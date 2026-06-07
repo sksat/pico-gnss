@@ -50,10 +50,12 @@ bind_interrupts!(struct Irqs {
 const GNSS_BAUD: u32 = 9600;
 
 /// 起動時にモジュールへ送る PMTK 設定 (チェックサムは送信時に計算)。
-/// SBAS(MSAS) 探索有効化・DGPS 補正源を SBAS に・AIC(干渉除去) 有効化。
+/// 実機で各コマンドに `$PMTK001,<cmd>,3`(成功) が返ることを確認済 (チップは MT3333 系)。
+/// 注: SBAS は地域依存。日本の MSAS は 2020 終了済なので fix quality は 1 のまま
+///     (WAAS/EGNOS 圏では有効)。GYSFFMANC は QZSS SLAS 非対応で sub-meter は不可。詳細は NOTES.md。
 const PMTK_INIT: &[&str] = &[
-    "PMTK313,1", // SBAS 探索を有効化
-    "PMTK301,2", // DGPS 補正源 = SBAS (WAAS/MSAS)
+    "PMTK313,1", // SBAS 探索を有効化 (WAAS/EGNOS 圏で有効)
+    "PMTK301,2", // DGPS 補正源 = SBAS
     "PMTK286,1", // AIC (アクティブ干渉除去) 有効化
 ];
 

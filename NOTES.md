@@ -101,6 +101,19 @@ GYSFFMANC は QZSS を GLONASS のような専用 talker ($GQGSV) でなく **$G
 - `PMTK301,2` — DGPS 補正源を SBAS に
 - `PMTK286,1` — AIC (アクティブ干渉除去)
 
-SBAS が効くと GGA fix quality が 2 になる。サブメータが要るなら QZSS L1S **SLAS** 対応の確認が
-必要 (チップ依存)。秋月に[みちびき受信不具合の告知 (2022)](https://akizukidenshi.com/goodsaffix/gysffmanc_notification_20221118.pdf)
-があるので併せて確認。
+### このモジュールでは config による sub-meter 化は不可 (調査結果)
+
+- チップは **MediaTek MT3333 系** (PMTK が通り、各コマンドに `$PMTK001,<cmd>,3` (3=成功) を ACK。
+  実機で TX→モジュール RX 配線時に 313/301/286 すべて成功を確認)。
+- **GYSFFMANC は QZSS SLAS 非対応**: [QZSS 公式の SLAS/CLAS 対応製品リスト](https://qzss.go.jp/usage/products/slas-clas.html)
+  に太陽誘電/GYSF 系は無い (u-blox/Sony/Furuno 等のみ)。秋月の説明も「みちびき対応(=QZSS 測距)」止まりで
+  サブメータを謳わない。→ **L1S 補強を復調しないので SLAS を有効化する PMTK は存在しない**。
+- 日本の従来型 SBAS (**MSAS**) は **2020 年に運用終了**。よって `PMTK313,1`/`PMTK301,2` は ACK は
+  成功するが日本では fix quality は 1 のまま (WAAS/EGNOS 圏では有効なので firmware には残す)。
+- QZSS (PRN 193-202) は既に測距用に NMEA 出力されている (GSV)。使われない時は SNR が無い=信号が弱い
+  だけで config の問題ではない。
+
+**結論**: このハードの精度レバーは config でなく**アンテナの天空確保 (衛星数↑・HDOP↓)** のみ。
+現実的な水平精度の床は **~2-3m** (補強なしコンシューマ GNSS 相当)。サブメータが要るなら
+SLAS/CLAS 対応受信機 (u-blox F9 系等) が必要。
+秋月に[みちびき受信不具合の告知 (2022)](https://akizukidenshi.com/goodsaffix/gysffmanc_notification_20221118.pdf)あり。
