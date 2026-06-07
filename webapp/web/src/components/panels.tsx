@@ -3,7 +3,7 @@ import { Canvas } from "./Canvas";
 import { Row, drawSpark } from "./charts";
 import { snrColor, sysColor, SYS_INFO } from "../nmea";
 import type { Accuracy, Timing } from "../stats";
-import type { GnssState, Sync } from "../types";
+import type { GnssState } from "../types";
 
 const QUALITY = ["No fix", "GPS", "DGPS", "PPS", "RTK", "Float RTK", "Estimated", "Manual", "Sim"];
 const p2 = (n: number) => String(n).padStart(2, "0");
@@ -19,20 +19,21 @@ function dms(dd: number, lat: boolean): string {
   return `${d}°${((a - d) * 60).toFixed(4)}′${hemi}`;
 }
 
-function Clock({ sync }: { sync: Sync | null }) {
+/** epochMs(受信時の UTC ms) + 経過 を rAF で進める。GPSDO の規律 UTC を優先。 */
+function Clock({ epochMs, wall }: { epochMs: number | null; wall: number }) {
   const [txt, setTxt] = useState("--:--:--");
   useEffect(() => {
     let raf = 0;
     const tick = () => {
-      if (sync) {
-        const d = new Date(sync.unix_s * 1000 + (Date.now() - sync.wall));
+      if (epochMs != null) {
+        const d = new Date(epochMs + (Date.now() - wall));
         setTxt(`${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}.${p3(d.getUTCMilliseconds())}`);
       }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [sync]);
+  }, [epochMs, wall]);
   return <div className="clock-time">{txt}</div>;
 }
 
@@ -55,10 +56,15 @@ export function Header({ s, acc, timing }: { s: GnssState; acc: Accuracy; timing
         </div>
       </div>
       <div className="clock">
-        <Clock sync={s.sync} />
+        <Clock
+          epochMs={s.gpsdo ? s.gpsdo.unixMs : s.sync ? s.sync.unix_s * 1000 : null}
+          wall={s.gpsdo ? s.gpsdo.wall : s.sync ? s.sync.wall : 0}
+        />
         <div className="clock-label">
-          GNSS-disciplined UTC
-          <span className={"lock-badge" + (s.sync ? " locked" : "")}>{s.sync ? "PPS LOCK" : "NO SYNC"}</span>
+          GPSDO-disciplined UTC
+          <span className={"lock-badge" + (s.gpsdo?.locked ? " locked" : "")}>
+            {s.gpsdo ? (s.gpsdo.locked ? "GPSDO LOCK" : "ACQUIRING") : "NO SYNC"}
+          </span>
         </div>
       </div>
       <div className={"conn" + (s.conn.up ? " up" : "")}>
@@ -111,18 +117,21 @@ export function PpsPanel({ s }: { s: GnssState }) {
 }
 
 export function SyncPanel({ s }: { s: GnssState }) {
+  const g = s.gpsdo;
   const y = s.sync;
   const iso = y ? new Date(y.unix_s * 1000).toISOString().replace(".000Z", "Z").replace("T", " ") : "—";
+  const inHoldover = g != null && g.holdoverMs > 2000;
   return (
     <section className="panel a-sync">
-      <h2>Time sync</h2>
+      <h2>GPSDO <span className="hdr-aux">{g ? (g.locked ? "locked" : "acquiring") : "—"}</span></h2>
       <div className="sync-utc">{iso}</div>
       <dl className="kv compact">
+        <Row k="disciplined freq" v={g ? `${g.ppb >= 0 ? "+" : ""}${(g.ppb / 1000).toFixed(3)} ppm` : "—"} />
+        <Row k="osc offset" v={g ? `${signed(g.ppb)} ppb` : "—"} />
+        <Row k="holdover" v={g ? (inHoldover ? `${(g.holdoverMs / 1000).toFixed(0)} s ⚠` : "PPS locked") : "—"} />
         <Row k="unix_s" v={y?.unix_s ?? "—"} />
-        <Row k="pps local" v={y ? `${(y.pps_local_us / 1e6).toFixed(3)} s` : "—"} />
-        <Row k="osc drift" v={y ? `${signed(y.drift_us)} µs` : "—"} />
       </dl>
-      <p className="hint">PPS エッジ↔UTC 秒の対応付けは firmware (RP2040, 1µs) 側で実施。host 同期のジッタ (数十ms) を避ける。</p>
+      <p className="hint">PIO の ns 精度 PPS 間隔で RP2040 水晶ドリフトを推定し UTC を規律。PPS 断中も周波数外挿で時刻を保持 (holdover)。</p>
     </section>
   );
 }

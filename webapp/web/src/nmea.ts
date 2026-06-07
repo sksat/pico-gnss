@@ -79,6 +79,7 @@ export class Gnss {
   pps: GnssState["pps"] = null;
   ppsDev: number[] = [];
   sync: GnssState["sync"] = null;
+  gpsdo: GnssState["gpsdo"] = null;
   posHist: GnssState["posHist"] = [];
   track: GnssState["track"] = [];
   raw: GnssState["raw"] = [];
@@ -100,6 +101,15 @@ export class Gnss {
       }
       case "sync":
         this.sync = { unix_s: m.unix_s, pps_local_us: m.pps_local_us, drift_us: m.drift_us, wall: Date.now() };
+        break;
+      case "time":
+        this.gpsdo = {
+          unixMs: m.unix_ns / 1e6,
+          ppb: m.ppb,
+          holdoverMs: m.holdover_ms,
+          locked: m.locked,
+          wall: Date.now(),
+        };
         break;
       case "status":
         this.conn = { up: m.connected, text: m.connected ? "streaming" : (m.note ?? "waiting for data"), src: m.source };
@@ -201,6 +211,7 @@ export class Gnss {
       pps: this.pps,
       ppsDev: this.ppsDev.slice(-400),
       sync: this.sync,
+      gpsdo: this.gpsdo,
       posHist: this.posHist.slice(),
       track: this.track.slice(),
       raw: this.raw.slice(-250),

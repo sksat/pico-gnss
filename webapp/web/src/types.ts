@@ -2,6 +2,7 @@ export type Msg =
   | { t: "nmea"; s: string }
   | { t: "pps"; count: number; interval_us: number; interval_ns: number; state: string; missed: number }
   | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number }
+  | { t: "time"; unix_ns: number; ppb: number; holdover_ms: number; locked: boolean }
   | { t: "status"; source: string; connected: boolean; note?: string };
 
 export interface Sat {
@@ -40,6 +41,14 @@ export interface Sync {
   drift_us: number;
   wall: number;
 }
+/** GPSDO の規律クロック状態 (firmware の TIME 行)。 */
+export interface Gpsdo {
+  unixMs: number; // 規律 UTC (ms, 受信時点)
+  ppb: number; // 推定周波数オフセット (ns/s)
+  holdoverMs: number; // 最後の PPS 規律からの経過
+  locked: boolean;
+  wall: number; // 受信時の Date.now()
+}
 export interface RawLine {
   ts: string;
   sentence: string;
@@ -70,6 +79,7 @@ export interface GnssState {
   pps: Pps | null;
   ppsDev: number[];
   sync: Sync | null;
+  gpsdo: Gpsdo | null;
   posHist: PosSample[];
   track: TrackSample[];
   raw: RawLine[];

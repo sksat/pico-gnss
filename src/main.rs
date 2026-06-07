@@ -11,15 +11,18 @@
 //! - `NMEA $GxXXX,...*hh`
 //! - `PPS count=<n> interval_us=<us> interval_ns=<ns> state=<...> missed=<m>`
 //! - `SYNC pps_local_us=<t> unix_s=<s> drift_us=<d>`
+//! - `TIME unix_ns=<n> ppb=<p> holdover_ms=<h> locked=<0|1>`  (GPSDO の規律 UTC)
 //!
-//! ## PPS タイムスタンプは PIO ハードキャプチャ
-//! ソフト (embassy Input + Instant) でエッジを刻むと、Cortex-M0+ の critical-section が
-//! 全 IRQ をマスクするためジッタ ~9µs が床になる。そこで **PIO で PPS エッジを sysclk
-//! 2 サイクル (=16ns @125MHz) 分解能でラッチ**し、CPU/割込のレイテンシを完全に排除する。
-//! PIO の自走ダウンカウンタ X をエッジで FIFO に push、CPU は連続する値の差から間隔を ns で得る。
-//! (X は ~68s で 1 周し、0 通過時に低位相ループで稀に誤キャプチャが出るので、host 側で
-//!  範囲外の間隔は除外する。)
+//! ## PPS タイムスタンプは PIO ハードキャプチャ (~16ns 分解能)
+//! ソフト (embassy Input + Instant) はジッタ ~9µs が床 (M0+ の critical-section 全 IRQ マスク)。
+//! PIO0 SM0 で PPS エッジを sysclk 2 サイクル(=16ns)分解能でラッチし、間隔を ns で得る。
+//!
+//! ## GPSDO (GPS 規律発振器)
+//! PIO の精密な PPS 間隔から RP2040 水晶の周波数オフセット (ppb) を [`DisciplinedClock`] が
+//! EMA 推定し、UTC エポックと合わせて規律 UTC を提供する。**PPS が切れている間 (holdover)
+//! も推定周波数で外挿**して時刻を保つ。`time_task` が 1Hz で規律 UTC を `TIME` 行に出す。
 
+use core::cell::RefCell;
 use core::fmt::Write as _;
 
 use defmt::{info, warn};
@@ -37,12 +40,17 @@ use embassy_rp::pio::{
 };
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::signal::Signal;
+use embassy_time::{Instant, Timer};
 use embedded_io_async::{Read, Write};
 use heapless::String;
 use static_cell::StaticCell;
 
-use pico_gnss::{parse_ddmmyy, parse_hhmmss, NmeaLineAssembler, PpsEvent, PpsTimeSync, PpsTracker};
+use pico_gnss::{
+    civil_to_unix, parse_ddmmyy, parse_hhmmss, DisciplinedClock, NmeaLineAssembler, PpsEvent,
+    PpsTracker,
+};
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
@@ -65,8 +73,17 @@ const PMTK_INIT: &[&str] = &[
     "PMTK286,1", // AIC (アクティブ干渉除去) 有効化
 ];
 
-/// PPS エッジの local timestamp (µs) を pps_task → main へ渡す。最新値のみ保持。
+/// PPS エッジの local timestamp (Instant ns) を pps_task → main へ渡す (エポック固定用)。
 static PPS_TS: Signal<CriticalSectionRawMutex, u64> = Signal::new();
+
+/// GPSDO の規律クロック。pps_task が周波数を、main が UTC エポックを更新し、time_task が読む。
+static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<DisciplinedClock>> =
+    BlockingMutex::new(RefCell::new(DisciplinedClock::new()));
+
+/// Instant を ns に (µs 分解能)。
+fn now_local_ns() -> u64 {
+    Instant::now().as_micros() * 1000
+}
 
 /// `$<payload>*<csum>\r\n` を組み立てて送る。
 async fn send_pmtk<W: Write>(tx: &mut W, payload: &str) {
@@ -79,30 +96,34 @@ async fn send_pmtk<W: Write>(tx: &mut W, payload: &str) {
     let _ = tx.write_all(line.as_bytes()).await;
 }
 
-/// PIO がラッチした PPS エッジ (カウンタ値) を読み、間隔を ns で求めて出すタスク。
+/// PIO がラッチした PPS エッジを読み、間隔を ns で求めて出す + 周波数を規律するタスク。
 #[embassy_executor::task]
 async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
     let ns_per_tick: u64 = PIO_CYCLES_PER_TICK * 1_000_000_000 / clk_sys_freq() as u64; // 16 @125MHz
     let mut tracker = PpsTracker::new();
     let mut last_x: Option<u32> = None;
-    let mut edge_ns: u64 = 0; // 累積エッジ時刻 (ns)
+    let mut edge_ns: u64 = 0;
 
     loop {
         let x = sm.rx().wait_pull().await; // エッジ時の自走ダウンカウンタ値
+        // エポック固定用の Instant 時刻 (µs ジッタは絶対オフセットのみに効き、周波数には効かない)。
+        PPS_TS.signal(now_local_ns());
+
         let interval_ns = match last_x {
-            // ダウンカウンタなので prev - curr (wrapping)。
-            Some(lx) => lx.wrapping_sub(x) as u64 * ns_per_tick,
+            Some(lx) => lx.wrapping_sub(x) as u64 * ns_per_tick, // ダウンカウンタ: prev - curr
             None => 0,
         };
         last_x = Some(x);
         edge_ns += interval_ns;
 
-        let edge_us = edge_ns / 1000;
-        PPS_TS.signal(edge_us);
+        // PIO の精密な間隔で水晶の周波数オフセットを規律。
+        if interval_ns > 0 {
+            CLOCK.lock(|c| c.borrow_mut().update_freq(interval_ns as i64));
+        }
 
         let count = tracker.count() + 1;
         let interval_us = interval_ns / 1000;
-        let (state, missed): (&str, u32) = match tracker.record(edge_us) {
+        let (state, missed): (&str, u32) = match tracker.record(edge_ns / 1000) {
             PpsEvent::First => ("First", 0),
             PpsEvent::Locked { .. } => ("Locked", 0),
             PpsEvent::Irregular { missed, .. } => ("Irregular", missed),
@@ -114,26 +135,47 @@ async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
     }
 }
 
+/// 1Hz で GPSDO の規律 UTC を出すタスク。PPS が切れていても周波数外挿で時刻を保つ (holdover)。
+#[embassy_executor::task]
+async fn time_task() {
+    loop {
+        Timer::after_secs(1).await;
+        let local = now_local_ns();
+        let (now, ppb, holdover, locked) = CLOCK.lock(|c| {
+            let c = c.borrow();
+            (c.now_ns(local), c.freq_ppb(), c.holdover_ns(local), c.is_locked())
+        });
+        if let Some(now) = now {
+            info!(
+                "TIME unix_ns={} ppb={} holdover_ms={} locked={}",
+                now,
+                ppb,
+                holdover / 1_000_000,
+                locked as u8
+            );
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    info!("pico-gnss: start (NMEA on UART0/GP1 @ {} baud, PPS on GP2 via PIO)", GNSS_BAUD);
+    info!("pico-gnss: start (NMEA on UART0/GP1 @ {} baud, PPS on GP2 via PIO, GPSDO)", GNSS_BAUD);
 
-    // PPS on GP2 を PIO0 SM0 でハードキャプチャする。
-    // 自走ダウンカウンタ X を 2 サイクル毎に減算しつつ pin を監視し、立ち上がりで X を push。
+    // PPS on GP2 を PIO0 SM0 でハードキャプチャ (自走ダウンカウンタを立ち上がりで push)。
     let Pio { mut common, mut sm0, .. } = Pio::new(p.PIO0, Irqs);
     let prg = pio_asm!(
         ".wrap_target",
         "low:",
-        "    jmp pin rising",   // pin high -> 立ち上がり
-        "    jmp x-- low",      // X 減算してループ (低位相 2 cyc/iter)
+        "    jmp pin rising",
+        "    jmp x-- low",
         "rising:",
-        "    in x, 32",         // ISR = X
-        "    push noblock",     // FIFO へ
+        "    in x, 32",
+        "    push noblock",
         "high:",
-        "    jmp x-- highchk",  // X 減算
+        "    jmp x-- highchk",
         "highchk:",
-        "    jmp pin high",     // まだ high ならループ; low なら wrap -> low (高位相 2 cyc/iter)
+        "    jmp pin high",
         ".wrap",
     );
     let loaded = common.load_program(&prg.program);
@@ -145,6 +187,7 @@ async fn main(spawner: Spawner) {
     sm0.set_config(&pio_cfg);
     sm0.set_enable(true);
     spawner.spawn(pps_task(sm0).unwrap());
+    spawner.spawn(time_task().unwrap());
 
     // UART0: TX=GP0 (モジュール設定送信), RX=GP1 (NMEA 受信)。
     static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
@@ -157,16 +200,16 @@ async fn main(spawner: Spawner) {
     let (mut tx, mut rx) = uart.split();
 
     // 起動直後にモジュール設定を送る (TX→モジュール RX 配線時に有効)。
-    embassy_time::Timer::after_millis(300).await;
+    Timer::after_millis(300).await;
     for cmd in PMTK_INIT {
         send_pmtk(&mut tx, cmd).await;
-        embassy_time::Timer::after_millis(120).await;
+        Timer::after_millis(120).await;
     }
     info!("pico-gnss: sent {} PMTK config commands (SBAS/AIC)", PMTK_INIT.len());
 
     let mut assembler = NmeaLineAssembler::new();
-    let mut timesync = PpsTimeSync::new();
     let mut read_buf = [0u8; 64];
+    let mut pending_edge_ns: Option<u64> = None;
 
     loop {
         let n = match rx.read(&mut read_buf).await {
@@ -177,9 +220,9 @@ async fn main(spawner: Spawner) {
             }
         };
 
-        // PIO がラッチした最新 PPS エッジ時刻を取り込む。
+        // PIO がラッチした最新 PPS エッジ (Instant 時刻) を覚えておく。
         if let Some(t) = PPS_TS.try_take() {
-            timesync.on_pps(t);
+            pending_edge_ns = Some(t);
         }
 
         for &b in &read_buf[..n] {
@@ -191,19 +234,26 @@ async fn main(spawner: Spawner) {
             };
             info!("NMEA {=str}", s);
 
+            // RMC (日付+時刻) と直近 PPS エッジを対応付けて UTC エポックを固定する。
             if s.get(3..6) == Some("RMC") {
                 let time = s.split(',').nth(1).and_then(parse_hhmmss);
                 let date = s.split(',').nth(9).and_then(parse_ddmmyy);
-                if let Some((d, mo, y)) = date {
-                    timesync.set_date(y, mo, d);
-                }
-                if let Some((h, mi, se)) = time {
-                    if let Some(sp) = timesync.on_time(h, mi, se) {
-                        info!(
-                            "SYNC pps_local_us={} unix_s={} drift_us={}",
-                            sp.pps_local_us, sp.unix_s, sp.drift_us
-                        );
-                    }
+                if let (Some((h, mi, se)), Some((d, mo, y)), Some(local_ns)) =
+                    (time, date, pending_edge_ns)
+                {
+                    let unix_s = civil_to_unix(y as i64, mo as i64, d as i64, h as i64, mi as i64, se as i64);
+                    let ppb = CLOCK.lock(|c| {
+                        let mut c = c.borrow_mut();
+                        c.update_epoch(local_ns, unix_s * 1_000_000_000);
+                        c.freq_ppb()
+                    });
+                    // SYNC (webapp 互換): drift は規律された ppb を µs/s で。
+                    info!(
+                        "SYNC pps_local_us={} unix_s={} drift_us={}",
+                        local_ns / 1000,
+                        unix_s,
+                        ppb / 1000
+                    );
                 }
             }
         }

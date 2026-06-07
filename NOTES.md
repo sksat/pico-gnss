@@ -50,6 +50,21 @@ PPS 立ち上がりは UTC 秒境界。**その瞬間の local timer 値 (RP2040
   host 側で 1s±50ms 外の間隔を統計から除外している。
 - firmware は `PPS ... interval_ns=<ns> ...` を出し、webapp は ns でジッタ σ を表示する。
 
+### GPSDO (GPS 規律発振器)
+
+PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを推定**し、UTC を規律する
+([`DisciplinedClock`], host テスト済み)。**PPS が切れている間 (holdover) も推定周波数で外挿**して
+時刻を保つのが GPSDO の肝。
+
+- PPS 間隔の偏差 (interval_ns − 1e9) がそのまま周波数オフセット **ppb (= ns/s)**。
+  実測 ≈ **+2.6 ppm (= +2600 ppb)** (RP2040 水晶)。これを EMA (α=1/32) で平滑する。
+- 周波数推定は PIO の精密間隔から、UTC エポックは連続して読める local clock (embassy Instant) から
+  と別々に与える (Instant の µs ジッタは絶対オフセットにのみ効き、周波数=holdover ドリフトには効かない)。
+- firmware は 1Hz で `TIME unix_ns=<規律UTC> ppb=<推定> holdover_ms=<経過> locked=<0|1>` を出す。
+  webapp はこれで device 規律クロックを表示し、PPS 断時は holdover カウンタを出す。
+- 補正式: 真の経過 = local 経過 − local経過 × ppb/1e9 (local が ppb 分速い/遅いぶんを補正)。
+  ロック後 holdover に入ると、残差周波数誤差ぶんだけ時刻がドリフトする (フル ppm でなく)。
+
 ## ハマった罠
 
 ### 1. `DEFMT_LOG` 未設定で RTT が無言になる
