@@ -3,6 +3,7 @@ export type Msg =
   | { t: "pps"; count: number; interval_us: number; interval_ns: number; state: string; missed: number }
   | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number }
   | { t: "time"; unix_ns: number; ppb: number; holdover_ms: number; locked: boolean }
+  | { t: "fw"; s: string }
   | { t: "status"; source: string; connected: boolean; note?: string };
 
 export interface Sat {
@@ -26,6 +27,13 @@ export interface Fix {
   speedKn: number | null;
   courseDeg: number | null;
   status: string;
+}
+/** GST: 受信機が報告する測位の標準偏差 (m)。 */
+export interface Gst {
+  rms: number | null;
+  sLat: number | null;
+  sLon: number | null;
+  sAlt: number | null;
 }
 export interface Pps {
   count: number;
@@ -80,6 +88,8 @@ export interface GnssState {
   ppsDev: number[];
   sync: Sync | null;
   gpsdo: Gpsdo | null;
+  gst: Gst | null;
+  fw: string | null;
   posHist: PosSample[];
   track: TrackSample[];
   raw: RawLine[];

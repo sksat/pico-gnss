@@ -38,7 +38,7 @@ use embassy_rp::pio::{
     Config as PioConfig, Direction as PioDirection, InterruptHandler as PioInterruptHandler, Pio,
     StateMachine,
 };
-use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
+use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartTx, Config as UartConfig};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::signal::Signal;
@@ -71,6 +71,10 @@ const PMTK_INIT: &[&str] = &[
     "PMTK313,1", // SBAS 探索を有効化 (WAAS/EGNOS 圏で有効)
     "PMTK301,2", // DGPS 補正源 = SBAS
     "PMTK286,1", // AIC (アクティブ干渉除去) 有効化
+    // NMEA 出力: GLL/RMC/VTG/GGA/GSA/GSV(各1) + GST(測位σ, field7) + ZDA(field17) を有効化。
+    // フィールド順: GLL,RMC,VTG,GGA,GSA,GSV,GRS,GST,(res×5),MALM,MEPH,MDGP,MDBG,ZDA,MCHN。
+    "PMTK314,1,1,1,1,1,1,0,1,0,0,0,0,0,0,0,0,0,1,0",
+    "PMTK605", // FW バージョン照会 → $PMTK705 で返る (ACK は無く応答が版情報)
 ];
 
 /// PPS エッジの local timestamp (Instant ns) を pps_task → main へ渡す (エポック固定用)。
@@ -91,9 +95,14 @@ async fn send_pmtk<W: Write>(tx: &mut W, payload: &str) {
     for b in payload.as_bytes() {
         cs ^= *b;
     }
-    let mut line: String<48> = String::new();
-    let _ = write!(line, "${}*{:02X}\r\n", payload, cs);
-    let _ = tx.write_all(line.as_bytes()).await;
+    // PMTK314 (NMEA 出力設定) は ~51 文字になるので余裕を持って 96。溢れると truncate されて
+    // 不完全コマンドになり、モジュールに拒否される (実際にハマった)。
+    let mut line: String<96> = String::new();
+    if write!(line, "${}*{:02X}\r\n", payload, cs).is_ok() {
+        let _ = tx.write_all(line.as_bytes()).await;
+    } else {
+        warn!("send_pmtk: line too long: {=str}", payload);
+    }
 }
 
 /// PIO がラッチした PPS エッジを読み、間隔を ns で求めて出す + 周波数を規律するタスク。
@@ -133,6 +142,20 @@ async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
             count, interval_us, interval_ns, state, missed
         );
     }
+}
+
+/// モジュール設定 (PMTK) を送るタスク。**RX 受信 (main) をブロックしないよう別タスクにする**
+/// — 同じループで送ると Timer/送信中に RX が読まれず、届く ACK が RX バッファ溢れで消える。
+#[embassy_executor::task]
+async fn config_task(mut tx: BufferedUartTx) {
+    // 起動直後はモジュールが PMTK を受け付けないので十分待ってから、間隔も空けて送る。
+    // 起動直後 (~1s) は UART が同期せず framing が多発しモジュールも未準備なので十分待つ。
+    Timer::after_millis(2000).await;
+    for cmd in PMTK_INIT {
+        send_pmtk(&mut tx, cmd).await;
+        Timer::after_millis(600).await;
+    }
+    info!("pico-gnss: PMTK config sent ({} cmds)", PMTK_INIT.len());
 }
 
 /// 1Hz で GPSDO の規律 UTC を出すタスク。PPS が切れていても周波数外挿で時刻を保つ (holdover)。
@@ -197,15 +220,10 @@ async fn main(spawner: Spawner) {
     let mut config = UartConfig::default();
     config.baudrate = GNSS_BAUD;
     let uart = BufferedUart::new(p.UART0, p.PIN_0, p.PIN_1, Irqs, tx_buf, rx_buf, config);
-    let (mut tx, mut rx) = uart.split();
+    let (tx, mut rx) = uart.split();
 
-    // 起動直後にモジュール設定を送る (TX→モジュール RX 配線時に有効)。
-    Timer::after_millis(300).await;
-    for cmd in PMTK_INIT {
-        send_pmtk(&mut tx, cmd).await;
-        Timer::after_millis(120).await;
-    }
-    info!("pico-gnss: sent {} PMTK config commands (SBAS/AIC)", PMTK_INIT.len());
+    // モジュール設定は別タスクで送る (main は RX を読み続ける)。
+    spawner.spawn(config_task(tx).unwrap());
 
     let mut assembler = NmeaLineAssembler::new();
     let mut read_buf = [0u8; 64];
@@ -214,10 +232,10 @@ async fn main(spawner: Spawner) {
     loop {
         let n = match rx.read(&mut read_buf).await {
             Ok(n) => n,
-            Err(e) => {
-                warn!("uart read error: {:?}", e);
-                continue;
-            }
+            // Framing/Overrun は起動直後やモジュール再設定時に多発する。毎回 warn! すると
+            // RTT が溢れて他のログ (ACK/NMEA) を trim してしまうので、黙って継続する
+            // (assembler は次の '$' で再同期する)。
+            Err(_) => continue,
         };
 
         // PIO がラッチした最新 PPS エッジ (Instant 時刻) を覚えておく。
@@ -233,6 +251,11 @@ async fn main(spawner: Spawner) {
                 continue;
             };
             info!("NMEA {=str}", s);
+
+            // FW バージョン応答 ($PMTK705) は専用行で出す (talker が長く NMEA 抽出に乗らないため)。
+            if s.starts_with("$PMTK705") {
+                info!("FW {=str}", s);
+            }
 
             // RMC (日付+時刻) と直近 PPS エッジを対応付けて UTC エポックを固定する。
             if s.get(3..6) == Some("RMC") {

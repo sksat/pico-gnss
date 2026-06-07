@@ -80,6 +80,8 @@ export class Gnss {
   ppsDev: number[] = [];
   sync: GnssState["sync"] = null;
   gpsdo: GnssState["gpsdo"] = null;
+  gst: GnssState["gst"] = null;
+  fw: GnssState["fw"] = null;
   posHist: GnssState["posHist"] = [];
   track: GnssState["track"] = [];
   raw: GnssState["raw"] = [];
@@ -111,6 +113,12 @@ export class Gnss {
           wall: Date.now(),
         };
         break;
+      case "fw": {
+        // $PMTK705,<release>,<build>,<model>,... → release を版として表示。
+        const f = m.s.split(",");
+        this.fw = f[1] ?? m.s;
+        break;
+      }
       case "status":
         this.conn = { up: m.connected, text: m.connected ? "streaming" : (m.note ?? "waiting for data"), src: m.source };
         break;
@@ -160,6 +168,16 @@ export class Gnss {
       case "VTG": {
         this.fix.courseDeg = num(p[1]) ?? this.fix.courseDeg;
         this.fix.speedKn = num(p[5]) ?? this.fix.speedKn;
+        break;
+      }
+      case "GST": {
+        // $GxGST,utc,rms,smaj,smin,orient,sdLat,sdLon,sdAlt
+        this.gst = {
+          rms: num(p[2]),
+          sLat: num(p[6]),
+          sLon: num(p[7]),
+          sAlt: num(p[8]),
+        };
         break;
       }
       case "GSA": {
@@ -212,6 +230,8 @@ export class Gnss {
       ppsDev: this.ppsDev.slice(-400),
       sync: this.sync,
       gpsdo: this.gpsdo,
+      gst: this.gst,
+      fw: this.fw,
       posHist: this.posHist.slice(),
       track: this.track.slice(),
       raw: this.raw.slice(-250),

@@ -17,6 +17,8 @@ target = "thumbv6m-none-eabi"    # Cortex-M0 and Cortex-M0+
 # defmt はビルド時に DEFMT_LOG でログレベルを決める。未設定だと info!/warn! 等が
 # コンパイル時に無効化され RTT に何も出ない (println! だけは別枠で常に出る)。
 DEFMT_LOG = "info"
+# RTT up バッファ既定 1024B は NMEA + PMTK 設定の混雑で溢れて行が trim される。広げる。
+DEFMT_RTT_BUFFER_SIZE = "8192"
 
 [alias]
 # host 上で純粋ロジック (lib) だけをテストする。bin (firmware) は no_main なので

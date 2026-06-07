@@ -43,7 +43,7 @@ export function Header({ s, acc, timing }: { s: GnssState; acc: Accuracy; timing
       <div className="brand">
         <span className="logo">◈</span>
         <span className="title">pico-gnss</span>
-        <span className="subtitle">GYSFFMANC · RP2040</span>
+        <span className="subtitle">{s.fw ? `${s.fw} · RP2040` : "GYSFFMANC · RP2040"}</span>
       </div>
       <div className="metrics">
         <div className="metric">

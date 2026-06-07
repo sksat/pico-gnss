@@ -105,6 +105,12 @@ GYSFFMANC は QZSS を GLONASS のような専用 talker ($GQGSV) でなく **$G
 出す。talker だけ見ると QZSS が GPS 扱いになる → **PRN レンジでコンステレーション分類**する
 (193–202 = QZSS, 120–158 = SBAS 等)。日本では QZSS が数機受かる。
 
+### 9. ビルド失敗時に古いバイナリを焼かない (`;` でなく `&&`)
+`cargo build ; probe-rs run <elf>` だと **build が失敗しても古い .elf が焼かれ**、変更が反映されてない
+バイナリで延々デバッグする羽目になる (実際にハマった: `BufferedUartTx<'static>` の型エラーに気付かず、
+config 変更が一切効いてないのに「PMTK が効かない」と誤診)。**必ず `cargo build && probe-rs run` で繋ぐ**。
+バックグラウンド実行や `| tail` でエラーを見落としやすいので特に注意。
+
 ## 精度指標の意味 (webapp ヘッダ)
 
 - **位置 `X m` = 水平 CEP(50%)**: 直近 ~2 分窓の測位点の経験的ばらつき (50% がこの半径内)。
@@ -115,12 +121,20 @@ GYSFFMANC は QZSS を GLONASS のような専用 talker ($GQGSV) でなく **$G
 
 ## モジュール設定 (PMTK)
 
-起動時に PMTK コマンドを UART0 TX(GP0) から送る (チェックサムは送信時計算)。TX→モジュール RX が
-配線されていれば適用される (MediaTek 系チップ前提):
+起動時に PMTK コマンドを UART0 TX(GP0) から `config_task` (RX をブロックしない別タスク) で送る。
+TX→モジュール RX 配線時に適用され、各コマンドに `$PMTK001,<cmd>,3`(成功) が返る。**実機で全 ACK 成功を確認**:
 
-- `PMTK313,1` — SBAS(MSAS) 探索を有効化
-- `PMTK301,2` — DGPS 補正源を SBAS に
-- `PMTK286,1` — AIC (アクティブ干渉除去)
+- `PMTK313,1` — SBAS 探索 ・ `PMTK301,2` — DGPS=SBAS ・ `PMTK286,1` — AIC
+- `PMTK314,...` — NMEA 出力に **GST を追加** (測位の標準偏差 σ を受信機が直接出す)。webapp の精度パネルに
+  `rcv σH/σV/RMS` として表示。フィールド順: GLL,RMC,VTG,GGA,GSA,GSV,GRS,GST,(res×5),MALM,MEPH,MDGP,MDBG,ZDA,MCHN。
+- `PMTK605` — FW バージョン照会 → `$PMTK705` で返る。**この個体は `MT3333_AXN5.1.9_MODULE_STD_F0 / 太陽誘電 /
+  9600bps`** (チップは MediaTek MT3333 確定)。webapp ヘッダに表示。
+
+### PMTK 送信で踏んだ罠
+- **送信は RX をブロックしない別タスクで** — 同じ main ループで `Timer`/送信中だと RX が読まれず、
+  届く ACK/NMEA が RX バッファ溢れで消える。
+- **行バッファは長コマンド分確保** — `PMTK314` は ~51 文字。`String<48>` だと truncate されて不完全コマンドになり拒否される。
+- **`$PMTK705` 等の一度きりの応答はサーバ側でキャッシュ**して後続クライアントに再送 (WS は接続後しか受け取れない)。
 
 ### このモジュールでは config による sub-meter 化は不可 (調査結果)
 

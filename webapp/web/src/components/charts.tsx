@@ -131,6 +131,8 @@ export function SnrChart({ s }: { s: GnssState }) {
 // ---------- Position accuracy (scatter) ----------
 export function AccuracyPanel({ s, acc }: { s: GnssState; acc: Accuracy }) {
   const f = s.fix;
+  const gstH =
+    s.gst && s.gst.sLat != null && s.gst.sLon != null ? Math.hypot(s.gst.sLat, s.gst.sLon) : null;
   return (
     <section className="panel">
       <h2>Position accuracy <span className="hdr-aux">{acc.n}/{acc.total} samples · ~2 min window</span></h2>
@@ -163,6 +165,9 @@ export function AccuracyPanel({ s, acc }: { s: GnssState; acc: Accuracy }) {
         <Row k="HDOP" v={f.hdop != null ? f.hdop.toFixed(2) : "—"} />
         <Row k="VDOP" v={f.vdop != null ? f.vdop.toFixed(2) : "—"} />
         <Row k="PDOP" v={f.pdop != null ? f.pdop.toFixed(2) : "—"} />
+        <Row k="rcv σH" v={gstH != null ? `${gstH.toFixed(1)} m` : "—"} />
+        <Row k="rcv σV" v={s.gst?.sAlt != null ? `${s.gst.sAlt.toFixed(1)} m` : "—"} />
+        <Row k="rcv RMS" v={s.gst?.rms != null ? `${s.gst.rms.toFixed(1)} m` : "—"} />
       </dl>
     </section>
   );

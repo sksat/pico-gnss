@@ -31,15 +31,18 @@ type Msg =
   | { t: "pps"; count: number; interval_us: number; interval_ns: number; state: string; missed: number }
   | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number }
   | { t: "time"; unix_ns: number; ppb: number; holdover_ms: number; locked: boolean }
+  | { t: "fw"; s: string }
   | { t: "status"; source: string; connected: boolean; note?: string };
 
 const NMEA_RE = /NMEA (\$[A-Za-z0-9]{2,5},[^*\s]*\*[0-9A-Fa-f]{2})/;
 const PPS_RE = /PPS count=(\d+) interval_us=(\d+) interval_ns=(\d+) state=(\w+) missed=(\d+)/;
 const SYNC_RE = /SYNC pps_local_us=(\d+) unix_s=(\d+) drift_us=(-?\d+)/;
 const TIME_RE = /TIME unix_ns=(\d+) ppb=(-?\d+) holdover_ms=(\d+) locked=([01])/;
+const FW_RE = /FW (\$PMTK705,[^*]*\*[0-9A-Fa-f]{2})/;
 
 function parseLine(line: string): Msg | null {
   let m: RegExpExecArray | null;
+  if ((m = FW_RE.exec(line))) return { t: "fw", s: m[1] };
   if ((m = NMEA_RE.exec(line))) return { t: "nmea", s: m[1] };
   if ((m = PPS_RE.exec(line)))
     return { t: "pps", count: +m[1], interval_us: +m[2], interval_ns: +m[3], state: m[4], missed: +m[5] };
@@ -85,6 +88,8 @@ function broadcast(msg: Msg): void {
 
 // 直近状態を保持し、新規接続クライアントに即送る (履歴の簡易リプレイ)。
 let lastStatus: Msg = { t: "status", source: "?", connected: false };
+// FW バージョンは起動時に 1 回だけ来るので、後から繋ぐクライアントにも送れるよう覚えておく。
+let lastFw: Msg | null = null;
 
 function handleUpgrade(req: http.IncomingMessage, socket: Socket): void {
   const key = req.headers["sec-websocket-key"];
@@ -101,6 +106,7 @@ function handleUpgrade(req: http.IncomingMessage, socket: Socket): void {
   );
   clients.add(socket);
   socket.write(wsFrame(JSON.stringify(lastStatus)));
+  if (lastFw) socket.write(wsFrame(JSON.stringify(lastFw)));
 
   socket.on("data", (buf: Buffer) => {
     // クライアントからの close フレーム (opcode 0x8) だけ処理。
@@ -172,7 +178,9 @@ function parseArgs(argv: string[]): Args {
 
 function feedLine(line: string): void {
   const msg = parseLine(line);
-  if (msg) broadcast(msg);
+  if (!msg) return;
+  if (msg.t === "fw") lastFw = msg;
+  broadcast(msg);
 }
 
 /** probe-rs を起動し、stdout 各行を解析して配信する (実機モード)。 */
