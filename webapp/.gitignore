@@ -1,4 +1,3 @@
 /node_modules
 /dist
-/public/client.js
-/public/client.js.map
+/public
