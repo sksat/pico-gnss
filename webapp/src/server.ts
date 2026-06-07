@@ -28,19 +28,19 @@ import { setTimeout as sleep } from "timers/promises";
 // --- firmware が出す行 → ブラウザへ送る JSON メッセージ ---
 type Msg =
   | { t: "nmea"; s: string }
-  | { t: "pps"; count: number; interval_us: number; state: string; missed: number }
+  | { t: "pps"; count: number; interval_us: number; interval_ns: number; state: string; missed: number }
   | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number }
   | { t: "status"; source: string; connected: boolean; note?: string };
 
 const NMEA_RE = /NMEA (\$[A-Za-z0-9]{2,5},[^*\s]*\*[0-9A-Fa-f]{2})/;
-const PPS_RE = /PPS count=(\d+) interval_us=(\d+) state=(\w+) missed=(\d+)/;
+const PPS_RE = /PPS count=(\d+) interval_us=(\d+) interval_ns=(\d+) state=(\w+) missed=(\d+)/;
 const SYNC_RE = /SYNC pps_local_us=(\d+) unix_s=(\d+) drift_us=(-?\d+)/;
 
 function parseLine(line: string): Msg | null {
   let m: RegExpExecArray | null;
   if ((m = NMEA_RE.exec(line))) return { t: "nmea", s: m[1] };
   if ((m = PPS_RE.exec(line)))
-    return { t: "pps", count: +m[1], interval_us: +m[2], state: m[3], missed: +m[4] };
+    return { t: "pps", count: +m[1], interval_us: +m[2], interval_ns: +m[3], state: m[4], missed: +m[5] };
   if ((m = SYNC_RE.exec(line)))
     return { t: "sync", pps_local_us: +m[1], unix_s: +m[2], drift_us: +m[3] };
   return null;

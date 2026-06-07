@@ -1,6 +1,6 @@
 export type Msg =
   | { t: "nmea"; s: string }
-  | { t: "pps"; count: number; interval_us: number; state: string; missed: number }
+  | { t: "pps"; count: number; interval_us: number; interval_ns: number; state: string; missed: number }
   | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number }
   | { t: "status"; source: string; connected: boolean; note?: string };
 
@@ -29,7 +29,8 @@ export interface Fix {
 export interface Pps {
   count: number;
   interval_us: number;
-  dev: number;
+  interval_ns: number;
+  dev: number; // interval_ns - 1e9 (ns)
   state: string;
   missed: number;
 }

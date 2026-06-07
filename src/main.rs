@@ -8,19 +8,17 @@
 //! - PPS = GP2。
 //!
 //! ## 出力 (defmt-rtt → probe-rs → webapp/server.ts が抽出)
-//! - `NMEA $GxXXX,...*hh` : 受信した生 NMEA センテンス。
-//! - `PPS count=<n> interval_us=<us> state=<...> missed=<m>` : PPS エッジ。
-//! - `SYNC pps_local_us=<t> unix_s=<s> drift_us=<d>` : PPS 規律された UTC エポック。
+//! - `NMEA $GxXXX,...*hh`
+//! - `PPS count=<n> interval_us=<us> interval_ns=<ns> state=<...> missed=<m>`
+//! - `SYNC pps_local_us=<t> unix_s=<s> drift_us=<d>`
 //!
-//! ## 時刻同期は firmware 側 ([`PpsTimeSync`])
-//! PPS 立ち上がりは UTC 秒境界。その local timer 値 (1µs) を NMEA の UTC 秒と対応付ける。
-//! host 側で同期すると probe/USB のジッタ (数十ms) が乗るため MCU 上で行う。
-//! ジッタの床は ~9µs (Cortex-M0+ は critical-section が全 IRQ をマスクするため、ソフトの
-//! タイムスタンプはこれ以上詰められない。sub-µs には PIO ハードキャプチャが必要)。
-//!
-//! ## モジュール設定 (PMTK)
-//! 起動時に SBAS(MSAS)/AIC 等を有効化する PMTK コマンドを TX から送る。TX→モジュール RX が
-//! 配線されていれば適用され、SBAS 補強で測位精度が上がる (MediaTek 系チップ前提)。
+//! ## PPS タイムスタンプは PIO ハードキャプチャ
+//! ソフト (embassy Input + Instant) でエッジを刻むと、Cortex-M0+ の critical-section が
+//! 全 IRQ をマスクするためジッタ ~9µs が床になる。そこで **PIO で PPS エッジを sysclk
+//! 2 サイクル (=16ns @125MHz) 分解能でラッチ**し、CPU/割込のレイテンシを完全に排除する。
+//! PIO の自走ダウンカウンタ X をエッジで FIFO に push、CPU は連続する値の差から間隔を ns で得る。
+//! (X は ~68s で 1 周し、0 通過時に低位相ループで稀に誤キャプチャが出るので、host 側で
+//!  範囲外の間隔は除外する。)
 
 use core::fmt::Write as _;
 
@@ -30,12 +28,16 @@ use panic_probe as _;
 
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
-use embassy_rp::gpio::{Input, Pull};
-use embassy_rp::peripherals::UART0;
+use embassy_rp::clocks::clk_sys_freq;
+use embassy_rp::peripherals::{PIO0, UART0};
+use embassy_rp::pio::program::pio_asm;
+use embassy_rp::pio::{
+    Config as PioConfig, Direction as PioDirection, InterruptHandler as PioInterruptHandler, Pio,
+    StateMachine,
+};
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Instant, Timer};
 use embedded_io_async::{Read, Write};
 use heapless::String;
 use static_cell::StaticCell;
@@ -44,10 +46,14 @@ use pico_gnss::{parse_ddmmyy, parse_hhmmss, NmeaLineAssembler, PpsEvent, PpsTime
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
+    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
 });
 
 /// AE-GNSS-EXTANT (GYSFFMANC) のデフォルトボーレート 9600。
 const GNSS_BAUD: u32 = 9600;
+
+/// PIO 自走カウンタの 1 tick = 2 サイクル。
+const PIO_CYCLES_PER_TICK: u64 = 2;
 
 /// 起動時にモジュールへ送る PMTK 設定 (チェックサムは送信時に計算)。
 /// 実機で各コマンドに `$PMTK001,<cmd>,3`(成功) が返ることを確認済 (チップは MT3333 系)。
@@ -73,44 +79,72 @@ async fn send_pmtk<W: Write>(tx: &mut W, payload: &str) {
     let _ = tx.write_all(line.as_bytes()).await;
 }
 
-/// PPS (GP2) の立ち上がりエッジを待ち、即座に timestamp を取って main へ送るタスク。
+/// PIO がラッチした PPS エッジ (カウンタ値) を読み、間隔を ns で求めて出すタスク。
 #[embassy_executor::task]
-async fn pps_task(mut pps: Input<'static>) {
+async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
+    let ns_per_tick: u64 = PIO_CYCLES_PER_TICK * 1_000_000_000 / clk_sys_freq() as u64; // 16 @125MHz
     let mut tracker = PpsTracker::new();
+    let mut last_x: Option<u32> = None;
+    let mut edge_ns: u64 = 0; // 累積エッジ時刻 (ns)
+
     loop {
-        pps.wait_for_rising_edge().await;
-        // エッジ直後に刻む。
-        let now_us = Instant::now().as_micros();
-        PPS_TS.signal(now_us);
+        let x = sm.rx().wait_pull().await; // エッジ時の自走ダウンカウンタ値
+        let interval_ns = match last_x {
+            // ダウンカウンタなので prev - curr (wrapping)。
+            Some(lx) => lx.wrapping_sub(x) as u64 * ns_per_tick,
+            None => 0,
+        };
+        last_x = Some(x);
+        edge_ns += interval_ns;
+
+        let edge_us = edge_ns / 1000;
+        PPS_TS.signal(edge_us);
 
         let count = tracker.count() + 1;
-        match tracker.record(now_us) {
-            PpsEvent::First => {
-                info!("PPS count={} interval_us={} state=First missed=0", count, 0u64)
-            }
-            PpsEvent::Locked { interval_us } => {
-                info!("PPS count={} interval_us={} state=Locked missed=0", count, interval_us)
-            }
-            PpsEvent::Irregular {
-                interval_us,
-                missed,
-            } => info!(
-                "PPS count={} interval_us={} state=Irregular missed={}",
-                count, interval_us, missed
-            ),
-        }
+        let interval_us = interval_ns / 1000;
+        let (state, missed): (&str, u32) = match tracker.record(edge_us) {
+            PpsEvent::First => ("First", 0),
+            PpsEvent::Locked { .. } => ("Locked", 0),
+            PpsEvent::Irregular { missed, .. } => ("Irregular", missed),
+        };
+        info!(
+            "PPS count={} interval_us={} interval_ns={} state={=str} missed={}",
+            count, interval_us, interval_ns, state, missed
+        );
     }
 }
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    info!("pico-gnss: start (NMEA on UART0/GP1 @ {} baud, PPS on GP2)", GNSS_BAUD);
+    info!("pico-gnss: start (NMEA on UART0/GP1 @ {} baud, PPS on GP2 via PIO)", GNSS_BAUD);
 
-    // PPS on GP2
-    let pps = Input::new(p.PIN_2, Pull::None);
-    // embassy-executor 0.10 ではタスク関数が Result<SpawnToken, _> を返す。
-    spawner.spawn(pps_task(pps).unwrap());
+    // PPS on GP2 を PIO0 SM0 でハードキャプチャする。
+    // 自走ダウンカウンタ X を 2 サイクル毎に減算しつつ pin を監視し、立ち上がりで X を push。
+    let Pio { mut common, mut sm0, .. } = Pio::new(p.PIO0, Irqs);
+    let prg = pio_asm!(
+        ".wrap_target",
+        "low:",
+        "    jmp pin rising",   // pin high -> 立ち上がり
+        "    jmp x-- low",      // X 減算してループ (低位相 2 cyc/iter)
+        "rising:",
+        "    in x, 32",         // ISR = X
+        "    push noblock",     // FIFO へ
+        "high:",
+        "    jmp x-- highchk",  // X 減算
+        "highchk:",
+        "    jmp pin high",     // まだ high ならループ; low なら wrap -> low (高位相 2 cyc/iter)
+        ".wrap",
+    );
+    let loaded = common.load_program(&prg.program);
+    let pps_pin = common.make_pio_pin(p.PIN_2);
+    sm0.set_pin_dirs(PioDirection::In, &[&pps_pin]);
+    let mut pio_cfg = PioConfig::default();
+    pio_cfg.use_program(&loaded, &[]);
+    pio_cfg.set_jmp_pin(&pps_pin);
+    sm0.set_config(&pio_cfg);
+    sm0.set_enable(true);
+    spawner.spawn(pps_task(sm0).unwrap());
 
     // UART0: TX=GP0 (モジュール設定送信), RX=GP1 (NMEA 受信)。
     static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
@@ -123,10 +157,10 @@ async fn main(spawner: Spawner) {
     let (mut tx, mut rx) = uart.split();
 
     // 起動直後にモジュール設定を送る (TX→モジュール RX 配線時に有効)。
-    Timer::after_millis(300).await;
+    embassy_time::Timer::after_millis(300).await;
     for cmd in PMTK_INIT {
         send_pmtk(&mut tx, cmd).await;
-        Timer::after_millis(120).await;
+        embassy_time::Timer::after_millis(120).await;
     }
     info!("pico-gnss: sent {} PMTK config commands (SBAS/AIC)", PMTK_INIT.len());
 
@@ -143,7 +177,7 @@ async fn main(spawner: Spawner) {
             }
         };
 
-        // pps_task が刻んだ最新 PPS エッジを取り込む。
+        // PIO がラッチした最新 PPS エッジ時刻を取り込む。
         if let Some(t) = PPS_TS.try_take() {
             timesync.on_pps(t);
         }
@@ -155,10 +189,8 @@ async fn main(spawner: Spawner) {
             let Ok(s) = core::str::from_utf8(sentence) else {
                 continue;
             };
-            // 生 NMEA をそのまま流す。パース・可視化は host (Web) 側。
             info!("NMEA {=str}", s);
 
-            // RMC は日付+時刻を両方持つ。直近 PPS エッジと突き合わせて SYNC を確立する。
             if s.get(3..6) == Some("RMC") {
                 let time = s.split(',').nth(1).and_then(parse_hhmmss);
                 let date = s.split(',').nth(9).and_then(parse_ddmmyy);

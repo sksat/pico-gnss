@@ -9,6 +9,10 @@ const QUALITY = ["No fix", "GPS", "DGPS", "PPS", "RTK", "Float RTK", "Estimated"
 const p2 = (n: number) => String(n).padStart(2, "0");
 const p3 = (n: number) => String(n).padStart(3, "0");
 const signed = (n: number) => (n >= 0 ? "+" : "") + n;
+/** ns のジッタを読みやすい単位で。 */
+function jitterStr(ns: number): string {
+  return Math.abs(ns) < 1000 ? `±${ns.toFixed(1)} ns` : `±${(ns / 1000).toFixed(2)} µs`;
+}
 function dms(dd: number, lat: boolean): string {
   const hemi = lat ? (dd >= 0 ? "N" : "S") : dd >= 0 ? "E" : "W";
   const a = Math.abs(dd), d = Math.floor(a);
@@ -46,8 +50,8 @@ export function Header({ s, acc, timing }: { s: GnssState; acc: Accuracy; timing
           <div className="metric-lbl">horizontal CEP 50% · R95 {acc.n >= 8 ? acc.r95.toFixed(1) : "—"}m</div>
         </div>
         <div className="metric">
-          <div className="metric-val">{timing.n >= 5 ? "±" + timing.sigma.toFixed(1) : "—"} <span className="u">µs</span></div>
-          <div className="metric-lbl">PPS timestamp jitter (1σ)</div>
+          <div className="metric-val">{timing.n >= 5 ? jitterStr(timing.sigma) : "—"}</div>
+          <div className="metric-lbl">PPS jitter (1σ · PIO 16ns capture)</div>
         </div>
       </div>
       <div className="clock">
@@ -95,7 +99,7 @@ export function PpsPanel({ s }: { s: GnssState }) {
         <span>{p && p.interval_us > 0 ? p.interval_us.toLocaleString() : "—"}</span>
         <span className="unit">µs</span>
       </div>
-      <div className="pps-dev">dev {p && p.interval_us > 0 ? signed(p.dev) : "—"} µs · {p?.state ?? "—"}</div>
+      <div className="pps-dev">dev {p && p.interval_ns > 0 ? signed(p.dev) : "—"} ns · {p?.state ?? "—"}</div>
       <Canvas className="spark" draw={(ctx, w, h) => drawSpark(ctx, w, h, s.ppsDev)} />
       <dl className="kv compact">
         <Row k="count" v={p?.count ?? 0} />

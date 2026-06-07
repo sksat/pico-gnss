@@ -173,14 +173,14 @@ export function TimingPanel({ s, timing }: { s: GnssState; timing: Timing }) {
   const dev = s.ppsDev;
   return (
     <section className="panel">
-      <h2>PPS / time precision <span className="hdr-aux">{timing.n} samples</span></h2>
-      <div className="chart-label">interval deviation (µs) · history</div>
+      <h2>PPS / time precision <span className="hdr-aux">{timing.n} samples · PIO 16ns</span></h2>
+      <div className="chart-label">interval deviation (ns) · history</div>
       <Canvas className="canvas-line" draw={(ctx, w, h) => {
         if (dev.length < 2) return;
         const maxAbs = Math.max(20, ...dev.map((d) => Math.abs(d)));
         ctx.strokeStyle = "#22303d"; ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
         ctx.fillStyle = "#475569"; ctx.font = "9px ui-monospace, monospace"; ctx.textAlign = "left";
-        ctx.fillText(`+${maxAbs.toFixed(0)}`, 2, 9); ctx.fillText(`-${maxAbs.toFixed(0)}`, 2, h - 3);
+        ctx.fillText(`+${maxAbs.toFixed(0)}ns`, 2, 9); ctx.fillText(`-${maxAbs.toFixed(0)}ns`, 2, h - 3);
         drawLine(ctx, w, h, dev.slice(-200), "#36d399", -maxAbs, maxAbs, 3);
       }} />
       <div className="chart-label">jitter histogram</div>
@@ -196,15 +196,15 @@ export function TimingPanel({ s, timing }: { s: GnssState; timing: Timing }) {
           ctx.fillStyle = "#3b82f6"; ctx.fillRect(i * bw + 0.5, h - 12 - bh, bw - 1, bh);
         }
         ctx.fillStyle = "#475569"; ctx.font = "9px ui-monospace, monospace";
-        ctx.textAlign = "left"; ctx.fillText(`${lo.toFixed(0)}µs`, 1, h - 2);
-        ctx.textAlign = "right"; ctx.fillText(`${hi.toFixed(0)}µs`, w - 1, h - 2);
+        ctx.textAlign = "left"; ctx.fillText(`${lo.toFixed(0)}ns`, 1, h - 2);
+        ctx.textAlign = "right"; ctx.fillText(`${hi.toFixed(0)}ns`, w - 1, h - 2);
       }} />
       <dl className="kv compact stat3">
-        <Row k="interval µ" v={timing.n >= 2 ? `${timing.meanInterval.toFixed(1)}` : "—"} />
-        <Row k="jitter σ" v={timing.n >= 2 ? `${timing.sigma.toFixed(2)} µs` : "—"} />
-        <Row k="peak-peak" v={timing.n >= 2 ? `${timing.pp.toFixed(0)} µs` : "—"} />
+        <Row k="jitter σ" v={timing.n >= 2 ? `${timing.sigma.toFixed(1)} ns` : "—"} />
+        <Row k="peak-peak" v={timing.n >= 2 ? `${timing.pp.toFixed(0)} ns` : "—"} />
         <Row k="osc offset" v={timing.n >= 2 ? `${timing.ppm >= 0 ? "+" : ""}${timing.ppm.toFixed(2)} ppm` : "—"} />
-        <Row k="est. UTC σ" v={timing.n >= 5 ? `±${timing.sigma.toFixed(1)} µs` : "—"} />
+        <Row k="interval µ" v={timing.n >= 2 ? `${(timing.meanIntervalNs / 1000).toFixed(2)} µs` : "—"} />
+        <Row k="est. UTC σ" v={timing.n >= 5 ? `±${timing.sigma.toFixed(1)} ns` : "—"} />
         <Row k="missed" v={s.pps?.missed ?? 0} />
       </dl>
     </section>

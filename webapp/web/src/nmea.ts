@@ -88,13 +88,16 @@ export class Gnss {
   dispatch(m: Msg): void {
     switch (m.t) {
       case "nmea": this.onNmea(m.s); break;
-      case "pps":
-        this.pps = { count: m.count, interval_us: m.interval_us, dev: m.interval_us - 1_000_000, state: m.state, missed: m.missed };
-        if (m.interval_us > 0) {
-          this.ppsDev.push(m.interval_us - 1_000_000);
+      case "pps": {
+        const devNs = m.interval_ns - 1_000_000_000;
+        this.pps = { count: m.count, interval_us: m.interval_us, interval_ns: m.interval_ns, dev: devNs, state: m.state, missed: m.missed };
+        // PIO カウンタ wrap 等の外れ値 (1s±50ms 外) は精度統計から除外。
+        if (m.interval_ns > 0 && Math.abs(devNs) < 50_000_000) {
+          this.ppsDev.push(devNs); // ns
           if (this.ppsDev.length > 600) this.ppsDev.shift();
         }
         break;
+      }
       case "sync":
         this.sync = { unix_s: m.unix_s, pps_local_us: m.pps_local_us, drift_us: m.drift_us, wall: Date.now() };
         break;

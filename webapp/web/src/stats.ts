@@ -53,21 +53,22 @@ export function computeAccuracy(all: PosSample[]): Accuracy {
 
 export interface Timing {
   n: number;
-  meanInterval: number; // µs
-  sigma: number; // jitter 1σ (µs)
-  pp: number; // peak-peak (µs)
-  ppm: number; // 局部発振器オフセット
+  meanIntervalNs: number; // ns
+  sigma: number; // jitter 1σ (ns) — PIO ハードキャプチャの分解能 ~16ns
+  pp: number; // peak-peak (ns)
+  ppm: number; // 局部発振器オフセット (ns/s = 1000ppm → ppm = mean/1000)
 }
 
-export function computeTiming(dev: number[]): Timing {
-  const n = dev.length;
-  if (n < 2) return { n, meanInterval: 0, sigma: 0, pp: 0, ppm: 0 };
-  const m = mean(dev);
+/** PPS 間隔偏差 (interval_ns - 1e9) の列から時刻精度指標を求める。単位は ns。 */
+export function computeTiming(devNs: number[]): Timing {
+  const n = devNs.length;
+  if (n < 2) return { n, meanIntervalNs: 0, sigma: 0, pp: 0, ppm: 0 };
+  const m = mean(devNs);
   return {
     n,
-    meanInterval: 1_000_000 + m,
-    sigma: std(dev),
-    pp: Math.max(...dev) - Math.min(...dev),
-    ppm: m,
+    meanIntervalNs: 1_000_000_000 + m,
+    sigma: std(devNs),
+    pp: Math.max(...devNs) - Math.min(...devNs),
+    ppm: m / 1000,
   };
 }

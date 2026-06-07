@@ -30,19 +30,25 @@ PPS 立ち上がりは UTC 秒境界。**その瞬間の local timer 値 (RP2040
 **なぜ firmware 側でやるか**: host (probe-rs RTT 経由) で同期すると USB/probe の往復ジッタ
 (数十 ms) が乗り、PPS 本来の精度が失われる。エッジを µs で刻める MCU 上で対応付けるのが必須。
 
-### PPS タイムスタンプのジッタは ~9µs が床 (重要)
+### PPS タイムスタンプ: ソフト ~9µs → PIO ハードキャプチャ ~10ns (重要)
 
-実測ジッタ σ ≈ 9µs。これは PPS 信号自体 (モジュール仕様で数十 ns) ではなく **RP2040 側の
-ソフトタイムスタンプのレイテンシ揺らぎ**。
+**ソフト (embassy Input + `Instant::now()`) はジッタ σ ≈ 9µs が床**。これは PPS 信号自体
+(モジュール仕様で数十 ns) ではなく RP2040 側のソフトタイムスタンプのレイテンシ揺らぎ。
 
-- **原因**: RP2040 は Cortex-M0+ で BASEPRI が無く、`critical-section` が**全割り込みをマスク**する。
-  defmt の RTT 書き込み等で critical-section に入っている間は PPS エッジ割り込みが遅延する。
-- **効かなかった対策** (試して revert 済): GPIO エッジ割込を最優先(P0)に・PPS タスクを高優先
-  InterruptExecutor(P1) で走らせる → critical-section マスクの前では無力で、σ は改善せず
-  (9〜10µs のまま)。複雑さだけ増えるので不採用。
-- **sub-µs にするには**: **PIO ハードキャプチャ**しかない。PIO は sysclk(125MHz=8ns) で
-  GPIO エッジを CPU/割込非介在でラッチできるので critical-section の影響を受けない。
-- なお ~9µs でもネットワーク NTP の ms ジッタより 2 桁良く、用途次第では十分。
+- 原因: RP2040 は Cortex-M0+ で BASEPRI が無く、`critical-section` が**全割り込みをマスク**する。
+  defmt の RTT 書き込み等で critical-section 中は PPS エッジ割り込みが遅延する。
+- **効かなかった対策**: GPIO 割込を最優先(P0)に・PPS タスクを高優先 InterruptExecutor(P1) で走らせる
+  → critical-section マスクの前では無力で σ は改善せず (9〜10µs)。複雑さだけ増えるので不採用 (revert 済)。
+
+**PIO ハードキャプチャで σ ≈ 10ns を達成** (約 900 倍改善):
+- PIO0 SM0 で自走ダウンカウンタ X を 2 サイクル毎に減算しつつ pin を監視し、立ち上がりで X を FIFO に push。
+  tick = 2 cyc = **16ns @125MHz**。CPU/割込/critical-section に一切依存しない (ハードでラッチ)。
+- CPU は連続する X の差 (wrapping_sub, ダウンカウンタ) から間隔を ns で得る。
+- 実測: interval ≈ 1,000,002,5xx ns、**ばらつきは 16ns 量子化だけ (σ ≈ 8-10ns, peak-peak 32ns)**。
+  平均オフセット ≈ +2.5µs/s = **RP2040 水晶の +2.5 ppm** がクリーンに測れる。
+- 注意: X は ~68s で 1 周し、0 通過時に低位相ループで稀に誤キャプチャ (短い外れ間隔) が出る。
+  host 側で 1s±50ms 外の間隔を統計から除外している。
+- firmware は `PPS ... interval_ns=<ns> ...` を出し、webapp は ns でジッタ σ を表示する。
 
 ## ハマった罠
 
