@@ -3,12 +3,21 @@
 
 //! GNSS 受信テスト firmware (RP2040 / Raspberry Pi Pico)。
 //!
-//! - UART0 RX = GP1 に GNSS モジュール (秋月 AE-GNSS-EXTANT+ANT_SET) の NMEA TX を接続。
+//! - UART0 RX = GP1 に GNSS モジュール (秋月 AE-GNSS-EXTANT+ANT_SET / GYSFFMANC) の NMEA TX を接続。
 //! - PPS = GP2。
 //!
-//! バイトストリームの 1 センテンスへの切り出しは [`pico_gnss::NmeaLineAssembler`]
-//! (host テスト済み)、センテンスのパースは `nmea` クレートに委譲する。
-//! ログは defmt-rtt 経由で probe-rs (PicoBridge Lite) の RTT に出る。
+//! ## 出力 (defmt-rtt → probe-rs → webapp/server.ts が抽出)
+//! - `NMEA $GxXXX,...*hh` : 受信した生 NMEA センテンス (パース・可視化は Web 側)。
+//! - `PPS count=<n> interval_us=<us> state=<First|Locked|Irregular> missed=<m>` : PPS エッジ。
+//! - `SYNC pps_local_us=<t> unix_s=<s> drift_us=<d>` : PPS 規律された UTC エポック。
+//!
+//! ## 時刻同期は firmware 側で行う (精度のため)
+//! PPS の立ち上がりは UTC 秒境界。その瞬間の local timer 値 (1µs) を、後続 NMEA の
+//! UTC 秒と対応付ける ([`PpsTimeSync`])。host 側で同期すると probe/USB のジッタ (数十 ms)
+//! が乗るので、エッジを µs で刻める MCU 上で対応付けるのが必須。
+//!
+//! PPS エッジは専用タスク [`pps_task`] で即座に [`Instant::now`] を取り (レイテンシ最小)、
+//! [`Signal`] で main タスクへ渡す。main は NMEA の時刻と突き合わせて `SYNC` を出す。
 
 use defmt::{info, warn};
 use defmt_rtt as _;
@@ -19,41 +28,49 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Input, Pull};
 use embassy_rp::peripherals::UART0;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUartRx, Config as UartConfig};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::Instant;
 use embedded_io_async::Read;
 use static_cell::StaticCell;
 
-use nmea::Nmea;
-
-use pico_gnss::{NmeaLineAssembler, PpsEvent, PpsTracker};
+use pico_gnss::{parse_ddmmyy, parse_hhmmss, NmeaLineAssembler, PpsEvent, PpsTimeSync, PpsTracker};
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
 });
 
-/// AE-GNSS-EXTANT のボーレート。多くの GNSS モジュールのデフォルトは 9600 (要実機確認)。
+/// AE-GNSS-EXTANT (GYSFFMANC) のデフォルトボーレート 9600。
 const GNSS_BAUD: u32 = 9600;
 
-/// PPS (GP2) の立ち上がりエッジを待ち、[`PpsTracker`] で間隔・欠落を判定して出すタスク。
+/// PPS エッジの local timestamp (µs) を pps_task → main へ渡す。最新値のみ保持。
+static PPS_TS: Signal<CriticalSectionRawMutex, u64> = Signal::new();
+
+/// PPS (GP2) の立ち上がりエッジを待ち、即座に timestamp を取って main へ送るタスク。
+/// 併せて [`PpsTracker`] で間隔/欠落を判定し、PPS 行を出す。
 #[embassy_executor::task]
 async fn pps_task(mut pps: Input<'static>) {
     let mut tracker = PpsTracker::new();
     loop {
         pps.wait_for_rising_edge().await;
+        // エッジ直後に刻む (時刻同期の精度はここのレイテンシで決まる)。
         let now_us = Instant::now().as_micros();
+        PPS_TS.signal(now_us);
+
+        let count = tracker.count() + 1;
         match tracker.record(now_us) {
-            PpsEvent::First => info!("PPS #{}: first pulse", tracker.count()),
+            PpsEvent::First => {
+                info!("PPS count={} interval_us={} state=First missed=0", count, 0u64)
+            }
             PpsEvent::Locked { interval_us } => {
-                info!("PPS #{}: locked, interval = {} us", tracker.count(), interval_us)
+                info!("PPS count={} interval_us={} state=Locked missed=0", count, interval_us)
             }
             PpsEvent::Irregular {
                 interval_us,
                 missed,
-            } => warn!(
-                "PPS #{}: irregular, interval = {} us, missed = {}",
-                tracker.count(),
-                interval_us,
-                missed
+            } => info!(
+                "PPS count={} interval_us={} state=Irregular missed={}",
+                count, interval_us, missed
             ),
         }
     }
@@ -77,7 +94,7 @@ async fn main(spawner: Spawner) {
     let mut rx = BufferedUartRx::new(p.UART0, Irqs, p.PIN_1, rx_buf, config);
 
     let mut assembler = NmeaLineAssembler::new();
-    let mut nmea = Nmea::default();
+    let mut timesync = PpsTimeSync::new();
     let mut read_buf = [0u8; 64];
 
     loop {
@@ -89,8 +106,10 @@ async fn main(spawner: Spawner) {
             }
         };
 
-        // 生バイトは bring-up 用に debug レベルで残す (DEFMT_LOG=debug で見える)。
-        defmt::debug!("uart rx {} bytes: {=[u8]:a}", n, &read_buf[..n]);
+        // pps_task が刻んだ最新 PPS エッジを取り込む。
+        if let Some(t) = PPS_TS.try_take() {
+            timesync.on_pps(t);
+        }
 
         for &b in &read_buf[..n] {
             let Some(sentence) = assembler.push(b) else {
@@ -99,43 +118,23 @@ async fn main(spawner: Spawner) {
             let Ok(s) = core::str::from_utf8(sentence) else {
                 continue;
             };
-            // チェックサム検証とフィールド分解は nmea クレートに任せる。
-            // センテンス種別 ($ttSSS の tt=talker, SSS=種別)。
-            let talker = s.get(1..3).unwrap_or("");
-            let kind = s.get(3..6).unwrap_or("");
-            let _ = nmea.parse(s);
+            // 生 NMEA をそのまま流す。パース・可視化は host (Web) 側。
+            info!("NMEA {=str}", s);
 
-            // 測位サマリ: GGA のときだけ (毎センテンス出すと煩い)。fix_quality 0 = 未測位。
-            if kind == "GGA" {
-                let quality = s.split(',').nth(6).unwrap_or("");
-                let lat = nmea.latitude.unwrap_or(f64::NAN);
-                let lon = nmea.longitude.unwrap_or(f64::NAN);
-                let sats = nmea.num_of_fix_satellites.unwrap_or(0);
-                info!(
-                    "GGA fix_quality={=str} sats_used={} lat={} lon={}",
-                    quality, sats, lat, lon
-                );
-            }
-            // [診断] GSV: 視野内衛星数と SNR(C/N0)。$xxGSV,total,msg,inView,(prn,el,az,snr)*...
-            // SNR は field 7,11,15,... (4 フィールド毎の 4 番目)。fix には ~30dBHz 以上が要る。
-            if kind == "GSV" {
-                let mut max_snr = 0u8;
-                for (i, f) in s.split(',').enumerate() {
-                    if i >= 7 && (i - 7) % 4 == 0 {
-                        let f = f.split('*').next().unwrap_or(f); // 末尾 *checksum を除去
-                        if let Ok(v) = f.parse::<u8>() {
-                            if v > max_snr {
-                                max_snr = v;
-                            }
-                        }
+            // RMC は日付+時刻を両方持つ。直近 PPS エッジと突き合わせて SYNC を確立する。
+            if s.get(3..6) == Some("RMC") {
+                let time = s.split(',').nth(1).and_then(parse_hhmmss);
+                let date = s.split(',').nth(9).and_then(parse_ddmmyy);
+                if let Some((d, mo, y)) = date {
+                    timesync.set_date(y, mo, d);
+                }
+                if let Some((h, mi, se)) = time {
+                    if let Some(sp) = timesync.on_time(h, mi, se) {
+                        info!(
+                            "SYNC pps_local_us={} unix_s={} drift_us={}",
+                            sp.pps_local_us, sp.unix_s, sp.drift_us
+                        );
                     }
-                }
-                if s.split(',').nth(2) == Some("1") {
-                    let in_view = s.split(',').nth(3).unwrap_or("?");
-                    info!("GSV {=str}: {=str} in view", talker, in_view);
-                }
-                if max_snr > 0 {
-                    info!("  {=str}GSV max C/N0 this msg = {} dBHz", talker, max_snr);
                 }
             }
         }

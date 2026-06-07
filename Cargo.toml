@@ -17,7 +17,7 @@ path = "src/main.rs"
 heapless = "0.9.3"
 
 # firmware (組込ターゲット) 専用の依存。host ビルドには含まれないので、
-# `cargo test-host` (--target x86_64) では embassy / nmea / defmt を一切引かない。
+# `cargo test-host` (--target x86_64) では embassy / defmt を一切引かない。
 [target.'cfg(target_os = "none")'.dependencies]
 cortex-m = "0.7.7"
 cortex-m-rt = "0.7.3"
@@ -26,14 +26,6 @@ cortex-m-rt = "0.7.3"
 #  probe-rs が RTT フレームをデコードできず無言になる)。
 defmt = "1.0"
 defmt-rtt = "1.0"
-nmea = { version = "0.7", default-features = false, features = [
-    "GGA",
-    "RMC",
-    "GLL",
-    "VTG",
-    "GSA",
-    "GSV",
-] }
 embassy-executor = { version = "0.10.0", features = [
     "platform-cortex-m",
     "executor-thread",

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pico-gnss · GNSS realtime dashboard</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      crossorigin=""
+    />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">◈</span>
+        <span class="title">pico-gnss</span>
+        <span class="subtitle">GYSFFMANC · RP2040 · realtime</span>
+      </div>
+      <div class="clock">
+        <div class="clock-time" id="utc-time">--:--:--</div>
+        <div class="clock-label">
+          GNSS-disciplined UTC
+          <span class="lock-badge" id="lock-badge">NO SYNC</span>
+        </div>
+      </div>
+      <div class="conn">
+        <span class="dot" id="conn-dot"></span>
+        <span id="conn-text">connecting…</span>
+        <span class="src" id="conn-src"></span>
+      </div>
+    </header>
+
+    <main class="grid">
+      <!-- Fix summary -->
+      <section class="panel" id="panel-fix">
+        <h2>Fix</h2>
+        <div class="fix-status" id="fix-status">NO FIX</div>
+        <dl class="kv">
+          <div><dt>Lat</dt><dd id="f-lat">—</dd></div>
+          <div><dt>Lon</dt><dd id="f-lon">—</dd></div>
+          <div><dt>Alt</dt><dd id="f-alt">—</dd></div>
+          <div><dt>Sats used</dt><dd id="f-sats">—</dd></div>
+          <div><dt>HDOP</dt><dd id="f-hdop">—</dd></div>
+          <div><dt>Speed</dt><dd id="f-speed">—</dd></div>
+          <div><dt>Course</dt><dd id="f-course">—</dd></div>
+          <div><dt>Quality</dt><dd id="f-qual">—</dd></div>
+        </dl>
+      </section>
+
+      <!-- PPS -->
+      <section class="panel" id="panel-pps">
+        <h2>PPS</h2>
+        <div class="pps-big">
+          <span id="pps-interval">—</span><span class="unit">µs</span>
+        </div>
+        <div class="pps-dev">dev <span id="pps-dev">—</span> µs · <span id="pps-state">—</span></div>
+        <canvas id="pps-spark" class="spark"></canvas>
+        <dl class="kv compact">
+          <div><dt>count</dt><dd id="pps-count">0</dd></div>
+          <div><dt>missed</dt><dd id="pps-missed">0</dd></div>
+          <div><dt>osc drift</dt><dd id="pps-drift">—</dd></div>
+        </dl>
+      </section>
+
+      <!-- Time sync -->
+      <section class="panel" id="panel-sync">
+        <h2>Time sync</h2>
+        <div class="sync-utc" id="sync-utc">—</div>
+        <dl class="kv compact">
+          <div><dt>unix_s</dt><dd id="sync-unix">—</dd></div>
+          <div><dt>pps local</dt><dd id="sync-local">—</dd></div>
+          <div><dt>osc drift</dt><dd id="sync-drift">—</dd></div>
+        </dl>
+        <p class="hint">PPS エッジ↔UTC 秒の対応付けは firmware (RP2040, 1µs) 側で実施。</p>
+      </section>
+
+      <!-- Map -->
+      <section class="panel map-panel" id="panel-map">
+        <h2>Position <span class="hdr-aux" id="map-coords"></span></h2>
+        <div id="map"></div>
+      </section>
+
+      <!-- Sky plot -->
+      <section class="panel" id="panel-sky">
+        <h2>Sky plot <span class="hdr-aux" id="sky-count"></span></h2>
+        <canvas id="skyplot"></canvas>
+        <div class="legend" id="constellation-legend"></div>
+      </section>
+
+      <!-- SNR -->
+      <section class="panel" id="panel-snr">
+        <h2>C/N₀ (SNR) <span class="hdr-aux" id="snr-aux"></span></h2>
+        <canvas id="snr"></canvas>
+      </section>
+
+      <!-- Raw console -->
+      <section class="panel console-panel" id="panel-console">
+        <h2>NMEA stream <span class="hdr-aux" id="rate-aux"></span></h2>
+        <div class="console" id="console"></div>
+      </section>
+    </main>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      crossorigin=""
+    ></script>
+    <script type="module" src="client.js"></script>
+  </body>
+</html>

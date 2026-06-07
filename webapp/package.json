@@ -1,0 +1,18 @@
+{
+  "name": "pico-gnss-webapp",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Real-time GNSS dashboard for pico-gnss (probe-rs RTT bridge)",
+  "packageManager": "pnpm@10.18.3",
+  "scripts": {
+    "build": "tsc -p tsconfig.server.json && tsc -p tsconfig.client.json",
+    "start": "node dist/server.js",
+    "replay": "node dist/server.js --replay sample.log",
+    "dev": "pnpm run build && pnpm run start"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "@types/node": "^25.9.2",
+    "@types/leaflet": "^1.9.21"
+  }
+}
