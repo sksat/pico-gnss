@@ -1,0 +1,58 @@
+[package]
+name = "pico-gnss"
+version = "0.1.0"
+edition = "2021"
+
+# host テスト可能な純粋ロジック (assembler 等)。
+[lib]
+name = "pico_gnss"
+
+# firmware 本体 (embassy-rp, no_std/no_main)。
+[[bin]]
+name = "pico-gnss"
+path = "src/main.rs"
+
+# lib が使う HAL 非依存の依存だけをここに。host (`cargo test-host`) でも build される。
+[dependencies]
+heapless = "0.9.3"
+
+# firmware (組込ターゲット) 専用の依存。host ビルドには含まれないので、
+# `cargo test-host` (--target x86_64) では embassy / nmea / defmt を一切引かない。
+[target.'cfg(target_os = "none")'.dependencies]
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.3"
+# embassy-rp 0.10 は defmt 1.x を要求する。logger も同世代の defmt-rtt 1.x を使う
+# (defmt-rtt 0.4 は defmt 0.3 世代で、混ぜると 0.3.100 シム経由でコンパイルは通るが
+#  probe-rs が RTT フレームをデコードできず無言になる)。
+defmt = "1.0"
+defmt-rtt = "1.0"
+nmea = { version = "0.7", default-features = false, features = [
+    "GGA",
+    "RMC",
+    "GLL",
+    "VTG",
+    "GSA",
+    "GSV",
+] }
+embassy-executor = { version = "0.10.0", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "defmt",
+] }
+embassy-rp = { version = "0.10.0", features = [
+    "defmt",
+    "unstable-pac",
+    "time-driver",
+    "critical-section-impl",
+    "rp2040",
+] }
+embassy-time = { version = "0.5.1", features = [
+    "defmt",
+    "defmt-timestamp-uptime",
+] }
+embassy-sync = { version = "0.7.2", features = ["defmt"] }
+embassy-futures = "0.1.1"
+static_cell = "2.1.1"
+embedded-io-async = "0.7.0"
+portable-atomic = { version = "1.13.1", features = ["critical-section"] }
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
