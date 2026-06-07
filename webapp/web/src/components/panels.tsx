@@ -42,12 +42,12 @@ export function Header({ s, acc, timing }: { s: GnssState; acc: Accuracy; timing
       </div>
       <div className="metrics">
         <div className="metric">
-          <div className="metric-val">{acc.n >= 8 ? acc.twodrms.toFixed(2) : "—"} <span className="u">m</span></div>
-          <div className="metric-lbl">horizontal (2DRMS 95%)</div>
+          <div className="metric-val">{acc.n >= 8 ? acc.cep.toFixed(2) : "—"} <span className="u">m</span></div>
+          <div className="metric-lbl">horizontal CEP 50% · R95 {acc.n >= 8 ? acc.r95.toFixed(1) : "—"}m</div>
         </div>
         <div className="metric">
           <div className="metric-val">{timing.n >= 5 ? "±" + timing.sigma.toFixed(1) : "—"} <span className="u">µs</span></div>
-          <div className="metric-lbl">time sync (1σ jitter)</div>
+          <div className="metric-lbl">PPS timestamp jitter (1σ)</div>
         </div>
       </div>
       <div className="clock">

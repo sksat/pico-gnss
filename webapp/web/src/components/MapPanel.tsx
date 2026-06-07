@@ -1,19 +1,31 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { CircleMarker, MapContainer, Polyline, TileLayer, useMap } from "react-leaflet";
 import type { GnssState } from "../types";
 
 type LatLng = [number, number];
 
-/** 現在地が更新されたら追従。初回は invalidateSize でサイズを確定させる。 */
+/**
+ * 初回 fix で 1 回だけ中心合わせ。以後はズームを一切自動変更せず、ユーザが地図を
+ * ドラッグするまで pan で追従するだけ (ズームは常に保持・ユーザ操作を尊重)。
+ */
 function Follow({ pos }: { pos: LatLng | null }) {
   const map = useMap();
+  const inited = useRef(false);
+  const userHeld = useRef(false);
   useEffect(() => {
     setTimeout(() => map.invalidateSize(), 0);
+    const onDrag = () => { userHeld.current = true; }; // 手動ドラッグしたら追従停止
+    map.on("dragstart", onDrag);
+    return () => { map.off("dragstart", onDrag); };
   }, [map]);
   useEffect(() => {
     if (!pos) return;
-    if (map.getZoom() < 14) map.setView(pos, 17);
-    else map.panTo(pos, { animate: true, duration: 0.4 });
+    if (!inited.current) {
+      map.setView(pos, 17);
+      inited.current = true;
+    } else if (!userHeld.current) {
+      map.panTo(pos, { animate: false }); // ズーム保持のまま中心追従
+    }
   }, [pos?.[0], pos?.[1]]);
   return null;
 }

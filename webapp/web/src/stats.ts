@@ -10,22 +10,27 @@ export function std(a: number[]): number {
 }
 
 export interface Accuracy {
-  n: number;
-  drms: number; // 1σ horizontal (~63%)
-  twodrms: number; // 95%
-  cep: number; // 50%
+  n: number; // 計算に使った窓内サンプル数
+  total: number; // 蓄積総数
+  cep: number; // 経験的 50% 半径 (m)
+  r95: number; // 経験的 95% 半径 (m)
+  drms: number; // √(σE²+σN²) (1σ ~63%)
+  twodrms: number; // 2×DRMS (~95%, 正規分布近似)
   sE: number;
   sN: number;
   sAlt: number;
-  pts: { e: number; n: number }[]; // 平均からの East/North 偏差 (m)
+  pts: { e: number; n: number }[]; // 窓内の East/North 偏差 (m)
 }
 
 const M_PER_DEG = 111_320;
+// 直近ウィンドウだけで評価する (cold start 直後の収束ジャンプを除き、現在の条件を反映)。
+const WINDOW = 120; // ~2 min @ 1Hz
 
-/** 直近の測位点群から水平精度 (経験的なばらつき) を求める。 */
-export function computeAccuracy(pos: PosSample[]): Accuracy {
+export function computeAccuracy(all: PosSample[]): Accuracy {
+  const pos = all.slice(-WINDOW);
   const n = pos.length;
-  if (n < 2) return { n, drms: 0, twodrms: 0, cep: 0, sE: 0, sN: 0, sAlt: 0, pts: [] };
+  const empty: Accuracy = { n, total: all.length, cep: 0, r95: 0, drms: 0, twodrms: 0, sE: 0, sN: 0, sAlt: 0, pts: [] };
+  if (n < 3) return empty;
   const mLat = mean(pos.map((p) => p.lat));
   const mLon = mean(pos.map((p) => p.lon));
   const cosLat = Math.cos((mLat * Math.PI) / 180);
@@ -34,15 +39,14 @@ export function computeAccuracy(pos: PosSample[]): Accuracy {
   const sE = std(es);
   const sN = std(ns);
   const drms = Math.sqrt(sE * sE + sN * sN);
+  const radii = es.map((e, i) => Math.hypot(e, ns[i]!)).sort((a, b) => a - b);
+  const pct = (p: number) => radii[Math.min(radii.length - 1, Math.floor(p * radii.length))]!;
   const alts = pos.map((p) => p.alt).filter((a): a is number => a != null);
   return {
-    n,
-    drms,
-    twodrms: 2 * drms,
-    cep: 0.59 * (sE + sN),
-    sE,
-    sN,
-    sAlt: std(alts),
+    n, total: all.length,
+    cep: pct(0.5), r95: pct(0.95),
+    drms, twodrms: 2 * drms,
+    sE, sN, sAlt: std(alts),
     pts: pos.map((_, i) => ({ e: es[i]!, n: ns[i]! })),
   };
 }
@@ -55,7 +59,6 @@ export interface Timing {
   ppm: number; // 局部発振器オフセット
 }
 
-/** PPS 間隔偏差 (interval-1e6) の列から時刻精度指標を求める。 */
 export function computeTiming(dev: number[]): Timing {
   const n = dev.length;
   if (n < 2) return { n, meanInterval: 0, sigma: 0, pp: 0, ppm: 0 };
@@ -65,6 +68,6 @@ export function computeTiming(dev: number[]): Timing {
     meanInterval: 1_000_000 + m,
     sigma: std(dev),
     pp: Math.max(...dev) - Math.min(...dev),
-    ppm: m, // µs/s = ppm
+    ppm: m,
   };
 }

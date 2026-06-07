@@ -133,15 +133,15 @@ export function AccuracyPanel({ s, acc }: { s: GnssState; acc: Accuracy }) {
   const f = s.fix;
   return (
     <section className="panel">
-      <h2>Position accuracy <span className="hdr-aux">{acc.n} samples</span></h2>
+      <h2>Position accuracy <span className="hdr-aux">{acc.n}/{acc.total} samples · ~2 min window</span></h2>
       <Canvas className="canvas-scatter" draw={(ctx, w, h) => {
         const cx = w / 2, cy = h / 2, R = Math.min(w, h) / 2 - 10;
-        const maxR = Math.max(acc.twodrms * 1.3, 2, ...acc.pts.map((p) => Math.hypot(p.e, p.n)));
+        const maxR = Math.max(acc.r95 * 1.25, 2, ...acc.pts.map((p) => Math.hypot(p.e, p.n)));
         const sc = R / maxR;
         ctx.strokeStyle = "#1f2a36"; ctx.fillStyle = "#5a6b7b";
         ctx.font = "9px ui-monospace, monospace"; ctx.textAlign = "left"; ctx.textBaseline = "top";
         ctx.beginPath(); ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R); ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy); ctx.stroke();
-        for (const [rr, col, lab] of [[acc.drms, "#3b82f6", "1σ"], [acc.twodrms, "#f59e0b", "2DRMS"]] as const) {
+        for (const [rr, col, lab] of [[acc.cep, "#36d399", "CEP"], [acc.r95, "#f59e0b", "R95"]] as const) {
           if (rr <= 0) continue;
           ctx.strokeStyle = col; ctx.beginPath(); ctx.arc(cx, cy, rr * sc, 0, Math.PI * 2); ctx.stroke();
           ctx.fillStyle = col; ctx.fillText(`${lab} ${rr.toFixed(1)}m`, cx + 3, cy - rr * sc);
@@ -154,9 +154,9 @@ export function AccuracyPanel({ s, acc }: { s: GnssState; acc: Accuracy }) {
         }
       }} />
       <dl className="kv compact stat3">
-        <Row k="2DRMS 95%" v={acc.n >= 4 ? `${acc.twodrms.toFixed(2)} m` : "—"} />
-        <Row k="DRMS 1σ" v={acc.n >= 4 ? `${acc.drms.toFixed(2)} m` : "—"} />
         <Row k="CEP 50%" v={acc.n >= 4 ? `${acc.cep.toFixed(2)} m` : "—"} />
+        <Row k="R95 95%" v={acc.n >= 4 ? `${acc.r95.toFixed(2)} m` : "—"} />
+        <Row k="2DRMS" v={acc.n >= 4 ? `${acc.twodrms.toFixed(2)} m` : "—"} />
         <Row k="σ East" v={`${acc.sE.toFixed(2)} m`} />
         <Row k="σ North" v={`${acc.sN.toFixed(2)} m`} />
         <Row k="σ Alt" v={`${acc.sAlt.toFixed(2)} m`} />
