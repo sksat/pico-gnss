@@ -9,9 +9,14 @@ const QUALITY = ["No fix", "GPS", "DGPS", "PPS", "RTK", "Float RTK", "Estimated"
 const p2 = (n: number) => String(n).padStart(2, "0");
 const p3 = (n: number) => String(n).padStart(3, "0");
 const signed = (n: number) => (n >= 0 ? "+" : "") + n;
-/** ns のジッタを読みやすい単位で。 */
+/** ns のジッタ (常に正, σ) を読みやすい単位で。 */
 function jitterStr(ns: number): string {
   return Math.abs(ns) < 1000 ? `±${ns.toFixed(1)} ns` : `±${(ns / 1000).toFixed(2)} µs`;
+}
+/** 符号付きの誤差 (ns) を読みやすい単位で。 */
+function errStr(ns: number): string {
+  const s = ns >= 0 ? "+" : "";
+  return Math.abs(ns) < 1000 ? `${s}${ns} ns` : `${s}${(ns / 1000).toFixed(2)} µs`;
 }
 function dms(dd: number, lat: boolean): string {
   const hemi = lat ? (dd >= 0 ? "N" : "S") : dd >= 0 ? "E" : "W";
@@ -127,11 +132,12 @@ export function SyncPanel({ s }: { s: GnssState }) {
       <div className="sync-utc">{iso}</div>
       <dl className="kv compact">
         <Row k="disciplined freq" v={g ? `${g.ppb >= 0 ? "+" : ""}${(g.ppb / 1000).toFixed(3)} ppm` : "—"} />
-        <Row k="osc offset" v={g ? `${signed(g.ppb)} ppb` : "—"} />
+        <Row k="clock err (corr)" v={y ? errStr(y.err_ns) : "—"} />
+        <Row k="drift removed" v={g ? `~${(Math.abs(g.ppb) / 1000).toFixed(1)} µs/s` : "—"} />
         <Row k="holdover" v={g ? (inHoldover ? `${(g.holdoverMs / 1000).toFixed(0)} s ⚠` : "PPS locked") : "—"} />
-        <Row k="unix_s" v={y?.unix_s ?? "—"} />
       </dl>
-      <p className="hint">PIO の ns 精度 PPS 間隔で RP2040 水晶ドリフトを推定し UTC を規律。PPS 断中も周波数外挿で時刻を保持 (holdover)。</p>
+      <p className="hint">PIO の ns 精度 PPS 間隔で水晶ドリフトを推定し UTC を規律。clock err = 補正後の 1 秒先読み残差
+        (この精度で時刻を保持; PPS 断中も周波数外挿)。drift removed = 補正しなければ毎秒ずれていた量。</p>
     </section>
   );
 }

@@ -29,14 +29,14 @@ import { setTimeout as sleep } from "timers/promises";
 type Msg =
   | { t: "nmea"; s: string }
   | { t: "pps"; count: number; interval_us: number; interval_ns: number; state: string; missed: number }
-  | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number }
+  | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number; err_ns: number }
   | { t: "time"; unix_ns: number; ppb: number; holdover_ms: number; locked: boolean }
   | { t: "fw"; s: string }
   | { t: "status"; source: string; connected: boolean; note?: string };
 
 const NMEA_RE = /NMEA (\$[A-Za-z0-9]{2,5},[^*\s]*\*[0-9A-Fa-f]{2})/;
 const PPS_RE = /PPS count=(\d+) interval_us=(\d+) interval_ns=(\d+) state=(\w+) missed=(\d+)/;
-const SYNC_RE = /SYNC pps_local_us=(\d+) unix_s=(\d+) drift_us=(-?\d+)/;
+const SYNC_RE = /SYNC pps_local_us=(\d+) unix_s=(\d+) drift_us=(-?\d+)(?: err_ns=(-?\d+))?/;
 const TIME_RE = /TIME unix_ns=(\d+) ppb=(-?\d+) holdover_ms=(\d+) locked=([01])/;
 const FW_RE = /FW (\$PMTK705,[^*]*\*[0-9A-Fa-f]{2})/;
 
@@ -47,7 +47,7 @@ function parseLine(line: string): Msg | null {
   if ((m = PPS_RE.exec(line)))
     return { t: "pps", count: +m[1], interval_us: +m[2], interval_ns: +m[3], state: m[4], missed: +m[5] };
   if ((m = SYNC_RE.exec(line)))
-    return { t: "sync", pps_local_us: +m[1], unix_s: +m[2], drift_us: +m[3] };
+    return { t: "sync", pps_local_us: +m[1], unix_s: +m[2], drift_us: +m[3], err_ns: m[4] ? +m[4] : 0 };
   if ((m = TIME_RE.exec(line)))
     return { t: "time", unix_ns: +m[1], ppb: +m[2], holdover_ms: +m[3], locked: m[4] === "1" };
   return null;

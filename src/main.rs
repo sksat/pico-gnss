@@ -265,17 +265,22 @@ async fn main(spawner: Spawner) {
                     (time, date, pending_edge_ns)
                 {
                     let unix_s = civil_to_unix(y as i64, mo as i64, d as i64, h as i64, mi as i64, se as i64);
-                    let ppb = CLOCK.lock(|c| {
+                    let target = unix_s * 1_000_000_000;
+                    let (ppb, err_ns) = CLOCK.lock(|c| {
                         let mut c = c.borrow_mut();
-                        c.update_epoch(local_ns, unix_s * 1_000_000_000);
-                        c.freq_ppb()
+                        // 補正後の時刻精度: このエッジの UTC を「更新前のクロック (前回エポック+周波数)」で
+                        // 予測し、実際の UTC 秒との差を取る = 1 秒 holdover 後の残差 (補正が効いていれば ~µs)。
+                        let err = c.now_ns(local_ns).map(|pred| pred - target).unwrap_or(0);
+                        c.update_epoch(local_ns, target);
+                        (c.freq_ppb(), err)
                     });
-                    // SYNC (webapp 互換): drift は規律された ppb を µs/s で。
+                    // SYNC (webapp 互換): drift は規律された ppb を µs/s で。err_ns は補正後の予測残差。
                     info!(
-                        "SYNC pps_local_us={} unix_s={} drift_us={}",
+                        "SYNC pps_local_us={} unix_s={} drift_us={} err_ns={}",
                         local_ns / 1000,
                         unix_s,
-                        ppb / 1000
+                        ppb / 1000,
+                        err_ns
                     );
                 }
             }

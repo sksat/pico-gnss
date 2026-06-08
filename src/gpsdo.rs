@@ -92,6 +92,17 @@ impl DisciplinedClock {
         Some(eu + d - corr)
     }
 
+    /// 逆変換: 指定した UTC (Unix ns) が来る local 時刻 (ns)。周波数補正込み。
+    /// 「正確な UTC 時刻 T に何かを実行する」スケジューリングや、補正済みの待ち時間に使う。
+    pub fn local_for_unix_ns(&self, unix_ns: i64) -> Option<i64> {
+        let el = self.epoch_local_ns? as i64;
+        let eu = self.epoch_unix_ns?;
+        let dt = unix_ns - eu; // 真の経過 (ns)
+        // local 経過 = 真の経過 / (1 - ppb/1e9) ≈ 真 + 真*ppb/1e9 (ppb は小さい)。mppb は ppb*1000。
+        let d = dt + (dt as i128 * self.freq_mppb as i128 / 1_000_000_000_000i128) as i64;
+        Some(el + d)
+    }
+
     /// 最後に PPS で規律してからの経過 (holdover 時間, ns)。
     pub fn holdover_ns(&self, local_ns: u64) -> u64 {
         match self.last_disciplined_ns {
@@ -180,5 +191,22 @@ mod tests {
     fn now_is_none_before_epoch() {
         let c = DisciplinedClock::new();
         assert_eq!(c.now_ns(123), None);
+    }
+
+    #[test]
+    fn local_for_unix_roundtrips_with_now() {
+        let mut c = DisciplinedClock::new();
+        for _ in 0..40 {
+            c.update_freq(1_000_000_000 + 3000); // +3 ppm (現実的な水晶オフセット)
+        }
+        assert_eq!(c.freq_ppb(), 3000);
+        c.update_epoch(1_000_000_000, 5_000_000_000_000);
+        // 3 秒後の UTC が来る local 時刻を求め、その local で now_ns したら元の UTC に戻る。
+        let target = 5_000_000_000_000 + 3_000_000_000;
+        let local = c.local_for_unix_ns(target).unwrap();
+        let back = c.now_ns(local as u64).unwrap();
+        assert!((back - target).abs() <= 2, "roundtrip off by {}", back - target);
+        // 補正が効いていれば local 経過 > 真の経過 (水晶が速いぶん先に進む): +3ppm×3s ≈ +9µs。
+        assert!(local > 1_000_000_000 + 3_000_000_000);
     }
 }

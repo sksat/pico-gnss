@@ -103,7 +103,7 @@ export class Gnss {
         break;
       }
       case "sync":
-        this.sync = { unix_s: m.unix_s, pps_local_us: m.pps_local_us, drift_us: m.drift_us, wall: Date.now() };
+        this.sync = { unix_s: m.unix_s, pps_local_us: m.pps_local_us, drift_us: m.drift_us, err_ns: m.err_ns, wall: Date.now() };
         break;
       case "time":
         this.gpsdo = {

@@ -1,7 +1,7 @@
 export type Msg =
   | { t: "nmea"; s: string }
   | { t: "pps"; count: number; interval_us: number; interval_ns: number; state: string; missed: number }
-  | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number }
+  | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number; err_ns: number }
   | { t: "time"; unix_ns: number; ppb: number; holdover_ms: number; locked: boolean }
   | { t: "fw"; s: string }
   | { t: "status"; source: string; connected: boolean; note?: string };
@@ -47,6 +47,7 @@ export interface Sync {
   unix_s: number;
   pps_local_us: number;
   drift_us: number;
+  err_ns: number; // 補正後の 1 秒先読み残差 (時刻補正の精度)
   wall: number;
 }
 /** GPSDO の規律クロック状態 (firmware の TIME 行)。 */

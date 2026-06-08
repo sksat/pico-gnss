@@ -66,6 +66,9 @@ PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを�
   webapp はこれで device 規律クロックを表示し、PPS 断時は holdover カウンタを出す。
 - 補正式: 真の経過 = local 経過 − local経過 × ppb/1e9 (local が ppb 分速い/遅いぶんを補正)。
   ロック後 holdover に入ると、残差周波数誤差ぶんだけ時刻がドリフトする (フル ppm でなく)。
+- **時刻補正 API**: `now_ns(local)` = 規律 UTC (任意時刻), `local_for_unix_ns(utc)` = 指定 UTC が来る
+  local 時刻 (スケジューリング/補正待ち用)。精度は `err_ns` (補正後の 1 秒先読み残差) で測れる: 実機 **±数µs**
+  (絶対値の床は Instant の µs アンカー、周波数=holdover ドリフトは ppb 精度)。補正なしなら毎秒 ~2.8µs ずれる。
 
 ## ハマった罠
 
