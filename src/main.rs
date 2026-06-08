@@ -93,21 +93,21 @@ static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<DisciplinedClock>> 
 
 /// 位相制御の測定源。true=PIO ハード位相 (stage②, 本番)。false=旧 Instant 測定 (比較計測用)。
 const PHASE_USE_HW: bool = true;
-/// 位相同期のデッドバンド (ns)。検証済 500ns。0 にすると P が常時効くが弱信号で出力ジッタが増え、
-/// ζ0.35 のリミットサイクルは消えなかった (deadband は主因でなくループ遅れ由来)。
-const PHASE_DEADBAND_NS: i64 = 500;
-/// ロック判定: 位相がこの内 (5µs) のエッジを LOCK_HOLD 回連続でロック成立。
-const LOCK_NS: i64 = 5_000;
+/// 位相同期のデッドバンド (ns)。**0=P を常時効かせ全域で減衰**。Smith 予測子で遅延補償した上で
+/// Kp=1/8 (ζ≈0.71) にしたので、deadband 内で P が切れて無減衰になる事態を避ける。
+const PHASE_DEADBAND_NS: i64 = 0;
+/// ロック判定: 位相がこの内 (1µs) のエッジを LOCK_HOLD 回連続でロック成立。Smith でロックが ±80ns と
+/// 締まったので 1µs に下げた (旧 5µs)。
+const LOCK_NS: i64 = 1_000;
 const LOCK_HOLD: u32 = 5;
-/// 外れ値除去 (smart-friend 助言): ロック中にこの幅 (50µs) を超える位相は弱信号の不正 PPS/取りこぼし
-/// = 単発 garbage とみなし最大 OUTLIER_MAX 回まで棄却 (古い基準で巨大補正→出力 ~100ms ジャンプを防ぐ)。
-/// それ以上続けば本物の擾乱として再ロックに入る。水晶ドリフトは ~数十ns/s なので 50µs/1s 跳びは非物理。
-const OUTLIER_NS: i64 = 50_000;
-const OUTLIER_MAX: u32 = 8;
-/// 位相 I 項 (type-II PLL): ロック中、位相を周波数トリムに積分してドループ(定常オフセット)を 0 に。
-/// 固有周期 ≈ 2π√(PHASE_I_DEN) エッジ。減衰 ζ ≈ Kp/(2√Ki)。1/128 で実測 σ~300ns・mean~0 (検証済)。
-/// ※残差 ±300ns はループ遅れ d≈2 由来のリミットサイクル。ζ を上げても (Ki=1/512) 遅延が公式を裏切り
-/// 改善せず、弱信号で経験チューニングも収束しない。<300ns は Smith 予測子+安定信号が要る (NOTES 参照)。
+/// 外れ値除去 (smart-friend 助言): ロック中にこの幅を超える位相は弱信号の不正 PPS/取りこぼし = 単発 garbage
+/// とみなし最大 OUTLIER_MAX 回まで棄却。ロックが ±80ns になったので **3µs に下げ**、弱信号スパイク (4-10µs,
+/// 旧 50µs 閾値の下) が trim を蹴るのを防ぐ。それ以上続けば本物の擾乱として再ロック。
+const OUTLIER_NS: i64 = 3_000;
+const OUTLIER_MAX: u32 = 12;
+/// 位相 I 項 (type-II PLL): ロック中、予測位相を周波数トリムに積分してドループ(定常オフセット)を 0 に。
+/// 固有周期 ≈ 2π√(PHASE_I_DEN) エッジ。減衰 ζ ≈ Kp/(2√Ki) = (1/8)/(2/√128) ≈ 0.71 (Smith 予測子で遅延
+/// 補償済なので公式が成立)。Kp=1/8 + Smith + deadband=0 + 外れ値3µs で **実測 σ~35ns, mean~0** (NOTES)。
 const PHASE_I_DEN: i64 = 128;
 const PPB_TRIM_MAX: i64 = 3_000;
 /// D 項 (微分) ゲイン分母。d_corr = (ctrl − last_ctrl)/PHASE_D_DEN [ns]。位相速度に比例し振動を減衰。
@@ -267,7 +267,8 @@ async fn gen_capture_task(
     let mut ppb_trim: i64 = 0; // 位相 I 項 → 周波数トリム。**milli-ppb 単位** (高分解能。整数 ppb だと
                                // ctrl/DEN の truncate で deadzone、周期も 8ppb 量子化でリミットサイクルした)。
     let mut frac_acc: i64 = 0; // 周期の小数端数 (sigma-delta dither, ×1e12 スケール)。sub-cycle 周波数分解能。
-    let mut last_ctrl: i64 = 0; // 前エッジの位相 (D 項の微分用)
+    let mut last_ctrl: i64 = 0; // 前エッジの予測位相 (D 項の微分用)
+    let mut last_pd: i64 = 0; // 前エッジの P+D 補正 (Smith 予測の在飛行分。d≈2 なので 1 エッジ分)
     loop {
         let x = sm.rx().wait_pull().await; // x = 出力エッジの生カウンタ (C2_out)
         // GPS PPS の世代。前回の出力エッジから進んでいなければ GPS 欠落 → C0_GPS が古い → 補正に使わない
@@ -290,6 +291,10 @@ async fn gen_capture_task(
         });
         // 制御に使う位相: PIO ハード(stage②)。PHASE_USE_HW=false で旧 Instant 測定に切替 (比較計測用)。
         let ctrl = if PHASE_USE_HW { hwphase_ns } else { phase.unwrap_or(0) };
+        // **Smith 予測子**: 在飛行中(まだ位相に現れてない、前エッジに出した) P/D 補正だけ位相は下がる。
+        // それを引いた**予測位相 pred** で制御すると、ループ遅れ d≈2 が補償され ζ 公式が裏切られない。
+        // (外れ値/欠落の検出は生の ctrl で。pred は P/I/D ゲインにだけ使う。)
+        let pred = ctrl - last_pd;
         // 実験モード: 制御項を ~120 エッジ毎に巡回 (0=P, 1=PI, 2=PID)。各項の効果をホストで分離して見る。
         let cfg = if PHASE_EXPERIMENT { (count / 120) % 3 } else { 2 };
         let (use_i, use_d) = (cfg >= 1, cfg >= 2);
@@ -303,28 +308,28 @@ async fn gen_capture_task(
                 reject_cnt += 1; // ロック中の単発 garbage → 補正せずホールド (出力を飛ばさない)
             } else {
                 reject_cnt = 0;
-                // I 項: ロック中、位相を周波数トリム(milli-ppb)に積分 → ドループを 0 に。P 実験は 0。
-                // ctrl*1000/DEN で milli-ppb 分解能 (整数 truncate の deadzone 無し)。
+                // I 項: ロック中、予測位相を周波数トリム(milli-ppb)に積分 → ドループを 0 に。P 実験は 0。
                 if use_i {
                     if locked {
-                        ppb_trim = (ppb_trim - ctrl * 1000 / PHASE_I_DEN)
+                        ppb_trim = (ppb_trim - pred * 1000 / PHASE_I_DEN)
                             .clamp(-PPB_TRIM_MAX * 1000, PPB_TRIM_MAX * 1000);
                     }
                 } else {
                     ppb_trim = 0;
                 }
-                // P 項: deadband 外のみ。k=1/16 (ループ遅れ d≈2 に k=1/4 だと ±15µs リミットサイクル)。
-                if ctrl.abs() > PHASE_DEADBAND_NS {
-                    p_corr = (ctrl / 16).clamp(-100_000_000, 100_000_000);
+                // P 項: 予測位相に比例。Smith で遅延補償済なので ζ=Kp/(2√Ki)=(1/8)/(2/√128)≈0.71 が効く。
+                if pred.abs() > PHASE_DEADBAND_NS {
+                    p_corr = (pred / 8).clamp(-100_000_000, 100_000_000);
                 }
-                // D 項: 位相速度に比例し振動を減衰 (clean な PIO 測定なので D が使える)。
+                // D 項: 予測位相の速度に比例し振動を減衰。
                 if use_d && locked {
-                    d_corr = ((ctrl - last_ctrl) / PHASE_D_DEN).clamp(-100_000_000, 100_000_000);
+                    d_corr = ((pred - last_ctrl) / PHASE_D_DEN).clamp(-100_000_000, 100_000_000);
                 }
                 lock_cnt = if ctrl.abs() < LOCK_NS { (lock_cnt + 1).min(LOCK_HOLD) } else { 0 };
             }
         } // !valid (GPS 欠落等) は freq+I のみで自走 (holdover ホールド)、lock 状態は据え置き
-        last_ctrl = ctrl;
+        last_ctrl = pred;
+        last_pd = p_corr + d_corr;
         // 周期 = clk − overhead + 周波数調整(整数 cycle) − P − D。**周波数調整を sigma-delta で小数 dither**:
         // clk*(ppb + ppb_trim/1000)/1e9 を ×1e12 スケールで累積し整数 cycle を切り出す。これで周期が
         // 1 clk cycle(=8ppb) 量子化に制約されず sub-8ppb 分解能になり、I 項が正確な周波数に整定=リミットサイクル消滅。
