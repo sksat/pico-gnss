@@ -85,8 +85,8 @@ def sim_terms(exp):
         w[i] = 0.9 * w[i - 1] + rng.standard_normal() * floor * 0.44
     dist = drift + w
 
-    def run(kp, ki, kd, db=500):
-        p = np.full(M, 2000.0); ts = 0.0; lk = 0; last = 2000.0; eff = np.zeros(M)
+    def run(kp, ki, kd, db=500, init=2_400_000.0):  # 実測の取得開始 (~2.4ms) に初期値を合わせる
+        p = np.full(M, init); ts = 0.0; lk = 0; last = init; eff = np.zeros(M)
         for n in range(M - 1):
             c = p[n]; locked = lk >= 5
             pp = (c / kp) if abs(c) > db else 0.0
