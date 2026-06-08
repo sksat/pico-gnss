@@ -44,6 +44,8 @@ pnpm start
 uv run analyze.py /tmp/eval.log                       # テキスト集計 (stdlib のみ)
 uv run plot_report.py /tmp/eval.log out.png           # 評価図 (matplotlib/numpy)
 uv run plot_compare.py old.log new.log out.png        # 旧 vs 新手法の比較図 (stage② 等)
+uv run plot_terms.py exp.log out.png                  # 制御項 P/PI/PID の効果 (PHASE_EXPERIMENT ログ)
+uv run tune_gains.py exp.log out.png                  # 外乱を実機ログから取り、ゲインをオフライン掃引
 ```
 測位精度 (CEP/R95/2DRMS)・PPS ジッタ・GPSDO 安定度・時刻補正残差 (snap 済)・規律 PPS 出力ジッタ・
 位相同期の収束・holdover 誤差・衛星/C/N0 を出す。±1ms フィルタ・snap は firmware と揃えてある。

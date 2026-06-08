@@ -108,6 +108,11 @@ const OUTLIER_MAX: u32 = 8;
 /// ppb_trim -= ctrl/PHASE_I_DEN [ppb/edge]。P (÷16) より十分遅くして安定化。上限 ±3ppm。
 const PHASE_I_DEN: i64 = 128;
 const PPB_TRIM_MAX: i64 = 3_000;
+/// D 項 (微分) ゲイン分母。d_corr = (ctrl − last_ctrl)/PHASE_D_DEN [ns]。位相速度に比例し振動を減衰。
+const PHASE_D_DEN: i64 = 4;
+/// 制御項の実験モード: true で **P→PI→PID を ~120 エッジ毎に巡回**し各項の効果を観察 (cfg を PPSGEN に出力)。
+/// false で本番 = 常時 PID。
+const PHASE_EXPERIMENT: bool = false;
 
 /// 最新の GPS PPS エッジの生カウンタ値 (SM0)。stage② の PIO 位相計測で gen_capture が参照する。
 static C0_GPS: AtomicU32 = AtomicU32::new(0);
@@ -258,6 +263,7 @@ async fn gen_capture_task(
     let mut lock_cnt: u32 = 0; // 連続で位相が小さかったエッジ数 (≥LOCK_HOLD でロック)
     let mut reject_cnt: u32 = 0; // 連続で外れ値棄却したエッジ数
     let mut ppb_trim: i64 = 0; // 位相 I 項 → 周波数トリム (ppb)。ドループ(定常オフセット)を 0 に。
+    let mut last_ctrl: i64 = 0; // 前エッジの位相 (D 項の微分用)
     loop {
         let x = sm.rx().wait_pull().await; // x = 出力エッジの生カウンタ (C2_out)
         // GPS PPS の世代。前回の出力エッジから進んでいなければ GPS 欠落 → C0_GPS が古い → 補正に使わない
@@ -280,40 +286,50 @@ async fn gen_capture_task(
         });
         // 制御に使う位相: PIO ハード(stage②)。PHASE_USE_HW=false で旧 Instant 測定に切替 (比較計測用)。
         let ctrl = if PHASE_USE_HW { hwphase_ns } else { phase.unwrap_or(0) };
+        // 実験モード: 制御項を ~120 エッジ毎に巡回 (0=P, 1=PI, 2=PID)。各項の効果をホストで分離して見る。
+        let cfg = if PHASE_EXPERIMENT { (count / 120) % 3 } else { 2 };
+        let (use_i, use_d) = (cfg >= 1, cfg >= 2);
         // valid = この位相サンプルが信用できるか (GPS 新鮮 + 間隔健全)。
         let valid = fresh && sane && c0 != 0;
         let mut p_corr: i64 = 0; // 位相 P 項 (ns)。速い過渡を吸収。
+        let mut d_corr: i64 = 0; // 位相 D 項 (ns)。位相速度に比例し振動を減衰。
         if valid {
             let locked = lock_cnt >= LOCK_HOLD;
             if locked && ctrl.abs() > OUTLIER_NS && reject_cnt < OUTLIER_MAX {
                 reject_cnt += 1; // ロック中の単発 garbage → 補正せずホールド (出力を飛ばさない)
             } else {
                 reject_cnt = 0;
-                // I 項: ロック中、位相を周波数トリムに積分 → 比例制御の定常オフセット(ドループ)を 0 に。
-                if locked {
-                    ppb_trim = (ppb_trim - ctrl / PHASE_I_DEN).clamp(-PPB_TRIM_MAX, PPB_TRIM_MAX);
+                // I 項: ロック中、位相を周波数トリムに積分 → 定常オフセット(ドループ)を 0 に。P 実験は 0。
+                if use_i {
+                    if locked {
+                        ppb_trim = (ppb_trim - ctrl / PHASE_I_DEN).clamp(-PPB_TRIM_MAX, PPB_TRIM_MAX);
+                    }
+                } else {
+                    ppb_trim = 0;
                 }
                 // P 項: deadband 外のみ。k=1/16 (ループ遅れ d≈2 に k=1/4 だと ±15µs リミットサイクル)。
                 if ctrl.abs() > PHASE_DEADBAND_NS {
                     p_corr = (ctrl / 16).clamp(-100_000_000, 100_000_000);
                 }
+                // D 項: 位相速度に比例し振動を減衰 (clean な PIO 測定なので D が使える)。
+                if use_d && locked {
+                    d_corr = ((ctrl - last_ctrl) / PHASE_D_DEN).clamp(-100_000_000, 100_000_000);
+                }
                 lock_cnt = if ctrl.abs() < LOCK_NS { (lock_cnt + 1).min(LOCK_HOLD) } else { 0 };
             }
         } // !valid (GPS 欠落等) は freq+I のみで自走 (holdover ホールド)、lock 状態は据え置き
-        // 周期 = freq規律(ppb) + 位相I項(ppb_trim) − 位相P項(p_corr)。PIO ハード位相を type-II PLL で。
-        let period = clk + clk * (ppb + ppb_trim) / 1_000_000_000 - GEN_OVERHEAD - p_corr * clk / 1_000_000_000;
+        last_ctrl = ctrl;
+        // 周期 = freq規律(ppb) + I項(ppb_trim) − P項 − D項。PIO ハード位相を type-II/PID で。
+        let period = clk + clk * (ppb + ppb_trim) / 1_000_000_000 - GEN_OVERHEAD
+            - (p_corr + d_corr) * clk / 1_000_000_000;
         let _ = sm_gen.tx().try_push(period as u32);
         if let Some(iv) = interval_ns {
             count += 1;
-            // phase_ns=旧(Instant), hwphase_ns=新(PIO ハード), trim_ppb=位相I項の周波数トリム。
+            // 制御信号を全部出力 → ホストでプラント同定 + ゲイン掃引シミュ + 項別比較ができる。
+            // (互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残し、cfg/trim/p/d を追記)
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={}",
-                count,
-                iv,
-                iv - 1_000_000_000,
-                phase.unwrap_or(0),
-                hwphase_ns,
-                ppb_trim
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cfg={} p_ns={} d_ns={}",
+                count, iv, iv - 1_000_000_000, phase.unwrap_or(0), hwphase_ns, ppb_trim, cfg, p_corr, d_corr
             );
         }
         last_x = Some(x);
