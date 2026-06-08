@@ -32,7 +32,6 @@ use panic_probe as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::clk_sys_freq;
-use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, UART0};
 use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{
@@ -63,6 +62,9 @@ const GNSS_BAUD: u32 = 9600;
 
 /// PIO 自走カウンタの 1 tick = 2 サイクル。
 const PIO_CYCLES_PER_TICK: u64 = 2;
+/// 規律 PPS 生成プログラム 1 周の固定オーバーヘッド (clk_sys サイクル)。X = 周期 - これ。
+/// ループバック計測で実測 1e9ns になるよう調整する値 (初期推定)。
+const GEN_OVERHEAD: i64 = 10;
 
 /// 起動時にモジュールへ送る PMTK 設定 (チェックサムは送信時に計算)。
 /// 実機で各コマンドに `$PMTK001,<cmd>,3`(成功) が返ることを確認済 (チップは MT3333 系)。
@@ -163,9 +165,11 @@ async fn config_task(mut tx: BufferedUartTx) {
     info!("pico-gnss: PMTK config sent ({} cmds)", PMTK_INIT.len());
 }
 
-/// 1Hz で GPSDO の規律 UTC を出すタスク。PPS が切れていても周波数外挿で時刻を保つ (holdover)。
+/// 1Hz タスク: GPSDO の規律 UTC を出す + 規律 PPS 生成 (SM1) の周期を ppb 補正で更新する。
+/// PPS が切れていても周波数外挿で時刻/周期を保つ (holdover)。
 #[embassy_executor::task]
-async fn time_task() {
+async fn time_task(mut sm_gen: StateMachine<'static, PIO0, 1>) {
+    let clk = clk_sys_freq() as i64;
     loop {
         Timer::after_secs(1).await;
         let local = now_local_ns();
@@ -183,51 +187,33 @@ async fn time_task() {
                 locked as u8
             );
         }
+        // 規律 PPS 生成 SM の周期を更新: 1 真秒 = clk×(1+ppb/1e9) clk_sys サイクル。
+        // プログラム 1 周 = X + GEN_OVERHEAD サイクルなので X = 周期 - overhead。
+        let period = clk + clk * ppb / 1_000_000_000 - GEN_OVERHEAD;
+        let _ = sm_gen.tx().try_push(period as u32);
     }
 }
 
-/// 規律 PPS 出力 (GP3): GPSDO 補正済みクロックで UTC 秒境界をスケジュールし、立ち上がりエッジを出す。
-/// GPS PPS が切れても (holdover) 周波数外挿で UTC 秒に合わせて出し続ける ← 規律出力の主目的。
-/// ※ ソフトタイミングなので late は embassy executor のジッタ (~µs〜) が下限。ns 精度には PIO 出力が要る。
+/// ループバック (GP3→GP4) で規律 PPS 出力の周期を計測するタスク (SM2 capture)。
+/// GP4 にジャンパで戻すと、PIO ハード生成した出力エッジを GPS PPS と同じ手法で ns 計測できる。
 #[embassy_executor::task]
-async fn pps_out_task(mut pin: Output<'static>) {
+async fn gen_capture_task(mut sm: StateMachine<'static, PIO0, 2>) {
+    let ns_per_tick: u64 = PIO_CYCLES_PER_TICK * 1_000_000_000 / clk_sys_freq() as u64;
+    let mut last_x: Option<u32> = None;
+    let mut count: u32 = 0;
     loop {
-        // 現在の規律 UTC (Instant 系)。エポック未確定なら待つ。
-        let now_local = now_local_ns();
-        let Some(now_unix) = CLOCK.lock(|c| c.borrow().now_from_instant_ns(now_local)) else {
-            Timer::after_millis(200).await;
-            continue;
-        };
-        // 次の UTC 秒境界が来るローカル Instant 時刻を補正込みで求める。
-        let next_sec = now_unix / 1_000_000_000 + 1;
-        let target_unix = next_sec * 1_000_000_000;
-        let Some(local_target) = CLOCK.lock(|c| c.borrow().local_instant_for_unix_ns(target_unix))
-        else {
-            Timer::after_millis(200).await;
-            continue;
-        };
-        // その時刻まで待つ。既に過ぎている/マッピング異常はスキップして次の秒へ。
-        let wait_ns = local_target - now_local_ns() as i64;
-        if wait_ns <= 0 || wait_ns >= 1_200_000_000 {
-            Timer::after_millis(50).await;
-            continue;
+        let x = sm.rx().wait_pull().await;
+        if let Some(lx) = last_x {
+            let interval_ns = lx.wrapping_sub(x) as u64 * ns_per_tick;
+            count += 1;
+            info!(
+                "PPSGEN count={} interval_ns={} dev_ns={}",
+                count,
+                interval_ns,
+                interval_ns as i64 - 1_000_000_000
+            );
         }
-        Timer::after_micros((wait_ns / 1000) as u64).await;
-
-        // 立ち上がりエッジ = 規律 PPS。20ms 幅のパルス。
-        pin.set_high();
-        let fired = now_local_ns();
-        let holdover = CLOCK.lock(|c| c.borrow().holdover_ns(fired));
-        info!(
-            "PPSOUT unix_s={} sched_us={} fired_us={} late_us={} holdover_ms={}",
-            next_sec,
-            local_target / 1000,
-            fired / 1000,
-            (fired as i64 - local_target) / 1000,
-            holdover / 1_000_000
-        );
-        Timer::after_millis(20).await;
-        pin.set_low();
+        last_x = Some(x);
     }
 }
 
@@ -237,7 +223,7 @@ async fn main(spawner: Spawner) {
     info!("pico-gnss: start (NMEA on UART0/GP1 @ {} baud, PPS on GP2 via PIO, GPSDO)", GNSS_BAUD);
 
     // PPS on GP2 を PIO0 SM0 でハードキャプチャ (自走ダウンカウンタを立ち上がりで push)。
-    let Pio { mut common, mut sm0, .. } = Pio::new(p.PIO0, Irqs);
+    let Pio { mut common, mut sm0, mut sm1, mut sm2, .. } = Pio::new(p.PIO0, Irqs);
     let prg = pio_asm!(
         ".wrap_target",
         "low:",
@@ -261,10 +247,44 @@ async fn main(spawner: Spawner) {
     sm0.set_config(&pio_cfg);
     sm0.set_enable(true);
     spawner.spawn(pps_task(sm0).unwrap());
-    spawner.spawn(time_task().unwrap());
 
-    // 規律 PPS 出力を GP3 へ (GPSDO 補正済み UTC 秒境界。GPS 断中も holdover で継続)。
-    spawner.spawn(pps_out_task(Output::new(p.PIN_3, Level::Low)).unwrap());
+    // SM1: 規律 PPS 生成を GP3 へ。pull noblock で周期を保持し、毎周 X サイクル low + 短い high。
+    // CPU (time_task) が ppb 補正した周期を毎秒 push。エッジは PIO ハード生成なので ns クリーン。
+    // 周期は X に保持 (pull noblock は FIFO 空のとき X を OSR に再ロードする仕様)。
+    // カウントダウンは Y を使う ← X を delay で潰すと 2 発目以降が壊れる (ハマった)。
+    let gen_prg = pio_asm!(
+        "    set pindirs, 1", // GP3 を出力に (起動時 1 回; SET ピン=GP3)
+        ".wrap_target",
+        "    pull noblock",  // OSR = 新周期 (FIFO 空なら X = 保持中の周期)
+        "    mov x, osr",    // X = 周期 (保持; カウントダウンでは触らない)
+        "    mov y, osr",    // Y = カウントダウン用コピー
+        "    set pins, 1 [10]", // 立ち上がりエッジ + ~88ns high
+        "    set pins, 0",   // 立ち下がり
+        "delay:",
+        "    jmp y-- delay", // Y+1 サイクル low (X は保持)
+        ".wrap",
+    );
+    let gen_loaded = common.load_program(&gen_prg.program);
+    let gen_pin = common.make_pio_pin(p.PIN_3);
+    sm1.set_pin_dirs(PioDirection::Out, &[&gen_pin]);
+    let mut gen_cfg = PioConfig::default();
+    gen_cfg.use_program(&gen_loaded, &[]);
+    gen_cfg.set_set_pins(&[&gen_pin]);
+    sm1.set_config(&gen_cfg);
+    let _ = sm1.tx().try_push((clk_sys_freq() as i64 - GEN_OVERHEAD) as u32); // 初期周期 (ppb=0)
+    sm1.set_enable(true);
+
+    // SM2: ループバック (GP3→GP4 ジャンパ) で出力エッジを GPS PPS と同じ手法で捕捉・計測。
+    let lb_pin = common.make_pio_pin(p.PIN_4);
+    sm2.set_pin_dirs(PioDirection::In, &[&lb_pin]);
+    let mut lb_cfg = PioConfig::default();
+    lb_cfg.use_program(&loaded, &[]); // capture プログラムを再利用
+    lb_cfg.set_jmp_pin(&lb_pin);
+    sm2.set_config(&lb_cfg);
+    sm2.set_enable(true);
+
+    spawner.spawn(time_task(sm1).unwrap());
+    spawner.spawn(gen_capture_task(sm2).unwrap());
 
     // UART0: TX=GP0 (モジュール設定送信), RX=GP1 (NMEA 受信)。
     static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();

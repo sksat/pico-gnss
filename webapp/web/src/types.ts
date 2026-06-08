@@ -4,6 +4,7 @@ export type Msg =
   | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number; err_ns: number }
   | { t: "time"; unix_ns: number; ppb: number; holdover_ms: number; locked: boolean }
   | { t: "ppsout"; unix_s: number; late_us: number; holdover_ms: number }
+  | { t: "ppsgen"; count: number; interval_ns: number; dev_ns: number }
   | { t: "fw"; s: string }
   | { t: "status"; source: string; connected: boolean; note?: string };
 
@@ -66,6 +67,12 @@ export interface PpsOut {
   holdover_ms: number;
   wall: number;
 }
+/** PIO 規律 PPS 生成出力 (GP3→GP4 ループバック計測)。 */
+export interface PpsGen {
+  count: number;
+  dev_ns: number; // 出力周期 - 1e9 (SM2 計測, ローカル counter なので +ppm 込み)
+  jitter_ns: number; // 直近の周期ばらつき (peak-peak)
+}
 export interface RawLine {
   ts: string;
   sentence: string;
@@ -98,6 +105,7 @@ export interface GnssState {
   sync: Sync | null;
   gpsdo: Gpsdo | null;
   ppsOut: PpsOut | null;
+  ppsGen: PpsGen | null;
   gst: Gst | null;
   fw: string | null;
   posHist: PosSample[];

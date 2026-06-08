@@ -32,6 +32,7 @@ type Msg =
   | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number; err_ns: number }
   | { t: "time"; unix_ns: number; ppb: number; holdover_ms: number; locked: boolean }
   | { t: "ppsout"; unix_s: number; late_us: number; holdover_ms: number }
+  | { t: "ppsgen"; count: number; interval_ns: number; dev_ns: number }
   | { t: "fw"; s: string }
   | { t: "status"; source: string; connected: boolean; note?: string };
 
@@ -40,6 +41,7 @@ const PPS_RE = /PPS count=(\d+) interval_us=(\d+) interval_ns=(\d+) state=(\w+) 
 const SYNC_RE = /SYNC pps_local_us=(\d+) unix_s=(\d+) drift_us=(-?\d+)(?: err_ns=(-?\d+))?/;
 const TIME_RE = /TIME unix_ns=(\d+) ppb=(-?\d+) holdover_ms=(\d+) locked=([01])/;
 const PPSOUT_RE = /PPSOUT unix_s=(\d+) sched_us=\d+ fired_us=\d+ late_us=(-?\d+) holdover_ms=(\d+)/;
+const PPSGEN_RE = /PPSGEN count=(\d+) interval_ns=(\d+) dev_ns=(-?\d+)/;
 const FW_RE = /FW (\$PMTK705,[^*]*\*[0-9A-Fa-f]{2})/;
 
 function parseLine(line: string): Msg | null {
@@ -54,6 +56,8 @@ function parseLine(line: string): Msg | null {
     return { t: "time", unix_ns: +m[1], ppb: +m[2], holdover_ms: +m[3], locked: m[4] === "1" };
   if ((m = PPSOUT_RE.exec(line)))
     return { t: "ppsout", unix_s: +m[1], late_us: +m[2], holdover_ms: +m[3] };
+  if ((m = PPSGEN_RE.exec(line)))
+    return { t: "ppsgen", count: +m[1], interval_ns: +m[2], dev_ns: +m[3] };
   return null;
 }
 
@@ -208,7 +212,7 @@ function startProbeRs(args: Args): void {
   const logStream = args.log ? fs.createWriteStream(args.log, { flags: "a" }) : null;
   if (logStream) console.log(`[bridge] logging raw lines to ${args.log}`);
   const onLine = (line: string) => {
-    if (logStream && (line.includes("NMEA ") || line.includes("PPS count=") || line.includes("SYNC ") || line.includes("TIME ") || line.includes("PPSOUT ") || line.includes("FW "))) {
+    if (logStream && (line.includes("NMEA ") || line.includes("PPS count=") || line.includes("SYNC ") || line.includes("TIME ") || line.includes("PPSOUT ") || line.includes("PPSGEN ") || line.includes("FW "))) {
       logStream.write(line + "\n");
     }
     if (line.includes("NMEA ") || line.includes("PPS count=") || line.includes("SYNC ")) {

@@ -76,11 +76,13 @@ PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを�
   ※ 連続時計 (TIME 行) の絶対値は依然 µs アンカー (PIO は FIFO 経由でエッジ時しか読めないため)。
 - **補正タイマ**: `true_to_local_ns(true_ns)` で「真の時間で N 待つ」のに必要なローカル ns を得る
   (生の `Timer::after` は水晶公差 +2.7ppm 分ズレる)。これと `local_instant_for_unix_ns` が補正の素。
-- **規律 PPS 出力 (GP3)**: `pps_out_task` が GPSDO 補正済みクロックで UTC 秒境界をスケジュールし、
-  GP3 に立ち上がりエッジを出す。GPS PPS が切れても holdover で UTC 秒に合わせて出し続ける。
-  ただし**ソフトタイミング**なので `late` は embassy executor のジッタが下限 (実機 mean ~1.4ms / σ ~244µs;
-  UART 処理と CLOCK ロック競合で遅延)。秒境界には毎回揃う (unix_s 連番・ドリフト無し) が、**ns/µs 精度の
-  エッジには PIO ハードウェア生成が必要** (今後)。`PPSOUT unix_s= sched_us= fired_us= late_us= holdover_ms=` を出力。
+- **規律 PPS 出力 — 2 段階**:
+  - ソフト版 (旧 `pps_out_task`): `local_instant_for_unix_ns` で UTC 秒境界をスケジュールし GPIO トグル。
+    holdover 対応だが `late` は embassy executor ジッタが下限 (実機 mean ~1.4ms / σ ~244µs) → 廃止。
+  - **PIO 版 (現行)**: SM1 が GP3 に規律パルスを**ハード生成** (周期 = clk×(1+ppb/1e9)-overhead を CPU が
+    毎秒 push、`pull noblock` で保持)。エッジは executor 非依存。SM2 が GP4 で**ループバック捕捉** (GP3→GP4
+    ジャンパ) し周期を計測。実機 **ジッタ 16ns (= PIO 1 tick、量子化の床)**・GPS PPS と ~24ppb 一致。
+    `PPSGEN count= interval_ns= dev_ns=` を出力。ソフト版比 ~1.5 万倍クリーン。
 
 ## ハマった罠
 
@@ -127,6 +129,19 @@ GYSFFMANC は QZSS を GLONASS のような専用 talker ($GQGSV) でなく **$G
 バイナリで延々デバッグする羽目になる (実際にハマった: `BufferedUartTx<'static>` の型エラーに気付かず、
 config 変更が一切効いてないのに「PMTK が効かない」と誤診)。**必ず `cargo build && probe-rs run` で繋ぐ**。
 バックグラウンド実行や `| tail` でエラーを見落としやすいので特に注意。
+
+### 10. PIO 自走カウンタ生成器: 周期保持は X、カウントダウンは Y に分ける
+規律 PPS 生成 (SM1) で `pull noblock; mov x,osr; ...; delay: jmp x-- delay` と書くと、`jmp x--` が
+**周期を保持しているはずの X を 0/0xFFFFFFFF まで潰す**。次周の `pull noblock` (FIFO 空→`mov osr,x` 仕様)
+がゴミを再ロードし、2 発目以降が ~34s 周期に化けた。→ **周期は X に保持、カウントダウンは Y** (`mov y,osr;
+jmp y-- delay`)。出力ピンは起動時に `set pindirs, 1` で出力許可する (SET ピン = 生成ピン)。
+
+### 11. 新しい firmware ログ行は「観測経路」にも必ず通す (phantom バグの温床)
+PIO 規律出力のループバック計測で `PPSGEN` が全く出ず、「3 個目の SM(SM2) が壊れている」と何度も
+リフラッシュして誤デバッグした。真因は **webapp server の `--log` フィルタ (NMEA/PPS/SYNC/TIME/… の
+include リスト) に `PPSGEN` を入れ忘れていただけ** で、firmware は最初から正常に出していた。
+→ **新ログ行を足したら server のフィルタ/パースにも足す。疑わしいときは server を介さず
+`probe-rs run <elf>` で生出力を直接 grep** して切り分ける (これで一発で判明した)。
 
 ## 精度指標の意味 (webapp ヘッダ)
 

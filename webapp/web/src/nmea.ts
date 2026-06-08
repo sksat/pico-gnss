@@ -81,6 +81,8 @@ export class Gnss {
   sync: GnssState["sync"] = null;
   gpsdo: GnssState["gpsdo"] = null;
   ppsOut: GnssState["ppsOut"] = null;
+  ppsGen: GnssState["ppsGen"] = null;
+  private genDevs: number[] = [];
   gst: GnssState["gst"] = null;
   fw: GnssState["fw"] = null;
   posHist: GnssState["posHist"] = [];
@@ -109,6 +111,17 @@ export class Gnss {
       case "ppsout":
         this.ppsOut = { unix_s: m.unix_s, late_us: m.late_us, holdover_ms: m.holdover_ms, wall: Date.now() };
         break;
+      case "ppsgen": {
+        // 起動直後の外れ値 (周期未確定) は除外して、直近のジッタ (peak-peak) を出す。
+        if (Math.abs(m.dev_ns) < 100_000) {
+          this.genDevs.push(m.dev_ns);
+          if (this.genDevs.length > 30) this.genDevs.shift();
+        }
+        const recent = this.genDevs.slice(-15);
+        const jitter = recent.length >= 2 ? Math.max(...recent) - Math.min(...recent) : 0;
+        this.ppsGen = { count: m.count, dev_ns: m.dev_ns, jitter_ns: jitter };
+        break;
+      }
       case "time":
         this.gpsdo = {
           unixMs: m.unix_ns / 1e6,
@@ -236,6 +249,7 @@ export class Gnss {
       sync: this.sync,
       gpsdo: this.gpsdo,
       ppsOut: this.ppsOut,
+      ppsGen: this.ppsGen,
       gst: this.gst,
       fw: this.fw,
       posHist: this.posHist.slice(),
