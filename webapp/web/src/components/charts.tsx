@@ -204,12 +204,46 @@ export function TimingPanel({ s, timing }: { s: GnssState; timing: Timing }) {
         ctx.textAlign = "left"; ctx.fillText(`${lo.toFixed(0)}ns`, 1, h - 2);
         ctx.textAlign = "right"; ctx.fillText(`${hi.toFixed(0)}ns`, w - 1, h - 2);
       }} />
+      <div className="chart-label">clock err (補正後 UTC 残差, ns) · 緑帯 = MT3333 1PPS spec ±10ns</div>
+      <Canvas className="canvas-line" draw={(ctx, w, h) => {
+        const e = s.errHist;
+        if (e.length < 2) return;
+        const maxAbs = Math.max(30, ...e.map((x) => Math.abs(x)));
+        const yb = (v: number) => h * (1 - (v + maxAbs) / (2 * maxAbs));
+        ctx.fillStyle = "#10312420"; ctx.fillRect(0, yb(10), w, yb(-10) - yb(10));
+        ctx.strokeStyle = "#2a6b4f"; ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(0, yb(10)); ctx.lineTo(w, yb(10)); ctx.moveTo(0, yb(-10)); ctx.lineTo(w, yb(-10)); ctx.stroke(); ctx.setLineDash([]);
+        ctx.strokeStyle = "#22303d"; ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+        ctx.fillStyle = "#475569"; ctx.font = "9px ui-monospace, monospace"; ctx.textAlign = "left";
+        ctx.fillText(`+${maxAbs.toFixed(0)}ns`, 2, 9); ctx.fillText(`-${maxAbs.toFixed(0)}ns`, 2, h - 3);
+        drawLine(ctx, w, h, e.slice(-240), "#34d399", -maxAbs, maxAbs, 3);
+      }} />
+      <div className="chart-label">holdover 経過 (s) → 補正後誤差 (ns) · 途切れが長いほど誤差↑ (黄=PPS断復帰)</div>
+      <Canvas className="canvas-line" draw={(ctx, w, h) => {
+        const pts = s.holdoverPts;
+        if (pts.length < 1) return;
+        const hMax = Math.max(2, ...pts.map((p) => p.h));
+        const eMax = Math.max(30, ...pts.map((p) => Math.abs(p.e)));
+        const X = (hh: number) => (Math.sqrt(hh - 1) / Math.sqrt(Math.max(1, hMax - 1))) * (w - 6) + 3;
+        const Y = (ee: number) => (h - 12) * (1 - Math.abs(ee) / eMax) + 2;
+        ctx.strokeStyle = "#2a6b4f"; ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(0, Y(10)); ctx.lineTo(w, Y(10)); ctx.stroke(); ctx.setLineDash([]);
+        for (const p of pts) {
+          const big = p.h > 2;
+          ctx.fillStyle = big ? "#fbbf24" : "#38bdf8";
+          ctx.globalAlpha = big ? 0.95 : 0.45;
+          ctx.beginPath(); ctx.arc(X(p.h), Y(p.e), big ? 2.6 : 1.4, 0, 7); ctx.fill();
+        }
+        ctx.globalAlpha = 1; ctx.fillStyle = "#475569"; ctx.font = "9px ui-monospace, monospace";
+        ctx.textAlign = "left"; ctx.fillText("1s", 2, h - 2);
+        ctx.textAlign = "right"; ctx.fillText(`${hMax.toFixed(0)}s`, w - 1, h - 2); ctx.fillText(`±${eMax.toFixed(0)}ns`, w - 1, 9);
+      }} />
       <dl className="kv compact stat3">
         <Row k="jitter σ" v={timing.n >= 2 ? `${timing.sigma.toFixed(1)} ns` : "—"} />
         <Row k="peak-peak" v={timing.n >= 2 ? `${timing.pp.toFixed(0)} ns` : "—"} />
         <Row k="osc offset" v={timing.n >= 2 ? `${timing.ppm >= 0 ? "+" : ""}${timing.ppm.toFixed(2)} ppm` : "—"} />
-        <Row k="interval µ" v={timing.n >= 2 ? `${(timing.meanIntervalNs / 1000).toFixed(2)} µs` : "—"} />
-        <Row k="est. UTC σ" v={timing.n >= 5 ? `±${timing.sigma.toFixed(1)} ns` : "—"} />
+        <Row k="clock err σ" v={s.errHist.length >= 5 ? `${Math.sqrt(s.errHist.reduce((a, x) => a + x * x, 0) / s.errHist.length).toFixed(1)} ns` : "—"} />
+        <Row k="max holdover" v={s.holdoverPts.length ? `${Math.max(...s.holdoverPts.map((p) => p.h)).toFixed(0)} s` : "—"} />
         <Row k="missed" v={s.pps?.missed ?? 0} />
       </dl>
     </section>

@@ -79,6 +79,8 @@ export class Gnss {
   pps: GnssState["pps"] = null;
   ppsDev: number[] = [];
   sync: GnssState["sync"] = null;
+  errHist: GnssState["errHist"] = [];
+  holdoverPts: GnssState["holdoverPts"] = [];
   gpsdo: GnssState["gpsdo"] = null;
   ppsOut: GnssState["ppsOut"] = null;
   ppsGen: GnssState["ppsGen"] = null;
@@ -106,7 +108,12 @@ export class Gnss {
         break;
       }
       case "sync":
-        this.sync = { unix_s: m.unix_s, pps_local_us: m.pps_local_us, drift_us: m.drift_us, err_ns: m.err_ns, wall: Date.now() };
+        this.sync = { unix_s: m.unix_s, pps_local_us: m.pps_local_us, drift_us: m.drift_us, err_ns: m.err_ns, holdover_ms: m.holdover_ms, wall: Date.now() };
+        this.errHist.push(m.err_ns);
+        if (this.errHist.length > 240) this.errHist.shift();
+        // holdover 経過 (s) と その時の誤差。途切れがあれば h>1 の点が右に伸びる。
+        this.holdoverPts.push({ h: Math.max(1, m.holdover_ms / 1000), e: m.err_ns });
+        if (this.holdoverPts.length > 400) this.holdoverPts.shift();
         break;
       case "ppsout":
         this.ppsOut = { unix_s: m.unix_s, late_us: m.late_us, holdover_ms: m.holdover_ms, wall: Date.now() };
@@ -247,6 +254,8 @@ export class Gnss {
       pps: this.pps,
       ppsDev: this.ppsDev.slice(-400),
       sync: this.sync,
+      errHist: this.errHist.slice(),
+      holdoverPts: this.holdoverPts.slice(),
       gpsdo: this.gpsdo,
       ppsOut: this.ppsOut,
       ppsGen: this.ppsGen,

@@ -1,7 +1,7 @@
 export type Msg =
   | { t: "nmea"; s: string }
   | { t: "pps"; count: number; interval_us: number; interval_ns: number; state: string; missed: number }
-  | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number; err_ns: number }
+  | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number; err_ns: number; holdover_ms: number }
   | { t: "time"; unix_ns: number; ppb: number; holdover_ms: number; locked: boolean }
   | { t: "ppsout"; unix_s: number; late_us: number; holdover_ms: number }
   | { t: "ppsgen"; count: number; interval_ns: number; dev_ns: number }
@@ -50,7 +50,13 @@ export interface Sync {
   pps_local_us: number;
   drift_us: number;
   err_ns: number; // 補正後の 1 秒先読み残差 (時刻補正の精度)
+  holdover_ms: number; // この err が何秒 holdover の誤差か (通常 ~1000)
   wall: number;
+}
+/** holdover 経過 (s) と その時の補正後誤差 (ns) の 1 点。 */
+export interface HoldoverPt {
+  h: number; // holdover 経過 (秒)
+  e: number; // 補正後 clock err (ns)
 }
 /** GPSDO の規律クロック状態 (firmware の TIME 行)。 */
 export interface Gpsdo {
@@ -103,6 +109,8 @@ export interface GnssState {
   pps: Pps | null;
   ppsDev: number[];
   sync: Sync | null;
+  errHist: number[]; // clock err (ns) の履歴
+  holdoverPts: HoldoverPt[]; // (holdover 秒, err ns) 散布
   gpsdo: Gpsdo | null;
   ppsOut: PpsOut | null;
   ppsGen: PpsGen | null;

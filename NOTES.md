@@ -188,3 +188,23 @@ TX→モジュール RX 配線時に適用され、各コマンドに `$PMTK001,
 現実的な水平精度の床は **~2-3m** (補強なしコンシューマ GNSS 相当)。サブメータが要るなら
 SLAS/CLAS 対応受信機 (u-blox F9 系等) が必要。
 秋月に[みちびき受信不具合の告知 (2022)](https://akizukidenshi.com/goodsaffix/gysffmanc_notification_20221118.pdf)あり。
+
+## 仕様との突き合わせ (実測 vs データシート)
+
+中身は MediaTek **MT3333** (FW `MT3333_AXN5.1.9`)。公称値と窓際固定での実測の比較:
+
+| 項目 | モジュール仕様 | 実測 (窓際) | 評価 |
+|---|---|---|---|
+| **1PPS 確度** | **±10 ns RMS** (MT3333) | **σ 11ns** (好条件) / 35ns (38分・温度込み) | **ほぼ仕様通り**。PIO 捕捉(16ns 分解能)が仕様を検証できている |
+| 測位精度 | 2m / 2.5m CEP (公称, 良好環境) | CEP 5〜13m | 窓際の弱信号で悪化 (環境律速、モジュールの非) |
+| 構成 | GPS/GLONASS/QZSS, 99ch, 10Hz | GPS+GLONASS 捕捉, QZSS 未捕捉, 1Hz 運用 | QZSS は窓際で C/N0 不足 |
+| 感度 (追尾) | ~ -165 dBm (MT3333) | C/N0 max ~28 dBHz | 弱信号 (窓際) |
+| 電源 | VCC 3.8-5V / IO 2-3.6V | VBUS 5V / 3.3V TTL | OK |
+
+- **1PPS が ±10ns 仕様にドンピシャ**なのが最大の収穫: 受信機が仕様通りに動いていることと、こちらの
+  PIO ハードキャプチャ (σ11ns) が**その仕様を実測検証できる精度**であることを同時に確認できた。
+  GPSDO 時刻補正の残差 (clock err σ ~11ns) もこの 1PPS 確度が源泉。
+- holdover 精度はデータシートに無い (GPSDO は自前実装)。実測で **25s 途切れ → ~360ns** (周波数安定度
+  ~15ppb からの理論見積りと一致)。webapp の「holdover 経過→誤差」散布図で可視化。
+- 出典: [MT3333 (MediaTek)](https://www.mediatek.com/products/location-intelligence/mt3333),
+  1PPS ±10ns は MT3333 系モジュール (LOCOSYS MC-1612 ±11ns / Skylab SKG09D ±10ns) でも一致。

@@ -345,22 +345,25 @@ async fn main(spawner: Spawner) {
                     pending_fresh = false; // このエッジは消費した
                     let unix_s = civil_to_unix(y as i64, mo as i64, d as i64, h as i64, mi as i64, se as i64);
                     let target = unix_s * 1_000_000_000;
-                    let (ppb, err_ns) = CLOCK.lock(|c| {
+                    let (ppb, err_ns, hold_ms) = CLOCK.lock(|c| {
                         let mut c = c.borrow_mut();
                         // 補正後の時刻精度: このエッジの UTC を「更新前のクロック (前回エポック+周波数)」で
                         // 予測し、実際の UTC 秒との差を取る = holdover 後の残差。PIO 時刻 (ns 精度) で計算。
                         // PPS が複数秒途切れて復帰すると整数秒ズレるので最寄り秒へ snap し、真の sub 秒残差を出す。
                         let err = c.now_ns(pio_ns).map(|pred| snap_to_second_ns(pred - target)).unwrap_or(0);
+                        // この sync が前回 sync から何 ms 経っているか (= この err が何秒 holdover の誤差か)。
+                        let hold = (c.holdover_ns(inst_ns) / 1_000_000) as u32;
                         c.update_epoch(pio_ns, inst_ns, target);
-                        (c.freq_ppb(), err)
+                        (c.freq_ppb(), err, hold)
                     });
-                    // SYNC (webapp 互換): drift は規律された ppb を µs/s で。err_ns は補正後の予測残差 (ns)。
+                    // SYNC: err_ns は補正後の予測残差 (ns)、holdover_ms はこの err の holdover 経過。
                     info!(
-                        "SYNC pps_local_us={} unix_s={} drift_us={} err_ns={}",
+                        "SYNC pps_local_us={} unix_s={} drift_us={} err_ns={} holdover_ms={}",
                         pio_ns / 1000,
                         unix_s,
                         ppb / 1000,
-                        err_ns
+                        err_ns,
+                        hold_ms
                     );
                 }
             }
