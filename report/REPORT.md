@@ -63,6 +63,13 @@ host テスト 35 green。
 
 ## 制御方式 (P / PI / PID) の比較とゲインチューニング
 
+実機で制御構成を巡回 (PHASE_EXPERIMENT=true, `webapp/plot_ctrl.py`):
+
+![ctrl](ctrl.png)
+
+**P/PD はドループ(+250ns, I 無しでオフセットが残る) / PI・PID は 0 中心(I が消す) / PID+Smith は ±50ns**。
+スパイクは弱信号の PPS 欠落 (outlier reject で保持→復帰)。下記はオフライン sim での定量比較:
+
 ![tune](tune.png)
 
 「PI だと残差振動がある。D は要る？」を検証。**実機ログから外乱(系統ドリフト+測定フロア)を取り出し、

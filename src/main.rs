@@ -291,13 +291,20 @@ async fn gen_capture_task(
         });
         // 制御に使う位相: PIO ハード(stage②)。PHASE_USE_HW=false で旧 Instant 測定に切替 (比較計測用)。
         let ctrl = if PHASE_USE_HW { hwphase_ns } else { phase.unwrap_or(0) };
-        // **Smith 予測子**: 在飛行中(まだ位相に現れてない、前エッジに出した) P/D 補正だけ位相は下がる。
-        // それを引いた**予測位相 pred** で制御すると、ループ遅れ d≈2 が補償され ζ 公式が裏切られない。
-        // (外れ値/欠落の検出は生の ctrl で。pred は P/I/D ゲインにだけ使う。)
-        let pred = ctrl - last_pd;
-        // 実験モード: 制御項を ~120 エッジ毎に巡回 (0=P, 1=PI, 2=PID)。各項の効果をホストで分離して見る。
-        let cfg = if PHASE_EXPERIMENT { (count / 120) % 3 } else { 2 };
-        let (use_i, use_d) = (cfg >= 1, cfg >= 2);
+        // 実験モード: 制御構成を ~130 エッジ毎に巡回し実機で比較 (0=P,1=PD,2=PI,3=PID,4=PID+Smith)。
+        // 先頭を PID+Smith にしてコールドスタートをロックしてから P/PD/PI/PID を回す。本番は常に 4。
+        let cfg: u32 = if PHASE_EXPERIMENT {
+            let ph = (count / 130) % 5;
+            if ph == 0 { 4 } else { ph - 1 }
+        } else {
+            4
+        };
+        let use_i = matches!(cfg, 2 | 3 | 4);
+        let use_d = matches!(cfg, 1 | 3 | 4);
+        let use_smith = cfg == 4;
+        // **Smith 予測子**: 在飛行中(前エッジに出した、まだ位相に現れてない) P/D 補正を引いた予測位相 pred で
+        // 制御 → ループ遅れ d≈2 を補償し ζ 公式が成立。Smith 無しの構成では生の ctrl を使う。
+        let pred = if use_smith { ctrl - last_pd } else { ctrl };
         // valid = この位相サンプルが信用できるか (GPS 新鮮 + 間隔健全)。
         let valid = fresh && sane && c0 != 0;
         let mut p_corr: i64 = 0; // 位相 P 項 (ns)。速い過渡を吸収。

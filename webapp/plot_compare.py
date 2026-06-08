@@ -138,7 +138,7 @@ for v in (1e6, -1e6, 1e3, -1e3):
     a.axhline(v, color="#ccc", lw=0.5, ls="--")
 a.axhline(0, color="#888", lw=0.7)
 a.set_title("A. 出力位相 (symlog): ①Instant測定→②PIO+PID(振動)→③PID+Smith で詰める段階", fontsize=9.5)
-a.set_xlabel("経過時間[s] (実測) / エッジ (sim)"); a.set_ylabel("UTC 秒境界からのズレ [ns]")
+a.set_xlabel("各 run の経過時間 [s]"); a.set_ylabel("UTC 秒境界からのズレ [ns]")
 a.legend(fontsize=7.5, loc="upper right"); a.grid(True, which="both", alpha=0.15)
 
 # B: 測定精度. 旧 run で同じ出力を Instant と PIO で測った差 = Instant の測定ノイズ。
