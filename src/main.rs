@@ -93,8 +93,8 @@ static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<DisciplinedClock>> 
 
 /// 位相制御の測定源。true=PIO ハード位相 (stage②, 本番)。false=旧 Instant 測定 (比較計測用)。
 const PHASE_USE_HW: bool = true;
-/// 位相同期のデッドバンド (ns)。この内なら無補正で周期を 16ns クリーンに保つ。
-/// PIO ハード位相 (ns クリーン) を使うので小さく取れる (Instant 時代は ms ノイズで 50µs だった)。
+/// 位相同期のデッドバンド (ns)。検証済 500ns。0 にすると P が常時効くが弱信号で出力ジッタが増え、
+/// ζ0.35 のリミットサイクルは消えなかった (deadband は主因でなくループ遅れ由来)。
 const PHASE_DEADBAND_NS: i64 = 500;
 /// ロック判定: 位相がこの内 (5µs) のエッジを LOCK_HOLD 回連続でロック成立。
 const LOCK_NS: i64 = 5_000;
@@ -104,8 +104,10 @@ const LOCK_HOLD: u32 = 5;
 /// それ以上続けば本物の擾乱として再ロックに入る。水晶ドリフトは ~数十ns/s なので 50µs/1s 跳びは非物理。
 const OUTLIER_NS: i64 = 50_000;
 const OUTLIER_MAX: u32 = 8;
-/// 位相 I 項 (type-II PLL): ロック中、位相を周波数トリム ppb に積分してドループ(定常オフセット)を 0 に。
-/// ppb_trim -= ctrl/PHASE_I_DEN [ppb/edge]。P (÷16) より十分遅くして安定化。上限 ±3ppm。
+/// 位相 I 項 (type-II PLL): ロック中、位相を周波数トリムに積分してドループ(定常オフセット)を 0 に。
+/// 固有周期 ≈ 2π√(PHASE_I_DEN) エッジ。減衰 ζ ≈ Kp/(2√Ki)。1/128 で実測 σ~300ns・mean~0 (検証済)。
+/// ※残差 ±300ns はループ遅れ d≈2 由来のリミットサイクル。ζ を上げても (Ki=1/512) 遅延が公式を裏切り
+/// 改善せず、弱信号で経験チューニングも収束しない。<300ns は Smith 予測子+安定信号が要る (NOTES 参照)。
 const PHASE_I_DEN: i64 = 128;
 const PPB_TRIM_MAX: i64 = 3_000;
 /// D 項 (微分) ゲイン分母。d_corr = (ctrl − last_ctrl)/PHASE_D_DEN [ns]。位相速度に比例し振動を減衰。
@@ -262,7 +264,9 @@ async fn gen_capture_task(
     let mut last_gen: u32 = 0;
     let mut lock_cnt: u32 = 0; // 連続で位相が小さかったエッジ数 (≥LOCK_HOLD でロック)
     let mut reject_cnt: u32 = 0; // 連続で外れ値棄却したエッジ数
-    let mut ppb_trim: i64 = 0; // 位相 I 項 → 周波数トリム (ppb)。ドループ(定常オフセット)を 0 に。
+    let mut ppb_trim: i64 = 0; // 位相 I 項 → 周波数トリム。**milli-ppb 単位** (高分解能。整数 ppb だと
+                               // ctrl/DEN の truncate で deadzone、周期も 8ppb 量子化でリミットサイクルした)。
+    let mut frac_acc: i64 = 0; // 周期の小数端数 (sigma-delta dither, ×1e12 スケール)。sub-cycle 周波数分解能。
     let mut last_ctrl: i64 = 0; // 前エッジの位相 (D 項の微分用)
     loop {
         let x = sm.rx().wait_pull().await; // x = 出力エッジの生カウンタ (C2_out)
@@ -299,10 +303,12 @@ async fn gen_capture_task(
                 reject_cnt += 1; // ロック中の単発 garbage → 補正せずホールド (出力を飛ばさない)
             } else {
                 reject_cnt = 0;
-                // I 項: ロック中、位相を周波数トリムに積分 → 定常オフセット(ドループ)を 0 に。P 実験は 0。
+                // I 項: ロック中、位相を周波数トリム(milli-ppb)に積分 → ドループを 0 に。P 実験は 0。
+                // ctrl*1000/DEN で milli-ppb 分解能 (整数 truncate の deadzone 無し)。
                 if use_i {
                     if locked {
-                        ppb_trim = (ppb_trim - ctrl / PHASE_I_DEN).clamp(-PPB_TRIM_MAX, PPB_TRIM_MAX);
+                        ppb_trim = (ppb_trim - ctrl * 1000 / PHASE_I_DEN)
+                            .clamp(-PPB_TRIM_MAX * 1000, PPB_TRIM_MAX * 1000);
                     }
                 } else {
                     ppb_trim = 0;
@@ -319,9 +325,14 @@ async fn gen_capture_task(
             }
         } // !valid (GPS 欠落等) は freq+I のみで自走 (holdover ホールド)、lock 状態は据え置き
         last_ctrl = ctrl;
-        // 周期 = freq規律(ppb) + I項(ppb_trim) − P項 − D項。PIO ハード位相を type-II/PID で。
-        let period = clk + clk * (ppb + ppb_trim) / 1_000_000_000 - GEN_OVERHEAD
-            - (p_corr + d_corr) * clk / 1_000_000_000;
+        // 周期 = clk − overhead + 周波数調整(整数 cycle) − P − D。**周波数調整を sigma-delta で小数 dither**:
+        // clk*(ppb + ppb_trim/1000)/1e9 を ×1e12 スケールで累積し整数 cycle を切り出す。これで周期が
+        // 1 clk cycle(=8ppb) 量子化に制約されず sub-8ppb 分解能になり、I 項が正確な周波数に整定=リミットサイクル消滅。
+        frac_acc += clk * (ppb * 1000 + ppb_trim);
+        let freq_cycles = frac_acc.div_euclid(1_000_000_000_000);
+        frac_acc = frac_acc.rem_euclid(1_000_000_000_000);
+        let period =
+            clk - GEN_OVERHEAD + freq_cycles - (p_corr + d_corr) * clk / 1_000_000_000;
         let _ = sm_gen.tx().try_push(period as u32);
         if let Some(iv) = interval_ns {
             count += 1;
@@ -329,7 +340,7 @@ async fn gen_capture_task(
             // (互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残し、cfg/trim/p/d を追記)
             info!(
                 "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cfg={} p_ns={} d_ns={}",
-                count, iv, iv - 1_000_000_000, phase.unwrap_or(0), hwphase_ns, ppb_trim, cfg, p_corr, d_corr
+                count, iv, iv - 1_000_000_000, phase.unwrap_or(0), hwphase_ns, ppb_trim / 1000, cfg, p_corr, d_corr
             );
         }
         last_x = Some(x);
