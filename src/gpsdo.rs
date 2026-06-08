@@ -15,8 +15,10 @@
 const EMA_SHIFT: u32 = 5;
 /// ロック判定に必要な周波数サンプル数。
 const LOCK_SAMPLES: u32 = 8;
-/// 妥当な PPS 間隔範囲 (1s ± 50ms)。外れ値は周波数推定に使わない。
-const SANE_DEV_NS: i64 = 50_000_000;
+/// 妥当な PPS 間隔範囲 (1s ± 1ms)。これより外れた間隔 (PIO ~68s 周回グリッチの偽短間隔
+/// ≈ -37ms や欠落の ~2s) は周波数推定に使わない。50ms だと周回グリッチがすり抜けて
+/// EMA を汚染した (実機評価で発覚)。真の間隔は 1s±数µs なので 1ms でも十分余裕がある。
+const SANE_DEV_NS: i64 = 1_000_000;
 
 /// PPS で規律されるクロックモデル。
 #[derive(Debug, Default)]
@@ -156,14 +158,14 @@ mod tests {
     #[test]
     fn now_applies_freq_correction_during_holdover() {
         let mut c = DisciplinedClock::new();
-        // +1,000,000 ppb = +1000 ppm (誇張) で補正を見やすく。
+        // +100,000 ppb = +100 ppm (誇張) で補正を見やすく (フィルタ ±1ms 内に収める)。
         for _ in 0..40 {
-            c.update_freq(1_000_000_000 + 1_000_000);
+            c.update_freq(1_000_000_000 + 100_000);
         }
-        assert_eq!(c.freq_ppb(), 1_000_000);
+        assert_eq!(c.freq_ppb(), 100_000);
         c.update_epoch(0, 0);
-        // local 経過 1e9 ns (= 1 local 秒)。真の経過 = 1e9 - 1e9*1e6/1e12 = 1e9 - 1e6。
-        assert_eq!(c.now_ns(1_000_000_000), Some(1_000_000_000 - 1_000_000));
+        // local 経過 1e9 ns。真の経過 = 1e9 - 1e9*1e5/1e12 = 1e9 - 1e5。
+        assert_eq!(c.now_ns(1_000_000_000), Some(1_000_000_000 - 100_000));
     }
 
     #[test]

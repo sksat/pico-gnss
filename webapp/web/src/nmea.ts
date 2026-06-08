@@ -94,8 +94,9 @@ export class Gnss {
       case "pps": {
         const devNs = m.interval_ns - 1_000_000_000;
         this.pps = { count: m.count, interval_us: m.interval_us, interval_ns: m.interval_ns, dev: devNs, state: m.state, missed: m.missed };
-        // PIO カウンタ wrap 等の外れ値 (1s±50ms 外) は精度統計から除外。
-        if (m.interval_ns > 0 && Math.abs(devNs) < 50_000_000) {
+        // PIO カウンタ ~68s 周回グリッチ (≈ -37ms) や欠落は精度統計から除外。±50ms だと
+        // 周回グリッチがすり抜けて σ を汚染したので ±1ms に絞る (真の間隔は 1s±数µs)。
+        if (m.interval_ns > 0 && Math.abs(devNs) < 1_000_000) {
           this.ppsDev.push(devNs); // ns
           if (this.ppsDev.length > 600) this.ppsDev.shift();
         }

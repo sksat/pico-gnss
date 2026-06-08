@@ -46,8 +46,10 @@ PPS 立ち上がりは UTC 秒境界。**その瞬間の local timer 値 (RP2040
 - CPU は連続する X の差 (wrapping_sub, ダウンカウンタ) から間隔を ns で得る。
 - 実測: interval ≈ 1,000,002,5xx ns、**ばらつきは 16ns 量子化だけ (σ ≈ 8-10ns, peak-peak 32ns)**。
   平均オフセット ≈ +2.5µs/s = **RP2040 水晶の +2.5 ppm** がクリーンに測れる。
-- 注意: X は ~68s で 1 周し、0 通過時に低位相ループで稀に誤キャプチャ (短い外れ間隔) が出る。
-  host 側で 1s±50ms 外の間隔を統計から除外している。
+- 注意: X は ~68s で 1 周し、0 通過時に低位相ループで稀に誤キャプチャ (短い偽間隔 ≈ -37ms) が出る。
+  **このグリッチを弾くフィルタは ±1ms と厳しくする** — 当初 ±50ms だと周回グリッチがすり抜けて
+  GPSDO の周波数 EMA を汚染し、freq が -3826ppm・σ が 2.5ms に化けた (実機評価で発覚)。真の間隔は
+  1s±数µs なので 1ms でも余裕。firmware (`DisciplinedClock::SANE_DEV_NS`) と webapp 両方で ±1ms。
 - firmware は `PPS ... interval_ns=<ns> ...` を出し、webapp は ns でジッタ σ を表示する。
 
 ### GPSDO (GPS 規律発振器)

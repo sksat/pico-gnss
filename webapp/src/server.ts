@@ -155,6 +155,7 @@ interface Args {
   elf: string;
   replay: string | null;
   attach: boolean;
+  log: string | null;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -164,6 +165,7 @@ function parseArgs(argv: string[]): Args {
     elf: "../target/thumbv6m-none-eabi/debug/pico-gnss",
     replay: null,
     attach: false,
+    log: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const v = argv[i];
@@ -172,6 +174,7 @@ function parseArgs(argv: string[]): Args {
     else if (v === "--elf") a.elf = argv[++i];
     else if (v === "--replay") a.replay = argv[++i];
     else if (v === "--attach") a.attach = true;
+    else if (v === "--log") a.log = argv[++i];
   }
   return a;
 }
@@ -197,7 +200,13 @@ function startProbeRs(args: Args): void {
     lastStatus = { t: "status", source: "probe-rs", connected: false, note: String(e) };
     return;
   }
+  // --log 指定時は probe-rs の生行をファイルにも書く (配信と同時にキャプチャ)。
+  const logStream = args.log ? fs.createWriteStream(args.log, { flags: "a" }) : null;
+  if (logStream) console.log(`[bridge] logging raw lines to ${args.log}`);
   const onLine = (line: string) => {
+    if (logStream && (line.includes("NMEA ") || line.includes("PPS count=") || line.includes("SYNC ") || line.includes("TIME ") || line.includes("FW "))) {
+      logStream.write(line + "\n");
+    }
     if (line.includes("NMEA ") || line.includes("PPS count=") || line.includes("SYNC ")) {
       lastStatus = { t: "status", source: `probe-rs ${sub}`, connected: true };
       broadcast(lastStatus);
