@@ -63,12 +63,14 @@ host テスト 35 green。
 
 ## 制御方式 (P / PI / PID) の比較とゲインチューニング
 
-実機で制御構成を巡回 (PHASE_EXPERIMENT=true, `webapp/plot_ctrl.py`):
+各構成を**別々の走行でコールドスタート(2.4ms)から**撮り起動エッジで重ねた公平比較 (`CTRL_SEL` でビルド,
+`webapp/plot_ctrl.py`。巡回だと前構成の終状態を引き継ぎ初期条件が揃わないため):
 
 ![ctrl](ctrl.png)
 
-**P/PD はドループ(+250ns, I 無しでオフセットが残る) / PI・PID は 0 中心(I が消す) / PID+Smith は ±50ns**。
-スパイクは弱信号の PPS 欠落 (outlier reject で保持→復帰)。下記はオフライン sim での定量比較:
+全構成が 2.4ms から始まり、**PID+Smith (Kp1/8) が最速で σ~38ns にロック**。他は **Kp1/16 (安定上限。1/8 は
+PI が発散する)** で緩慢 = **Smith の遅延補償が高ゲイン=速い収束を可能にしている**。Kp1/16 が遅く定常の
+構造 (P/PD ドループ・PI/PID 振動) までは届かないので、定常の項別比較は下記オフライン sim を参照:
 
 ![tune](tune.png)
 

@@ -115,6 +115,9 @@ const PHASE_D_DEN: i64 = 4;
 /// 制御項の実験モード: true で **P→PI→PID を ~120 エッジ毎に巡回**し各項の効果を観察 (cfg を PPSGEN に出力)。
 /// false で本番 = 常時 PID。
 const PHASE_EXPERIMENT: bool = false;
+/// 単一制御構成の固定選択 (PHASE_EXPERIMENT=false 時)。0=P,1=PD,2=PI,3=PID,4=PID+Smith(本番)。
+/// 各構成をコールドスタートから個別キャプチャして compare 風に重ねる用。
+const CTRL_SEL: u32 = 4;
 
 /// 最新の GPS PPS エッジの生カウンタ値 (SM0)。stage② の PIO 位相計測で gen_capture が参照する。
 static C0_GPS: AtomicU32 = AtomicU32::new(0);
@@ -297,7 +300,7 @@ async fn gen_capture_task(
             let ph = (count / 130) % 5;
             if ph == 0 { 4 } else { ph - 1 }
         } else {
-            4
+            CTRL_SEL // 本番=4(PID+Smith)。0-3 で単一構成に固定キャプチャ (compare 用の公平比較)
         };
         let use_i = matches!(cfg, 2 | 3 | 4);
         let use_d = matches!(cfg, 1 | 3 | 4);
@@ -324,9 +327,11 @@ async fn gen_capture_task(
                 } else {
                     ppb_trim = 0;
                 }
-                // P 項: 予測位相に比例。Smith で遅延補償済なので ζ=Kp/(2√Ki)=(1/8)/(2/√128)≈0.71 が効く。
+                // P 項: 予測位相に比例。**Smith あり=Kp 1/8 (ζ≈0.71, 遅延補償済なので公式成立)**、
+                // Smith 無し=1/16 (1/8 はループ遅れで不安定/発振)。= Smith が高ゲインを可能にしている。
+                let kp_inv = if use_smith { 8 } else { 16 };
                 if pred.abs() > PHASE_DEADBAND_NS {
-                    p_corr = (pred / 8).clamp(-100_000_000, 100_000_000);
+                    p_corr = (pred / kp_inv).clamp(-100_000_000, 100_000_000);
                 }
                 // D 項: 予測位相の速度に比例し振動を減衰。
                 if use_d && locked {
