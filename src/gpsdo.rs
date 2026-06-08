@@ -25,9 +25,10 @@ const SANE_DEV_NS: i64 = 1_000_000;
 pub struct DisciplinedClock {
     freq_mppb: i64, // 周波数オフセット EMA (milli-ppb = ppb*1000, 高分解能保持用)
     samples: u32,
-    epoch_local_ns: Option<u64>,
+    epoch_pio_ns: Option<u64>,     // PIO timebase のエポック (ns 精度, err/now_ns 用)
+    epoch_instant_ns: Option<u64>, // Instant timebase のエポック (連続クエリ/holdover 用)
     epoch_unix_ns: Option<i64>,
-    last_disciplined_ns: Option<u64>, // 最後に epoch を更新した local 時刻 (holdover 計測)
+    last_instant_ns: Option<u64>, // 最後に規律した Instant 時刻 (holdover 計測)
 }
 
 impl DisciplinedClock {
@@ -35,9 +36,10 @@ impl DisciplinedClock {
         Self {
             freq_mppb: 0,
             samples: 0,
-            epoch_local_ns: None,
+            epoch_pio_ns: None,
+            epoch_instant_ns: None,
             epoch_unix_ns: None,
-            last_disciplined_ns: None,
+            last_instant_ns: None,
         }
     }
 
@@ -58,11 +60,19 @@ impl DisciplinedClock {
         self.samples += 1;
     }
 
-    /// PPS エッジの local 時刻 (連続クロック基準) を UTC に対応付けてエポックを更新する。
-    pub fn update_epoch(&mut self, local_ns: u64, unix_ns: i64) {
-        self.epoch_local_ns = Some(local_ns);
+    /// PPS エッジを UTC に対応付けてエポックを更新する。
+    /// `pio_ns` = PIO の ns 精度時刻 (err/now_ns 用)、`instant_ns` = 連続して読める Instant 時刻
+    /// (ticker/holdover 用)。両者は同じ XOSC 由来で同じ周波数オフセットを持つ。
+    pub fn update_epoch(&mut self, pio_ns: u64, instant_ns: u64, unix_ns: i64) {
+        self.epoch_pio_ns = Some(pio_ns);
+        self.epoch_instant_ns = Some(instant_ns);
         self.epoch_unix_ns = Some(unix_ns);
-        self.last_disciplined_ns = Some(local_ns);
+        self.last_instant_ns = Some(instant_ns);
+    }
+
+    /// local 経過 d (ns) を周波数補正: 真の経過 = d - d*ppb/1e9 = d - d*mppb/1e12。
+    fn corrected(&self, d: i64) -> i64 {
+        d - (d as i128 * self.freq_mppb as i128 / 1_000_000_000_000i128) as i64
     }
 
     /// 推定周波数オフセット (ppb)。
@@ -81,32 +91,35 @@ impl DisciplinedClock {
         self.samples >= LOCK_SAMPLES
     }
 
-    /// 任意の local 時刻における規律 UTC (Unix ns)。**周波数補正込みなので holdover 中も有効**。
-    /// local は freq_ppb 分だけ速い/遅いので、経過分を補正して真の経過に直す。
-    pub fn now_ns(&self, local_ns: u64) -> Option<i64> {
-        let el = self.epoch_local_ns?;
+    /// **PIO timebase** の local 時刻 → 規律 UTC (Unix ns)。ns 精度。PPS エッジでの err 計測用。
+    pub fn now_ns(&self, pio_ns: u64) -> Option<i64> {
+        let ep = self.epoch_pio_ns?;
         let eu = self.epoch_unix_ns?;
-        let d = local_ns as i64 - el as i64;
-        // 補正: 真の経過 = d - d*ppb/1e9 = d - d*mppb/1e12
-        let corr = (d as i128 * self.freq_mppb as i128 / 1_000_000_000_000i128) as i64;
-        Some(eu + d - corr)
+        Some(eu + self.corrected(pio_ns as i64 - ep as i64))
     }
 
-    /// 逆変換: 指定した UTC (Unix ns) が来る local 時刻 (ns)。周波数補正込み。
+    /// **Instant timebase** の local 時刻 → 規律 UTC。連続クエリ (ticker) 用。サブ秒は Instant の µs 精度。
+    pub fn now_from_instant_ns(&self, instant_ns: u64) -> Option<i64> {
+        let ei = self.epoch_instant_ns?;
+        let eu = self.epoch_unix_ns?;
+        Some(eu + self.corrected(instant_ns as i64 - ei as i64))
+    }
+
+    /// 逆変換: 指定した UTC が来る **Instant timebase** の local 時刻 (ns)。周波数補正込み。
     /// 「正確な UTC 時刻 T に何かを実行する」スケジューリングや、補正済みの待ち時間に使う。
-    pub fn local_for_unix_ns(&self, unix_ns: i64) -> Option<i64> {
-        let el = self.epoch_local_ns? as i64;
+    pub fn local_instant_for_unix_ns(&self, unix_ns: i64) -> Option<i64> {
+        let ei = self.epoch_instant_ns? as i64;
         let eu = self.epoch_unix_ns?;
         let dt = unix_ns - eu; // 真の経過 (ns)
-        // local 経過 = 真の経過 / (1 - ppb/1e9) ≈ 真 + 真*ppb/1e9 (ppb は小さい)。mppb は ppb*1000。
+        // local 経過 = 真 / (1 - ppb/1e9) ≈ 真 + 真*ppb/1e9。mppb は ppb*1000。
         let d = dt + (dt as i128 * self.freq_mppb as i128 / 1_000_000_000_000i128) as i64;
-        Some(el + d)
+        Some(ei + d)
     }
 
-    /// 最後に PPS で規律してからの経過 (holdover 時間, ns)。
-    pub fn holdover_ns(&self, local_ns: u64) -> u64 {
-        match self.last_disciplined_ns {
-            Some(t) => local_ns.saturating_sub(t),
+    /// 最後に PPS で規律してからの経過 (holdover 時間, ns)。Instant timebase で渡す。
+    pub fn holdover_ns(&self, instant_ns: u64) -> u64 {
+        match self.last_instant_ns {
+            Some(t) => instant_ns.saturating_sub(t),
             None => 0,
         }
     }
@@ -161,7 +174,7 @@ mod tests {
     #[test]
     fn now_without_correction() {
         let mut c = DisciplinedClock::new();
-        c.update_epoch(1_000_000_000, 5_000_000_000_000);
+        c.update_epoch(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
         // freq=0 → 補正なし。0.5s 後。
         assert_eq!(c.now_ns(1_500_000_000), Some(5_000_500_000_000));
     }
@@ -174,7 +187,7 @@ mod tests {
             c.update_freq(1_000_000_000 + 100_000);
         }
         assert_eq!(c.freq_ppb(), 100_000);
-        c.update_epoch(0, 0);
+        c.update_epoch(0, 0, 0);
         // local 経過 1e9 ns。真の経過 = 1e9 - 1e9*1e5/1e12 = 1e9 - 1e5。
         assert_eq!(c.now_ns(1_000_000_000), Some(1_000_000_000 - 100_000));
     }
@@ -182,7 +195,7 @@ mod tests {
     #[test]
     fn holdover_counts_since_last_epoch() {
         let mut c = DisciplinedClock::new();
-        c.update_epoch(1_000_000_000, 0);
+        c.update_epoch(1_000_000_000, 1_000_000_000, 0);
         assert_eq!(c.holdover_ns(1_000_000_000), 0);
         assert_eq!(c.holdover_ns(4_000_000_000), 3_000_000_000); // 3s holdover
     }
@@ -200,11 +213,11 @@ mod tests {
             c.update_freq(1_000_000_000 + 3000); // +3 ppm (現実的な水晶オフセット)
         }
         assert_eq!(c.freq_ppb(), 3000);
-        c.update_epoch(1_000_000_000, 5_000_000_000_000);
-        // 3 秒後の UTC が来る local 時刻を求め、その local で now_ns したら元の UTC に戻る。
+        c.update_epoch(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
+        // 3 秒後の UTC が来る local 時刻を求め、その local で now すれば元の UTC に戻る (Instant 系)。
         let target = 5_000_000_000_000 + 3_000_000_000;
-        let local = c.local_for_unix_ns(target).unwrap();
-        let back = c.now_ns(local as u64).unwrap();
+        let local = c.local_instant_for_unix_ns(target).unwrap();
+        let back = c.now_from_instant_ns(local as u64).unwrap();
         assert!((back - target).abs() <= 2, "roundtrip off by {}", back - target);
         // 補正が効いていれば local 経過 > 真の経過 (水晶が速いぶん先に進む): +3ppm×3s ≈ +9µs。
         assert!(local > 1_000_000_000 + 3_000_000_000);

@@ -77,8 +77,9 @@ const PMTK_INIT: &[&str] = &[
     "PMTK605", // FW バージョン照会 → $PMTK705 で返る (ACK は無く応答が版情報)
 ];
 
-/// PPS エッジの local timestamp (Instant ns) を pps_task → main へ渡す (エポック固定用)。
-static PPS_TS: Signal<CriticalSectionRawMutex, u64> = Signal::new();
+/// PPS エッジの (PIO ns 時刻, Instant ns 時刻) を pps_task → main へ渡す。
+/// PIO 時刻は ns 精度 (err/エポック計算用)、Instant は連続クエリ (ticker/holdover) のアンカー用。
+static PPS_TS: Signal<CriticalSectionRawMutex, (u64, u64)> = Signal::new();
 
 /// GPSDO の規律クロック。pps_task が周波数を、main が UTC エポックを更新し、time_task が読む。
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<DisciplinedClock>> =
@@ -115,8 +116,8 @@ async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
 
     loop {
         let x = sm.rx().wait_pull().await; // エッジ時の自走ダウンカウンタ値
-        // エポック固定用の Instant 時刻 (µs ジッタは絶対オフセットのみに効き、周波数には効かない)。
-        PPS_TS.signal(now_local_ns());
+        // エポックのアンカー用に Instant をエッジ直後に読む (µs ジッタは絶対オフセットのみに効く)。
+        let inst_ns = now_local_ns();
 
         let interval_ns = match last_x {
             Some(lx) => lx.wrapping_sub(x) as u64 * ns_per_tick, // ダウンカウンタ: prev - curr
@@ -124,6 +125,9 @@ async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
         };
         last_x = Some(x);
         edge_ns += interval_ns;
+
+        // PIO の ns 精度時刻 (edge_ns) と Instant を main へ。err/エポックは edge_ns 基準で ns 精度。
+        PPS_TS.signal((edge_ns, inst_ns));
 
         // PIO の精密な間隔で水晶の周波数オフセットを規律。
         if interval_ns > 0 {
@@ -166,7 +170,8 @@ async fn time_task() {
         let local = now_local_ns();
         let (now, ppb, holdover, locked) = CLOCK.lock(|c| {
             let c = c.borrow();
-            (c.now_ns(local), c.freq_ppb(), c.holdover_ns(local), c.is_locked())
+            // 連続クエリは Instant 系 (サブ秒は µs 精度)。エポックの絶対対応は Instant アンカー。
+            (c.now_from_instant_ns(local), c.freq_ppb(), c.holdover_ns(local), c.is_locked())
         });
         if let Some(now) = now {
             info!(
@@ -227,7 +232,7 @@ async fn main(spawner: Spawner) {
 
     let mut assembler = NmeaLineAssembler::new();
     let mut read_buf = [0u8; 64];
-    let mut pending_edge_ns: Option<u64> = None;
+    let mut pending: Option<(u64, u64)> = None; // (PIO ns, Instant ns)
 
     loop {
         let n = match rx.read(&mut read_buf).await {
@@ -238,9 +243,9 @@ async fn main(spawner: Spawner) {
             Err(_) => continue,
         };
 
-        // PIO がラッチした最新 PPS エッジ (Instant 時刻) を覚えておく。
-        if let Some(t) = PPS_TS.try_take() {
-            pending_edge_ns = Some(t);
+        // PIO がラッチした最新 PPS エッジ (PIO ns, Instant ns) を覚えておく。
+        if let Some(e) = PPS_TS.try_take() {
+            pending = Some(e);
         }
 
         for &b in &read_buf[..n] {
@@ -261,23 +266,24 @@ async fn main(spawner: Spawner) {
             if s.get(3..6) == Some("RMC") {
                 let time = s.split(',').nth(1).and_then(parse_hhmmss);
                 let date = s.split(',').nth(9).and_then(parse_ddmmyy);
-                if let (Some((h, mi, se)), Some((d, mo, y)), Some(local_ns)) =
-                    (time, date, pending_edge_ns)
+                if let (Some((h, mi, se)), Some((d, mo, y)), Some((pio_ns, inst_ns))) =
+                    (time, date, pending)
                 {
                     let unix_s = civil_to_unix(y as i64, mo as i64, d as i64, h as i64, mi as i64, se as i64);
                     let target = unix_s * 1_000_000_000;
                     let (ppb, err_ns) = CLOCK.lock(|c| {
                         let mut c = c.borrow_mut();
                         // 補正後の時刻精度: このエッジの UTC を「更新前のクロック (前回エポック+周波数)」で
-                        // 予測し、実際の UTC 秒との差を取る = 1 秒 holdover 後の残差 (補正が効いていれば ~µs)。
-                        let err = c.now_ns(local_ns).map(|pred| pred - target).unwrap_or(0);
-                        c.update_epoch(local_ns, target);
+                        // 予測し、実際の UTC 秒との差を取る = 1 秒 holdover 後の残差。PIO 時刻 (ns 精度) で
+                        // 計算するので err も ns 精度 (Instant の µs ジッタに汚されない)。
+                        let err = c.now_ns(pio_ns).map(|pred| pred - target).unwrap_or(0);
+                        c.update_epoch(pio_ns, inst_ns, target);
                         (c.freq_ppb(), err)
                     });
-                    // SYNC (webapp 互換): drift は規律された ppb を µs/s で。err_ns は補正後の予測残差。
+                    // SYNC (webapp 互換): drift は規律された ppb を µs/s で。err_ns は補正後の予測残差 (ns)。
                     info!(
                         "SYNC pps_local_us={} unix_s={} drift_us={} err_ns={}",
-                        local_ns / 1000,
+                        pio_ns / 1000,
                         unix_s,
                         ppb / 1000,
                         err_ns
