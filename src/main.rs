@@ -52,8 +52,18 @@ use static_cell::StaticCell;
 
 use pico_gnss::{
     civil_to_unix, parse_ddmmyy, parse_hhmmss, snap_to_second_ns, DisciplinedClock,
-    NmeaLineAssembler, PpsEvent, PpsTracker,
+    FreqUpdate, NmeaLineAssembler, PpsEvent, PpsTracker,
 };
+
+/// `FreqUpdate` を defmt ログ用の短い文字列に。
+fn freq_update_str(fu: FreqUpdate) -> &'static str {
+    match fu {
+        FreqUpdate::Applied => "ok",
+        FreqUpdate::GatedSane => "sane",
+        FreqUpdate::GatedQuality => "gate",
+        FreqUpdate::Quarantined => "quar",
+    }
+}
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
@@ -69,14 +79,38 @@ const PIO_CYCLES_PER_TICK: u64 = 2;
 /// ループバック計測で実測 1e9ns になるよう調整する値 (初期推定)。
 const GEN_OVERHEAD: i64 = 10;
 
+/// 運用モード = 受信機の dynamic model (MT3333 PMTK886)。
+/// **この GPSDO は固定 timing 用途**なので既定は `FixedTiming` (stationary)。受信機に
+/// 「動いていない」という強い事前情報を渡すと、弱信号での位置/速度の暴れと PPS 選別への悪影響が
+/// 減る (smart-friend GPT-5.5)。移動運用するときだけ `Mobile` にして stationary を無効化する。
+/// 自動切替はしない (弱信号の NMEA speed が嘘をつくとモード切替自体が新たな不安定要因になる)。
+#[derive(Clone, Copy)]
+enum OpMode {
+    FixedTiming, // PMTK886,4 = stationary。窓際固定・timing 専用。
+    #[allow(dead_code)]
+    Mobile, // PMTK886,0 = normal。移動運用時はこちら (将来 UI/設定口から切替)。
+}
+const OP_MODE: OpMode = OpMode::FixedTiming;
+
+impl OpMode {
+    /// dynamic model を設定する PMTK886 コマンド本体 (チェックサムは送信時に付く)。
+    const fn pmtk886(self) -> &'static str {
+        match self {
+            OpMode::FixedTiming => "PMTK886,4", // stationary
+            OpMode::Mobile => "PMTK886,0",      // normal
+        }
+    }
+}
+
 /// 起動時にモジュールへ送る PMTK 設定 (チェックサムは送信時に計算)。
 /// 実機で各コマンドに `$PMTK001,<cmd>,3`(成功) が返ることを確認済 (チップは MT3333 系)。
 /// 注: SBAS は地域依存。日本の MSAS は 2020 終了済なので fix quality は 1 のまま
 ///     (WAAS/EGNOS 圏では有効)。GYSFFMANC は QZSS SLAS 非対応で sub-meter は不可。詳細は NOTES.md。
 const PMTK_INIT: &[&str] = &[
-    "PMTK313,1", // SBAS 探索を有効化 (WAAS/EGNOS 圏で有効)
-    "PMTK301,2", // DGPS 補正源 = SBAS
-    "PMTK286,1", // AIC (アクティブ干渉除去) 有効化
+    OP_MODE.pmtk886(), // dynamic model (既定 stationary。固定 timing 用途の事前情報)
+    "PMTK313,1",       // SBAS 探索を有効化 (WAAS/EGNOS 圏で有効)
+    "PMTK301,2",       // DGPS 補正源 = SBAS
+    "PMTK286,1",       // AIC (アクティブ干渉除去) 有効化
     // NMEA 出力: GLL/RMC/VTG/GGA/GSA/GSV(各1) + GST(測位σ, field7) + ZDA(field17) を有効化。
     // フィールド順: GLL,RMC,VTG,GGA,GSA,GSV,GRS,GST,(res×5),MALM,MEPH,MDGP,MDBG,ZDA,MCHN。
     "PMTK314,1,1,1,1,1,1,0,1,0,0,0,0,0,0,0,0,0,1,0",
@@ -175,6 +209,7 @@ async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
     let mut tracker = PpsTracker::new();
     let mut last_x: Option<u32> = None;
     let mut edge_ns: u64 = 0;
+    let mut was_locked = false; // 直前エッジが Locked だったか (復帰検出用)
 
     loop {
         let x = sm.rx().wait_pull().await; // エッジ時の自走ダウンカウンタ値
@@ -193,11 +228,8 @@ async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
         // PIO の ns 精度時刻 (edge_ns) と Instant を main へ。err/エポックは edge_ns 基準で ns 精度。
         PPS_TS.signal((edge_ns, inst_ns));
 
-        // PIO の精密な間隔で水晶の周波数オフセットを規律。
-        if interval_ns > 0 {
-            CLOCK.lock(|c| c.borrow_mut().update_freq(interval_ns as i64));
-        }
-
+        // 先に PpsTracker で品質を判定する。周波数 EMA は **Locked のエッジでのみ**規律する
+        // (Irregular/First の間隔を入れると holdover/PPSGEN の土台が腐る — smart-friend GPT-5.5)。
         let count = tracker.count() + 1;
         let interval_us = interval_ns / 1000;
         let (state, missed): (&str, u32) = match tracker.record(edge_ns / 1000) {
@@ -205,9 +237,25 @@ async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
             PpsEvent::Locked { .. } => ("Locked", 0),
             PpsEvent::Irregular { missed, .. } => ("Irregular", missed),
         };
+        let locked = state == "Locked";
+        // holdover/Irregular からの復帰 (前回非 Locked → 今回 Locked) を検出したら周波数を検疫する。
+        let recovered = locked && !was_locked;
+        was_locked = locked;
+        // PIO の精密な間隔で水晶の周波数オフセットを規律 (Locked のときだけ、多段ゲート経由)。
+        let fu = if interval_ns > 0 && locked {
+            CLOCK.lock(|c| {
+                let mut c = c.borrow_mut();
+                if recovered {
+                    c.start_quarantine();
+                }
+                c.update_freq(interval_ns as i64)
+            })
+        } else {
+            FreqUpdate::GatedQuality
+        };
         info!(
-            "PPS count={} interval_us={} interval_ns={} state={=str} missed={}",
-            count, interval_us, interval_ns, state, missed
+            "PPS count={} interval_us={} interval_ns={} state={=str} missed={} freq={}",
+            count, interval_us, interval_ns, state, missed, freq_update_str(fu)
         );
     }
 }

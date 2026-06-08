@@ -241,6 +241,21 @@ stage② の位相ロックが sub-µs に収束した後、長尺 (~10分) で�
   消え σ~460ns 維持。**教訓**: GNSS 規律ループの定石は「欠落ホールド + 外れ値棄却 + 補正のスルーレート制限」。
   欠落検出だけでは「受理した garbage」を防げない。
 
+### 16. 周波数 EMA も「Locked のときだけ + 多段ゲート + 復帰検疫」(smart-friend GPT-5.5)
+罠 #15 は **位相**ループの garbage 対策。だが **周波数 EMA (GPSDO の土台)** は別経路で、`pps_task` が
+`PpsTracker` 判定**前に無条件で** `update_freq` を呼んでいた。ガードは ±1ms の非常停止枠だけ →
+**sub-ms の multipath/ハーフ秒スリップ PPS が EMA に素通り**し、holdover と PPSGEN の土台が腐る。GPT-5.5 曰く
+「弱点は `update_freq` 自体より、tracker 判定前に無条件更新している構造」。対処を 4 段で入れた:
+1. **順序修正**: tracker 判定後、`state==Locked` のエッジでのみ `update_freq`。First/Irregular の間隔は使わない。
+2. **品質ゲート** (±1ms 非常停止とは別の通常判定): 未ロック中は絶対 ±100µs、ロック後は `|measured − EMA|` の
+   残差 ±5µs (真のジッタは ns〜数十ns 級なので十分甘い安全側)。±1ms は「最後の非常停止」であって通常品質判定ではない。
+3. **復帰検疫**: holdover/Irregular→Locked の復帰直後 5 サンプルは EMA 更新を保留 (復帰直後の PPS は受信機内部状態・
+   PPS 位相が未整合で信用できない)。**EMA リセットはしない** — 短断なら過去の水晶推定の方が新しい数発より信用できる。
+   初回捕捉 (samples==0) では検疫しない (起動時の捕捉を遅らせない)。
+4. **状態依存 alpha**: 未ロック収束中は速い `1/8`、ロック後は `1/32`。
+- ログ `PPS ... freq=<ok|gate|quar|sane>` で各エッジの採否が見える。実機: 固定窓際の clean 受信では全 `ok`、
+  欠落復帰時のみ `quar`×5。`FreqUpdate` enum + host テスト (`gpsdo::tests`) でゲート/検疫を網羅。
+
 ## 精度指標の意味 (webapp ヘッダ)
 
 - **位置 `X m` = 水平 CEP(50%)**: 直近 ~2 分窓の測位点の経験的ばらつき (50% がこの半径内)。
@@ -254,6 +269,10 @@ stage② の位相ロックが sub-µs に収束した後、長尺 (~10分) で�
 起動時に PMTK コマンドを UART0 TX(GP0) から `config_task` (RX をブロックしない別タスク) で送る。
 TX→モジュール RX 配線時に適用され、各コマンドに `$PMTK001,<cmd>,3`(成功) が返る。**実機で全 ACK 成功を確認**:
 
+- `PMTK886,4` — **dynamic model = stationary** (運用モード)。この GPSDO は固定 timing 用途なので、受信機に
+  「動いていない」という強い事前情報を渡す → 弱信号での位置/速度の暴れと PPS 選別への悪影響を抑える。実機 `$PMTK001,886,3`
+  成功確認。**移動運用時は `PMTK886,0` (normal) に切替**える (`OpMode` enum で選択。自動切替はしない — 弱信号の NMEA
+  speed が嘘をつくとモード切替自体が新たな不安定要因になる)。
 - `PMTK313,1` — SBAS 探索 ・ `PMTK301,2` — DGPS=SBAS ・ `PMTK286,1` — AIC
 - `PMTK314,...` — NMEA 出力に **GST を追加** (測位の標準偏差 σ を受信機が直接出す)。webapp の精度パネルに
   `rcv σH/σV/RMS` として表示。フィールド順: GLL,RMC,VTG,GGA,GSA,GSV,GRS,GST,(res×5),MALM,MEPH,MDGP,MDBG,ZDA,MCHN。

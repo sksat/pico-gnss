@@ -11,20 +11,47 @@
 //! (embassy Instant 等) から、と別々に与える。両者は単位 (ns) を揃えるだけでよい。
 //! いずれも HAL 非依存なので host で `cargo test-host` する。
 
-/// EMA の平滑係数 alpha = 1/2^EMA_SHIFT (≈ 時定数 32 サンプル)。
+/// ロック後の EMA 平滑係数 alpha = 1/2^EMA_SHIFT (≈ 時定数 32 サンプル)。
 const EMA_SHIFT: u32 = 5;
+/// 収束中 (未ロック) の速い EMA 係数 alpha = 1/2^EMA_SHIFT_FAST (= 1/8)。
+/// 起動直後はまだ推定が無いので速く捕捉し、ロック後はゆっくり平滑してジッタを抑える。
+const EMA_SHIFT_FAST: u32 = 3;
 /// ロック判定に必要な周波数サンプル数。
 const LOCK_SAMPLES: u32 = 8;
-/// 妥当な PPS 間隔範囲 (1s ± 1ms)。これより外れた間隔 (PIO ~68s 周回グリッチの偽短間隔
-/// ≈ -37ms や欠落の ~2s) は周波数推定に使わない。50ms だと周回グリッチがすり抜けて
-/// EMA を汚染した (実機評価で発覚)。真の間隔は 1s±数µs なので 1ms でも十分余裕がある。
+/// **非常停止**枠 (1s ± 1ms)。これより外れた間隔 (PIO ~68s 周回グリッチの偽短間隔
+/// ≈ -37ms や欠落の ~2s) は明らかに不正。50ms だと周回グリッチがすり抜けて EMA を
+/// 汚染した (実機評価で発覚)。これは通常の品質判定ではなく最後の安全網であり、
+/// 通常品質は下の収束ゲート / 残差ゲートで弾く (smart-friend GPT-5.5 の指摘)。
 const SANE_DEV_NS: i64 = 1_000_000;
+/// 未ロック (収束中) の絶対品質ゲート ±100µs。EMA がまだ信用できないので絶対値で弾く。
+/// 窓際弱信号の中規模 multipath (数十〜数百µs) が最初の数発に混じって EMA を汚すのを防ぐ。
+const CONVERGE_GATE_NS: i64 = 100_000;
+/// ロック後の残差ゲート: `|measured − EMA|` が ±5µs を超える単発は multipath とみなし棄却。
+/// 固定窓際の真のジッタは ns〜数十ns 級なので 5µs でも十分甘い安全側。
+const RESIDUAL_GATE_NS: i64 = 5_000;
+/// holdover/Irregular から復帰した直後、周波数 EMA 更新を保留するサンプル数。
+/// 復帰直後の PPS は受信機内部状態・NMEA 対応・PPS 位相がまだ整っておらず信用できない。
+const QUARANTINE_SAMPLES: u32 = 5;
+
+/// `update_freq` の結果。pps_task 側のログ/状態管理に使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreqUpdate {
+    /// EMA を更新した。
+    Applied,
+    /// ±1ms 非常停止 (wrap グリッチ/欠落) で棄却。
+    GatedSane,
+    /// 品質ゲート (収束中の絶対 / ロック後の残差) で棄却。
+    GatedQuality,
+    /// 復帰検疫中につき EMA 更新を保留した。
+    Quarantined,
+}
 
 /// PPS で規律されるクロックモデル。
 #[derive(Debug, Default)]
 pub struct DisciplinedClock {
     freq_mppb: i64, // 周波数オフセット EMA (milli-ppb = ppb*1000, 高分解能保持用)
     samples: u32,
+    quarantine: u32, // >0 の間は復帰検疫中 (周波数 EMA 更新を保留)
     epoch_pio_ns: Option<u64>,     // PIO timebase のエポック (ns 精度, err/now_ns 用)
     epoch_instant_ns: Option<u64>, // Instant timebase のエポック (連続クエリ/holdover 用)
     epoch_unix_ns: Option<i64>,
@@ -45,6 +72,7 @@ impl DisciplinedClock {
         Self {
             freq_mppb: 0,
             samples: 0,
+            quarantine: 0,
             epoch_pio_ns: None,
             epoch_instant_ns: None,
             epoch_unix_ns: None,
@@ -53,20 +81,65 @@ impl DisciplinedClock {
     }
 
     /// 精密な PPS 間隔 (ns, 理想 1e9) から周波数オフセットを EMA 更新する。
-    /// 妥当範囲外 (wrap 等の外れ値) は無視。
-    pub fn update_freq(&mut self, interval_ns: i64) {
+    ///
+    /// 多段ゲートで弱信号 (窓際 multipath)・wrap グリッチ・復帰直後の怪しい PPS を弾く:
+    /// 1. **非常停止** ±1ms 外 → 棄却 (wrap/欠落)。
+    /// 2. **復帰検疫** 中 → 更新せず保留 (過去の推定の方が信用できる)。
+    /// 3. **品質ゲート** 未ロックは絶対 ±100µs、ロック後は EMA 残差 ±5µs。
+    /// 4. EMA 更新 (収束中は速い alpha、ロック後はゆっくり)。
+    ///
+    /// **呼ぶ側の責務**: `PpsTracker` が `Locked` と判定したエッジでのみ呼ぶこと
+    /// (Irregular/First の間隔は周波数推定に使わない)。復帰時は `start_quarantine()`。
+    pub fn update_freq(&mut self, interval_ns: i64) -> FreqUpdate {
         let dev = interval_ns - 1_000_000_000; // = ppb
+        // 1. 非常停止: ±1ms 外は wrap グリッチ/欠落。常に棄却。
         if dev.abs() >= SANE_DEV_NS {
-            return;
+            return FreqUpdate::GatedSane;
+        }
+        // 2. 復帰検疫: 復帰直後 M サンプルは受信機内部状態・PPS 位相が未整合で信用できない
+        //    ので EMA を更新せず、過去の水晶周波数推定を保つ。
+        if self.quarantine > 0 {
+            self.quarantine -= 1;
+            return FreqUpdate::Quarantined;
         }
         let measured_mppb = dev * 1000;
+        // 最初の 1 発はゲート基準 (EMA) が無いので、非常停止内ならそのまま採用。
         if self.samples == 0 {
             self.freq_mppb = measured_mppb;
-        } else {
-            // EMA: f += (x - f) / 2^SHIFT
-            self.freq_mppb += (measured_mppb - self.freq_mppb) >> EMA_SHIFT;
+            self.samples = 1;
+            return FreqUpdate::Applied;
         }
+        // 3. 品質ゲート。
+        if self.is_locked() {
+            // ロック後: EMA からの残差が大きい単発は multipath。±1ms より遥かに厳しく弾く。
+            if (measured_mppb - self.freq_mppb).abs() > RESIDUAL_GATE_NS * 1000 {
+                return FreqUpdate::GatedQuality;
+            }
+        } else {
+            // 収束中: EMA がまだ信用できないので絶対ゲートで中規模 multipath を弾く。
+            if dev.abs() > CONVERGE_GATE_NS {
+                return FreqUpdate::GatedQuality;
+            }
+        }
+        // 4. EMA 更新: f += (x − f) / 2^SHIFT。収束中は速い alpha=1/8 で捕捉。
+        let shift = if self.is_locked() { EMA_SHIFT } else { EMA_SHIFT_FAST };
+        self.freq_mppb += (measured_mppb - self.freq_mppb) >> shift;
         self.samples += 1;
+        FreqUpdate::Applied
+    }
+
+    /// holdover/Irregular から `Locked` へ復帰したとき呼ぶ。直後 `QUARANTINE_SAMPLES` 発の
+    /// 周波数 EMA 更新を保留する (EMA リセットはしない — 短断なら過去推定の方が信用できる)。
+    /// 守るべき推定がまだ無い初回捕捉 (samples==0) では何もしない — 起動時の捕捉を遅らせない。
+    pub fn start_quarantine(&mut self) {
+        if self.samples > 0 {
+            self.quarantine = QUARANTINE_SAMPLES;
+        }
+    }
+
+    /// 復帰検疫中か (ログ/デバッグ用)。
+    pub fn in_quarantine(&self) -> bool {
+        self.quarantine > 0
     }
 
     /// PPS エッジを UTC に対応付けてエポックを更新する。
@@ -174,6 +247,76 @@ mod tests {
         c.update_freq(2_000_000_000); // 同上
         assert_eq!(c.freq_ppb(), 2500);
         assert_eq!(c.samples, 1);
+    }
+
+    #[test]
+    fn update_freq_returns_applied_or_gated() {
+        let mut c = DisciplinedClock::new();
+        assert_eq!(c.update_freq(1_000_002_500), FreqUpdate::Applied);
+        assert_eq!(c.update_freq(500_000_000), FreqUpdate::GatedSane); // 非常停止
+    }
+
+    #[test]
+    fn pre_lock_converge_gate_rejects_midsize_outlier() {
+        let mut c = DisciplinedClock::new();
+        c.update_freq(1_000_002_500); // 1 発目で基準確立 (+2500ppb)
+        // 未ロック中、±1ms 内だが ±100µs を超える中規模 multipath は弾く。
+        assert_eq!(c.update_freq(1_000_000_000 + 200_000), FreqUpdate::GatedQuality);
+        assert_eq!(c.samples, 1);
+        assert_eq!(c.freq_ppb(), 2500); // 汚染されていない
+    }
+
+    #[test]
+    fn post_lock_residual_gate_rejects_multipath() {
+        let mut c = DisciplinedClock::new();
+        for _ in 0..12 {
+            c.update_freq(1_000_002_500); // +2500ppb でロック
+        }
+        assert!(c.is_locked());
+        // ロック後、EMA から +10µs ずれた単発 (multipath) は残差ゲートで棄却。
+        assert_eq!(c.update_freq(1_000_000_000 + 2500 + 10_000), FreqUpdate::GatedQuality);
+        assert_eq!(c.freq_ppb(), 2500); // EMA は動かない
+        // EMA 近傍 (±数十ns ジッタ) は通る。
+        assert_eq!(c.update_freq(1_000_002_500 + 16), FreqUpdate::Applied);
+    }
+
+    #[test]
+    fn quarantine_holds_updates_after_recovery() {
+        let mut c = DisciplinedClock::new();
+        for _ in 0..12 {
+            c.update_freq(1_000_002_500); // ロック (+2500ppb)
+        }
+        c.start_quarantine();
+        assert!(c.in_quarantine());
+        // 復帰直後 5 発は (たとえ妥当範囲でも) EMA を更新しない。
+        for _ in 0..5 {
+            assert_eq!(c.update_freq(1_000_005_000), FreqUpdate::Quarantined); // +5000ppb の怪しい PPS
+        }
+        assert_eq!(c.freq_ppb(), 2500); // 検疫が EMA を守った
+        assert!(!c.in_quarantine());
+        // 検疫明けは通常通り更新する。
+        assert_eq!(c.update_freq(1_000_002_500), FreqUpdate::Applied);
+    }
+
+    #[test]
+    fn quarantine_noop_on_cold_boot() {
+        let mut c = DisciplinedClock::new();
+        c.start_quarantine(); // まだ推定が無い → 検疫しない
+        assert!(!c.in_quarantine());
+        // 初回捕捉はすぐ採用される (起動時の捕捉が遅れない)。
+        assert_eq!(c.update_freq(1_000_002_500), FreqUpdate::Applied);
+        assert_eq!(c.freq_ppb(), 2500);
+    }
+
+    #[test]
+    fn fast_alpha_converges_within_few_samples() {
+        let mut c = DisciplinedClock::new();
+        // 未ロックの速い alpha=1/8 で、定常オフセットに数発で寄る。
+        for _ in 0..LOCK_SAMPLES {
+            c.update_freq(1_000_003_000); // +3000ppb
+        }
+        // 1 発目で 3000 に張り付くので、ロック時点で既にほぼ 3000。
+        assert!((c.freq_ppb() - 3000).abs() <= 50, "freq={}", c.freq_ppb());
     }
 
     #[test]
