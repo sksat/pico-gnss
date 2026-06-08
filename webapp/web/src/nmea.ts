@@ -80,6 +80,7 @@ export class Gnss {
   ppsDev: number[] = [];
   sync: GnssState["sync"] = null;
   gpsdo: GnssState["gpsdo"] = null;
+  ppsOut: GnssState["ppsOut"] = null;
   gst: GnssState["gst"] = null;
   fw: GnssState["fw"] = null;
   posHist: GnssState["posHist"] = [];
@@ -104,6 +105,9 @@ export class Gnss {
       }
       case "sync":
         this.sync = { unix_s: m.unix_s, pps_local_us: m.pps_local_us, drift_us: m.drift_us, err_ns: m.err_ns, wall: Date.now() };
+        break;
+      case "ppsout":
+        this.ppsOut = { unix_s: m.unix_s, late_us: m.late_us, holdover_ms: m.holdover_ms, wall: Date.now() };
         break;
       case "time":
         this.gpsdo = {
@@ -231,6 +235,7 @@ export class Gnss {
       ppsDev: this.ppsDev.slice(-400),
       sync: this.sync,
       gpsdo: this.gpsdo,
+      ppsOut: this.ppsOut,
       gst: this.gst,
       fw: this.fw,
       posHist: this.posHist.slice(),

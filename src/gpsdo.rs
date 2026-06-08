@@ -116,6 +116,13 @@ impl DisciplinedClock {
         Some(ei + d)
     }
 
+    /// 補正遅延の素: 「真の時間で `true_ns` 待つ」のに必要なローカルクロックの ns。
+    /// ローカルは ppb 分速い/遅いので、その分だけ多く/少なく待つ。`Timer::after` に被せると
+    /// 水晶公差でなく ±ppb の正確さで待てる (例: `after_micros(true_to_local_ns(us*1000)/1000)`)。
+    pub fn true_to_local_ns(&self, true_ns: i64) -> i64 {
+        true_ns + (true_ns as i128 * self.freq_mppb as i128 / 1_000_000_000_000i128) as i64
+    }
+
     /// 最後に PPS で規律してからの経過 (holdover 時間, ns)。Instant timebase で渡す。
     pub fn holdover_ns(&self, instant_ns: u64) -> u64 {
         match self.last_instant_ns {
@@ -198,6 +205,18 @@ mod tests {
         c.update_epoch(1_000_000_000, 1_000_000_000, 0);
         assert_eq!(c.holdover_ns(1_000_000_000), 0);
         assert_eq!(c.holdover_ns(4_000_000_000), 3_000_000_000); // 3s holdover
+    }
+
+    #[test]
+    fn true_to_local_applies_offset() {
+        let mut c = DisciplinedClock::new();
+        // freq=0 → 補正なし (恒等)。
+        assert_eq!(c.true_to_local_ns(1_000_000_000), 1_000_000_000);
+        for _ in 0..40 {
+            c.update_freq(1_000_000_000 + 100_000); // +100 ppm
+        }
+        // ローカルは速いので、真の 1s 待つには +100µs 多くローカルで待つ。
+        assert_eq!(c.true_to_local_ns(1_000_000_000), 1_000_000_000 + 100_000);
     }
 
     #[test]

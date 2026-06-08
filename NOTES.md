@@ -74,6 +74,13 @@ PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを�
   **±数µs** が床だったが、err はエッジ同士で測るので **エポックも予測も PIO の ns 時刻**にしたら
   **σ ≈ 11ns / peak-peak ~37ns** (16ns tick が床) まで下がった。補正なしなら毎秒 ~2.8µs ずれる。
   ※ 連続時計 (TIME 行) の絶対値は依然 µs アンカー (PIO は FIFO 経由でエッジ時しか読めないため)。
+- **補正タイマ**: `true_to_local_ns(true_ns)` で「真の時間で N 待つ」のに必要なローカル ns を得る
+  (生の `Timer::after` は水晶公差 +2.7ppm 分ズレる)。これと `local_instant_for_unix_ns` が補正の素。
+- **規律 PPS 出力 (GP3)**: `pps_out_task` が GPSDO 補正済みクロックで UTC 秒境界をスケジュールし、
+  GP3 に立ち上がりエッジを出す。GPS PPS が切れても holdover で UTC 秒に合わせて出し続ける。
+  ただし**ソフトタイミング**なので `late` は embassy executor のジッタが下限 (実機 mean ~1.4ms / σ ~244µs;
+  UART 処理と CLOCK ロック競合で遅延)。秒境界には毎回揃う (unix_s 連番・ドリフト無し) が、**ns/µs 精度の
+  エッジには PIO ハードウェア生成が必要** (今後)。`PPSOUT unix_s= sched_us= fired_us= late_us= holdover_ms=` を出力。
 
 ## ハマった罠
 

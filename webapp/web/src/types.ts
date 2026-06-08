@@ -3,6 +3,7 @@ export type Msg =
   | { t: "pps"; count: number; interval_us: number; interval_ns: number; state: string; missed: number }
   | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number; err_ns: number }
   | { t: "time"; unix_ns: number; ppb: number; holdover_ms: number; locked: boolean }
+  | { t: "ppsout"; unix_s: number; late_us: number; holdover_ms: number }
   | { t: "fw"; s: string }
   | { t: "status"; source: string; connected: boolean; note?: string };
 
@@ -58,6 +59,13 @@ export interface Gpsdo {
   locked: boolean;
   wall: number; // 受信時の Date.now()
 }
+/** 規律 PPS 出力 (GP3) の状態。 */
+export interface PpsOut {
+  unix_s: number;
+  late_us: number; // スケジュール時刻からの遅れ (executor ジッタ)
+  holdover_ms: number;
+  wall: number;
+}
 export interface RawLine {
   ts: string;
   sentence: string;
@@ -89,6 +97,7 @@ export interface GnssState {
   ppsDev: number[];
   sync: Sync | null;
   gpsdo: Gpsdo | null;
+  ppsOut: PpsOut | null;
   gst: Gst | null;
   fw: string | null;
   posHist: PosSample[];

@@ -32,6 +32,7 @@ use panic_probe as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::clk_sys_freq;
+use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{PIO0, UART0};
 use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{
@@ -185,6 +186,51 @@ async fn time_task() {
     }
 }
 
+/// 規律 PPS 出力 (GP3): GPSDO 補正済みクロックで UTC 秒境界をスケジュールし、立ち上がりエッジを出す。
+/// GPS PPS が切れても (holdover) 周波数外挿で UTC 秒に合わせて出し続ける ← 規律出力の主目的。
+/// ※ ソフトタイミングなので late は embassy executor のジッタ (~µs〜) が下限。ns 精度には PIO 出力が要る。
+#[embassy_executor::task]
+async fn pps_out_task(mut pin: Output<'static>) {
+    loop {
+        // 現在の規律 UTC (Instant 系)。エポック未確定なら待つ。
+        let now_local = now_local_ns();
+        let Some(now_unix) = CLOCK.lock(|c| c.borrow().now_from_instant_ns(now_local)) else {
+            Timer::after_millis(200).await;
+            continue;
+        };
+        // 次の UTC 秒境界が来るローカル Instant 時刻を補正込みで求める。
+        let next_sec = now_unix / 1_000_000_000 + 1;
+        let target_unix = next_sec * 1_000_000_000;
+        let Some(local_target) = CLOCK.lock(|c| c.borrow().local_instant_for_unix_ns(target_unix))
+        else {
+            Timer::after_millis(200).await;
+            continue;
+        };
+        // その時刻まで待つ。既に過ぎている/マッピング異常はスキップして次の秒へ。
+        let wait_ns = local_target - now_local_ns() as i64;
+        if wait_ns <= 0 || wait_ns >= 1_200_000_000 {
+            Timer::after_millis(50).await;
+            continue;
+        }
+        Timer::after_micros((wait_ns / 1000) as u64).await;
+
+        // 立ち上がりエッジ = 規律 PPS。20ms 幅のパルス。
+        pin.set_high();
+        let fired = now_local_ns();
+        let holdover = CLOCK.lock(|c| c.borrow().holdover_ns(fired));
+        info!(
+            "PPSOUT unix_s={} sched_us={} fired_us={} late_us={} holdover_ms={}",
+            next_sec,
+            local_target / 1000,
+            fired / 1000,
+            (fired as i64 - local_target) / 1000,
+            holdover / 1_000_000
+        );
+        Timer::after_millis(20).await;
+        pin.set_low();
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -216,6 +262,9 @@ async fn main(spawner: Spawner) {
     sm0.set_enable(true);
     spawner.spawn(pps_task(sm0).unwrap());
     spawner.spawn(time_task().unwrap());
+
+    // 規律 PPS 出力を GP3 へ (GPSDO 補正済み UTC 秒境界。GPS 断中も holdover で継続)。
+    spawner.spawn(pps_out_task(Output::new(p.PIN_3, Level::Low)).unwrap());
 
     // UART0: TX=GP0 (モジュール設定送信), RX=GP1 (NMEA 受信)。
     static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
