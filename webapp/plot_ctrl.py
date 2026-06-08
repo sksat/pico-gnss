@@ -67,9 +67,9 @@ a.set_yscale("symlog", linthresh=100)
 for v in (1e6, 1e3, 1e2, -1e2, -1e3, -1e6):
     a.axhline(v, color="#eee", lw=0.5)
 a.axhline(0, color="#888", lw=0.8)
-a.set_title("出力位相 (symlog): 全構成 2.4ms から → PID+Smith(Kp1/8) が最速で σ~38ns にロック。"
-            "他は Kp1/16(安定上限,1/8 は PI が発散)で緩慢=Smith が高ゲインを可能に。定常の構造比較は tune.png",
-            fontsize=8.6)
+a.set_title("出力位相 (symlog, 全構成 2.4ms から): P/PD=+370ns にドループ(I無し→offset) / "
+            "PI・PID=0中心だが Kp1/16 で振動 / PID+Smith=最速で σ38ns tight (1/8 は Smith が可能に)",
+            fontsize=8.8)
 a.set_xlabel("起動からのエッジ (≈秒)"); a.set_ylabel("UTC 秒境界からのズレ [ns]")
 a.legend(fontsize=9.5, loc="upper right"); a.grid(True, which="both", alpha=0.12)
 fig.tight_layout(rect=[0, 0, 1, 0.95])
