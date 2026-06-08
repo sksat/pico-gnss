@@ -41,8 +41,9 @@ pnpm start
 `--log` で録ったログ (または `probe-rs run > x.log`) を集計/可視化する。**Python は uv で実行**
 (PEP 723 インラインメタデータで依存を隔離環境に自動構築。venv ファイルは不要):
 ```bash
-uv run analyze.py /tmp/eval.log              # テキスト集計 (stdlib のみ)
-uv run plot_report.py /tmp/eval.log out.png  # 評価図 6 枚 (matplotlib/numpy)
+uv run analyze.py /tmp/eval.log                       # テキスト集計 (stdlib のみ)
+uv run plot_report.py /tmp/eval.log out.png           # 評価図 (matplotlib/numpy)
+uv run plot_compare.py old.log new.log out.png        # 旧 vs 新手法の比較図 (stage② 等)
 ```
 測位精度 (CEP/R95/2DRMS)・PPS ジッタ・GPSDO 安定度・時刻補正残差 (snap 済)・規律 PPS 出力ジッタ・
 位相同期の収束・holdover 誤差・衛星/C/N0 を出す。±1ms フィルタ・snap は firmware と揃えてある。

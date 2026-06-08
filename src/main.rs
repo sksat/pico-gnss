@@ -44,9 +44,10 @@ use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartTx, C
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Instant, Timer};
+use embassy_time::{with_timeout, Duration, Instant, Timer};
 use embedded_io_async::{Read, Write};
 use heapless::String;
+use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
 use pico_gnss::{
@@ -90,8 +91,26 @@ static PPS_TS: Signal<CriticalSectionRawMutex, (u64, u64)> = Signal::new();
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<DisciplinedClock>> =
     BlockingMutex::new(RefCell::new(DisciplinedClock::new()));
 
-/// 位相同期のデッドバンド (ns)。この内に入ったら補正を止め周期を 16ns クリーンに保つ。
-const PHASE_DEADBAND_NS: i64 = 50_000;
+/// 位相同期のデッドバンド (ns)。この内なら無補正で周期を 16ns クリーンに保つ。
+/// PIO ハード位相 (ns クリーン) を使うので小さく取れる (Instant 時代は ms ノイズで 50µs だった)。
+const PHASE_DEADBAND_NS: i64 = 500;
+
+/// 最新の GPS PPS エッジの生カウンタ値 (SM0)。stage② の PIO 位相計測で gen_capture が参照する。
+static C0_GPS: AtomicU32 = AtomicU32::new(0);
+/// 1 秒のPIO tick 数 (= clk_sys / PIO_CYCLES_PER_TICK)。位相を mod 1秒する用。
+const TICKS_PER_SEC: i64 = 62_500_000; // 125MHz / 2
+
+/// x を ±m/2 に正規化 (mod m で中心化)。位相を ±0.5秒に畳む用。
+fn signed_mod(x: i64, m: i64) -> i64 {
+    let r = x % m;
+    if r > m / 2 {
+        r - m
+    } else if r < -m / 2 {
+        r + m
+    } else {
+        r
+    }
+}
 
 /// gen_capture_task 用の高優先度割込エグゼキュータ。ループバックエッジ→Instant 読みの
 /// ウェイクアップ遅延 (thread executor だと UART 処理等で ~ms) を ~µs に下げ、位相測定を精密化する。
@@ -133,6 +152,7 @@ async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
 
     loop {
         let x = sm.rx().wait_pull().await; // エッジ時の自走ダウンカウンタ値
+        C0_GPS.store(x, Ordering::Relaxed); // stage②: 最新 GPS エッジの生カウンタを共有
         // エポックのアンカー用に Instant をエッジ直後に読む (µs ジッタは絶対オフセットのみに効く)。
         let inst_ns = now_local_ns();
 
@@ -211,44 +231,47 @@ async fn time_task() {
 async fn gen_capture_task(
     mut sm_gen: StateMachine<'static, PIO0, 1>,
     mut sm: StateMachine<'static, PIO0, 2>,
+    k: u32, // stage② 較正済みカウンタオフセット (C0−C2)
 ) {
     let clk = clk_sys_freq() as i64;
-    let ns_per_tick: u64 = PIO_CYCLES_PER_TICK * 1_000_000_000 / clk as u64;
+    let ns_per_tick: i64 = PIO_CYCLES_PER_TICK as i64 * 1_000_000_000 / clk;
     let mut last_x: Option<u32> = None;
     let mut count: u32 = 0;
-    let mut edge: u32 = 0;
-    let mut phase_ema: i64 = i64::MIN; // 位相の EMA。MIN=未測定
     loop {
-        let x = sm.rx().wait_pull().await;
-        edge += 1;
-        // 出力エッジの UTC 時刻 (Instant 経由) → 秒境界からのズレ = 位相。+ 現在の規律周波数。
-        // pps_task も gen_capture も高優先度割込で動くので、両 Instant 読みは低遅延 (~µs)。
+        let x = sm.rx().wait_pull().await; // x = 出力エッジの生カウンタ (C2_out)
+        // 出力周期。PIO ~68s 周回グリッチの偽エッジは間隔が異常 → 位相補正に使わない (garbage hwphase で
+        // 出力が飛ぶのを防ぐ)。補正クランプ ±100ms 込みでも健全な間隔は 1s±~100ms なので ±300ms で判定。
+        let interval_ns = last_x.map(|lx| lx.wrapping_sub(x) as i64 * ns_per_tick);
+        let sane = interval_ns.is_some_and(|iv| (iv - 1_000_000_000).abs() < 300_000_000);
+        // stage② PIO ハード位相: 出力エッジ と 最新 GPS エッジ の生カウンタ差 (mod 1秒) を ns に。
+        // Instant を介さないので executor のウェイクアップ遅延 (~ms) に汚されず 16ns 分解能。
+        let c0 = C0_GPS.load(Ordering::Relaxed);
+        let elapsed = c0.wrapping_sub(x).wrapping_sub(k) as i32 as i64; // GPS→出力 の経過 tick
+        let hwphase_ns = signed_mod(elapsed, TICKS_PER_SEC) * ns_per_tick;
+        // 旧手法 (比較用 emit のみ): 出力エッジの UTC 時刻 (Instant 経由) → 秒境界からのズレ。
         let (ppb, phase) = CLOCK.lock(|c| {
             let c = c.borrow();
             (c.freq_ppb(), c.now_from_instant_ns(now_local_ns()).map(snap_to_second_ns))
         });
-        if let Some(ph) = phase {
-            let ph = ph as i64;
-            phase_ema = if phase_ema == i64::MIN { ph } else { phase_ema + (ph - phase_ema) / 4 };
-        }
-        // 次周期 = freq 補正済み 1 真秒 − 位相補正。位相の連続フィードバックは ~±1.5ms の構造ノイズで
-        // 発振し周期も汚すので、**EMA 平滑した位相で 8 エッジに 1 回だけ one-shot 補正**。それ以外は
-        // 無補正で周期を 16ns クリーンに保つ。位相はソフト限界 ~±1-2ms に整定 (ns 位相は stage ② ハード必須)。
+        // 周期 = freq 補正済み 1 真秒 − 位相補正。位相は **PIO ハード位相 (ns クリーン) を連続 k=1/4** で。
+        // 測定がクリーンなので発振せずデッドバンドまで収束し保持 (旧 Instant の ±ms から大改善)。
         let mut period = clk + clk * ppb / 1_000_000_000 - GEN_OVERHEAD;
-        if phase_ema != i64::MIN && edge % 8 == 0 && phase_ema.abs() > PHASE_DEADBAND_NS {
-            let corr = phase_ema.clamp(-100_000_000, 100_000_000);
+        if sane && c0 != 0 && hwphase_ns.abs() > PHASE_DEADBAND_NS {
+            // ゲインは小さめ (k=1/16)。ループ遅れに対し k=1/4 だと ±15µs のリミットサイクルが残ったため。
+            let corr = (hwphase_ns / 16).clamp(-100_000_000, 100_000_000);
             period -= corr * clk / 1_000_000_000;
         }
         let _ = sm_gen.tx().try_push(period as u32);
-        if let Some(lx) = last_x {
-            let interval_ns = lx.wrapping_sub(x) as u64 * ns_per_tick;
+        if let Some(iv) = interval_ns {
             count += 1;
+            // phase_ns=旧(Instant), hwphase_ns=新(PIO ハード) を並べて出し精度比較できるように。
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={}",
                 count,
-                interval_ns,
-                interval_ns as i64 - 1_000_000_000,
-                phase.unwrap_or(0)
+                iv,
+                iv - 1_000_000_000,
+                phase.unwrap_or(0),
+                hwphase_ns
             );
         }
         last_x = Some(x);
@@ -265,8 +288,9 @@ async fn main(spawner: Spawner) {
     let prg = pio_asm!(
         ".wrap_target",
         "low:",
-        "    jmp pin rising",
-        "    jmp x-- low",
+        "    jmp pin rising", // pin high → 立ち上がり (本物) → 捕捉
+        "    jmp x-- low",    // X--; X≠0 なら low へ。X=0 のときだけ下へ落ちる
+        "    jmp low",        // X=0 (周回) → 偽キャプチャせず継続 (~68s 毎の glitch を源で除去)
         "rising:",
         "    in x, 32",
         "    push noblock",
@@ -278,23 +302,57 @@ async fn main(spawner: Spawner) {
     );
     let loaded = common.load_program(&prg.program);
     let pps_pin = common.make_pio_pin(p.PIN_2);
+    let lb_pin = common.make_pio_pin(p.PIN_4);
     sm0.set_pin_dirs(PioDirection::In, &[&pps_pin]);
-    let mut pio_cfg = PioConfig::default();
-    pio_cfg.use_program(&loaded, &[]);
-    pio_cfg.set_jmp_pin(&pps_pin);
-    sm0.set_config(&pio_cfg);
+    sm2.set_pin_dirs(PioDirection::In, &[&lb_pin]);
+
+    // SM0: GP2 (GPS PPS) を捕捉。
+    let mut cfg_gp2 = PioConfig::default();
+    cfg_gp2.use_program(&loaded, &[]);
+    cfg_gp2.set_jmp_pin(&pps_pin);
+    sm0.set_config(&cfg_gp2);
     sm0.set_enable(true);
-    // pps_task と gen_capture を高優先度割込エグゼキュータで動かす。両タスクが「PPS エッジの瞬間に
-    // Instant を読む」ので、ウェイクアップ遅延 (thread だと UART 処理等で ~ms) を ~µs に下げることが
-    // 位相同期の精度に直結する (GPS エッジの Instant = エポック基準、出力エッジの Instant = 位相)。
-    interrupt::SWI_IRQ_0.set_priority(Priority::P0);
-    let spawner_high = EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0);
-    spawner_high.spawn(pps_task(sm0).unwrap());
+
+    // stage②: SM2 を一旦 GP2 に向け、SM0 と同じ GPS エッジを両方で捕捉して生カウンタ差 K=C0−C2 を較正。
+    // 両 SM は同じ clk_sys なので K は定数。set_config でピンを変えても scratch X は保たれるので K は有効。
+    sm2.set_config(&cfg_gp2);
+    sm2.set_enable(true);
+    let mut k: u32 = 0;
+    {
+        let (mut ksum, mut kn): (i64, i64) = (0, 0);
+        for i in 0..7u32 {
+            // PPS は fix 後のみ出る。各エッジ最大 30s 待ち、出なければ較正打ち切り (hw 位相無効)。
+            match with_timeout(Duration::from_secs(30), async {
+                let c0 = sm0.rx().wait_pull().await;
+                let c2 = sm2.rx().wait_pull().await;
+                (c0, c2)
+            })
+            .await
+            {
+                Ok((c0, c2)) if i >= 2 => {
+                    ksum += c0.wrapping_sub(c2) as i32 as i64;
+                    kn += 1;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        if kn > 0 {
+            k = (ksum / kn) as i32 as u32;
+            info!("PHASE_K calibrated k={} (n={})", k as i32, kn);
+        } else {
+            warn!("PHASE_K calibration failed (no PPS)");
+        }
+    }
+
+    // SM2 を GP4 (ループバック) に切替。set_config は X を触らないので K は有効のまま。
+    let mut cfg_gp4 = PioConfig::default();
+    cfg_gp4.use_program(&loaded, &[]);
+    cfg_gp4.set_jmp_pin(&lb_pin);
+    sm2.set_config(&cfg_gp4);
 
     // SM1: 規律 PPS 生成を GP3 へ。pull noblock で周期を保持し、毎周 X サイクル low + 短い high。
-    // CPU (time_task) が ppb 補正した周期を毎秒 push。エッジは PIO ハード生成なので ns クリーン。
-    // 周期は X に保持 (pull noblock は FIFO 空のとき X を OSR に再ロードする仕様)。
-    // カウントダウンは Y を使う ← X を delay で潰すと 2 発目以降が壊れる (ハマった)。
+    // 周期は X に保持。カウントダウンは Y ← X を delay で潰すと 2 発目以降が壊れる (ハマった)。
     let gen_prg = pio_asm!(
         "    set pindirs, 1", // GP3 を出力に (起動時 1 回; SET ピン=GP3)
         ".wrap_target",
@@ -317,17 +375,12 @@ async fn main(spawner: Spawner) {
     let _ = sm1.tx().try_push((clk_sys_freq() as i64 - GEN_OVERHEAD) as u32); // 初期周期 (ppb=0)
     sm1.set_enable(true);
 
-    // SM2: ループバック (GP3→GP4 ジャンパ) で出力エッジを GPS PPS と同じ手法で捕捉・計測。
-    let lb_pin = common.make_pio_pin(p.PIN_4);
-    sm2.set_pin_dirs(PioDirection::In, &[&lb_pin]);
-    let mut lb_cfg = PioConfig::default();
-    lb_cfg.use_program(&loaded, &[]); // capture プログラムを再利用
-    lb_cfg.set_jmp_pin(&lb_pin);
-    sm2.set_config(&lb_cfg);
-    sm2.set_enable(true);
-
+    // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
+    interrupt::SWI_IRQ_0.set_priority(Priority::P0);
+    let spawner_high = EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0);
+    spawner_high.spawn(pps_task(sm0).unwrap());
     spawner.spawn(time_task().unwrap());
-    spawner_high.spawn(gen_capture_task(sm1, sm2).unwrap());
+    spawner_high.spawn(gen_capture_task(sm1, sm2, k).unwrap());
 
     // UART0: TX=GP0 (モジュール設定送信), RX=GP1 (NMEA 受信)。
     static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();

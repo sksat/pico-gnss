@@ -36,7 +36,19 @@ host テスト 35 green。
   さらに細かく見るには捕捉を 8ns 化 (PIO 2SM インターリーブ) が必要。
 - **D. 位相同期の収束 (symlog)**: 規律出力エッジの UTC 秒境界からのズレ。起動から引き込むが、位相の
   「測定」が CPU の Instant 読み (executor ウェイクアップ遅延) 律速で **ソフトでは ±~1.4ms 止まり**。
-  ns 位相同期は測定の HW 化 (PIO で出力エッジを GPS PPS と同じカウンタで捕捉, stage ②) が必要。
+  → これを HW 化したのが下記 stage ②。
+
+## stage ②: 位相測定を PIO ハード化 → 出力を UTC 秒に ns で同期
+
+![compare](compare.png)
+
+位相を Instant でなく **PIO の生カウンタ差**で測る (出力エッジ vs GPS PPS、両 SM が同じ clk_sys)。
+旧(Instant 制御) と 新(PIO ハード制御) を同じ指標 (PIO 真値 `hwphase`) で比較:
+- **A. 出力位相**: 旧 = ±1.2ms をさまよう / 新 = 2.4ms から **~300ns (デッドバンド) へ収束** (~4000×)。
+- **B. 測定精度**: 同じ出力を両方で測った差 = Instant の測定ノイズ **σ~360µs** (ウェイクアップ遅延) vs
+  PIO **16ns** (~2万×)。この測定差が出力をどこまで締められるかを決める = stage ② の肝。
+
+`uv run webapp/plot_compare.py report/compare-old.log report/compare-new.log out.png` で再生成。
 
 ## 設計の核と教訓
 
