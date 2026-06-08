@@ -126,7 +126,7 @@ export class Gnss {
         }
         const recent = this.genDevs.slice(-15);
         const jitter = recent.length >= 2 ? Math.max(...recent) - Math.min(...recent) : 0;
-        this.ppsGen = { count: m.count, dev_ns: m.dev_ns, jitter_ns: jitter };
+        this.ppsGen = { count: m.count, dev_ns: m.dev_ns, jitter_ns: jitter, phase_ns: m.phase_ns };
         break;
       }
       case "time":

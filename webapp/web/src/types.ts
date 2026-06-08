@@ -4,7 +4,7 @@ export type Msg =
   | { t: "sync"; pps_local_us: number; unix_s: number; drift_us: number; err_ns: number; holdover_ms: number }
   | { t: "time"; unix_ns: number; ppb: number; holdover_ms: number; locked: boolean }
   | { t: "ppsout"; unix_s: number; late_us: number; holdover_ms: number }
-  | { t: "ppsgen"; count: number; interval_ns: number; dev_ns: number }
+  | { t: "ppsgen"; count: number; interval_ns: number; dev_ns: number; phase_ns: number }
   | { t: "fw"; s: string }
   | { t: "status"; source: string; connected: boolean; note?: string };
 
@@ -78,6 +78,7 @@ export interface PpsGen {
   count: number;
   dev_ns: number; // 出力周期 - 1e9 (SM2 計測, ローカル counter なので +ppm 込み)
   jitter_ns: number; // 直近の周期ばらつき (peak-peak)
+  phase_ns: number; // UTC 秒境界からの位相ズレ (ソフト同期, ~ms 精度)
 }
 export interface RawLine {
   ts: string;

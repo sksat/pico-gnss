@@ -88,6 +88,9 @@ static PPS_TS: Signal<CriticalSectionRawMutex, (u64, u64)> = Signal::new();
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<DisciplinedClock>> =
     BlockingMutex::new(RefCell::new(DisciplinedClock::new()));
 
+/// 位相同期のデッドバンド (ns)。この内に入ったら補正を止め周期を 16ns クリーンに保つ。
+const PHASE_DEADBAND_NS: i64 = 50_000;
+
 /// Instant を ns に (µs 分解能)。
 fn now_local_ns() -> u64 {
     Instant::now().as_micros() * 1000
@@ -168,8 +171,7 @@ async fn config_task(mut tx: BufferedUartTx) {
 /// 1Hz タスク: GPSDO の規律 UTC を出す + 規律 PPS 生成 (SM1) の周期を ppb 補正で更新する。
 /// PPS が切れていても周波数外挿で時刻/周期を保つ (holdover)。
 #[embassy_executor::task]
-async fn time_task(mut sm_gen: StateMachine<'static, PIO0, 1>) {
-    let clk = clk_sys_freq() as i64;
+async fn time_task() {
     loop {
         Timer::after_secs(1).await;
         let local = now_local_ns();
@@ -187,30 +189,56 @@ async fn time_task(mut sm_gen: StateMachine<'static, PIO0, 1>) {
                 locked as u8
             );
         }
-        // 規律 PPS 生成 SM の周期を更新: 1 真秒 = clk×(1+ppb/1e9) clk_sys サイクル。
-        // プログラム 1 周 = X + GEN_OVERHEAD サイクルなので X = 周期 - overhead。
-        let period = clk + clk * ppb / 1_000_000_000 - GEN_OVERHEAD;
-        let _ = sm_gen.tx().try_push(period as u32);
     }
 }
 
-/// ループバック (GP3→GP4) で規律 PPS 出力の周期を計測するタスク (SM2 capture)。
-/// GP4 にジャンパで戻すと、PIO ハード生成した出力エッジを GPS PPS と同じ手法で ns 計測できる。
+/// 規律 PPS 出力の周期管理 + ループバック計測 (GP3 生成 / GP4 捕捉)。**エッジに同期して**
+/// 1 出力エッジにつき 1 回だけ次周期を更新する (= freq 規律 + 位相同期を 1 箇所で・1 サンプル遅れで)。
+/// time_task の 1Hz タイマと非同期に補正すると位相が発振したので、ここに集約した。
+/// ※ freq/位相規律はループバック (GP3→GP4 ジャンパ) 接続が前提。未接続だと初期周期で自走する。
 #[embassy_executor::task]
-async fn gen_capture_task(mut sm: StateMachine<'static, PIO0, 2>) {
-    let ns_per_tick: u64 = PIO_CYCLES_PER_TICK * 1_000_000_000 / clk_sys_freq() as u64;
+async fn gen_capture_task(
+    mut sm_gen: StateMachine<'static, PIO0, 1>,
+    mut sm: StateMachine<'static, PIO0, 2>,
+) {
+    let clk = clk_sys_freq() as i64;
+    let ns_per_tick: u64 = PIO_CYCLES_PER_TICK * 1_000_000_000 / clk as u64;
     let mut last_x: Option<u32> = None;
     let mut count: u32 = 0;
+    let mut edge: u32 = 0;
+    let mut phase_ema: i64 = i64::MIN; // 位相の EMA (測定ノイズを平滑)。MIN=未測定
     loop {
         let x = sm.rx().wait_pull().await;
+        edge += 1;
+        // 出力エッジの UTC 時刻 (Instant 経由) → 秒境界からのズレ = 位相。+ 現在の規律周波数。
+        let (ppb, phase) = CLOCK.lock(|c| {
+            let c = c.borrow();
+            (c.freq_ppb(), c.now_from_instant_ns(now_local_ns()).map(snap_to_second_ns))
+        });
+        // 位相を EMA 平滑 (Instant 測定は executor のウェイクアップ遅延で ~ms ノイズが乗る)。
+        if let Some(ph) = phase {
+            let ph = ph as i64;
+            phase_ema = if phase_ema == i64::MIN { ph } else { phase_ema + (ph - phase_ema) / 4 };
+        }
+        // 次周期 = freq 補正済み 1 真秒 (clk×(1+ppb/1e9)−overhead) − 位相補正。
+        // 位相同期は連続フィードバックだと測定遅れ+ノイズで発振したので、**EMA 平滑した位相で
+        // 8 エッジに 1 回だけ one-shot 補正**する。それ以外の周期は無補正で 16ns クリーンを保つ。
+        // late(phase>0)→周期短縮で次エッジ前倒し。1 周 ±100ms クランプ。freq 規律済みなので一度合えば保持。
+        let mut period = clk + clk * ppb / 1_000_000_000 - GEN_OVERHEAD;
+        if phase_ema != i64::MIN && edge % 8 == 0 && phase_ema.abs() > PHASE_DEADBAND_NS {
+            let corr = phase_ema.clamp(-100_000_000, 100_000_000);
+            period -= corr * clk / 1_000_000_000;
+        }
+        let _ = sm_gen.tx().try_push(period as u32);
         if let Some(lx) = last_x {
             let interval_ns = lx.wrapping_sub(x) as u64 * ns_per_tick;
             count += 1;
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={}",
                 count,
                 interval_ns,
-                interval_ns as i64 - 1_000_000_000
+                interval_ns as i64 - 1_000_000_000,
+                phase.unwrap_or(0)
             );
         }
         last_x = Some(x);
@@ -283,8 +311,8 @@ async fn main(spawner: Spawner) {
     sm2.set_config(&lb_cfg);
     sm2.set_enable(true);
 
-    spawner.spawn(time_task(sm1).unwrap());
-    spawner.spawn(gen_capture_task(sm2).unwrap());
+    spawner.spawn(time_task().unwrap());
+    spawner.spawn(gen_capture_task(sm1, sm2).unwrap());
 
     // UART0: TX=GP0 (モジュール設定送信), RX=GP1 (NMEA 受信)。
     static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();

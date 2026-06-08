@@ -136,6 +136,7 @@ export function SyncPanel({ s }: { s: GnssState }) {
         <Row k="drift removed" v={g ? `~${(Math.abs(g.ppb) / 1000).toFixed(1)} µs/s` : "—"} />
         <Row k="holdover" v={g ? (inHoldover ? `${(g.holdoverMs / 1000).toFixed(0)} s ⚠` : "PPS locked") : "—"} />
         <Row k="PPS gen (GP3→4)" v={s.ppsGen ? `jitter ${s.ppsGen.jitter_ns} ns (PIO)` : "—"} />
+        <Row k="PPS gen phase" v={s.ppsGen ? `${Math.abs(s.ppsGen.phase_ns) < 1000 ? s.ppsGen.phase_ns + " ns" : (s.ppsGen.phase_ns / 1e6).toFixed(2) + " ms"} ← UTC` : "—"} />
       </dl>
       <p className="hint">PIO の ns 精度 PPS 間隔で水晶ドリフトを推定し UTC を規律。clock err = 補正後の 1 秒先読み残差
         (この精度で時刻を保持; PPS 断中も周波数外挿)。drift removed = 補正しなければ毎秒ずれていた量。</p>
