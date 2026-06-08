@@ -56,16 +56,15 @@ for ln in log:
 fig, ax = plt.subplots(2, 2, figsize=(13, 8))
 fig.suptitle("pico-gnss: GPSDO 時刻同期・規律 PPS 出力 の実機評価", fontsize=14, fontweight="bold")
 
-# A: GPSDO 周波数そのものを時間軸で直接 (0→+2.4ppm にランプ→保持 が一目で分かる)
+# A: ロック値までのズレ を log-y で (収束が見やすい。赤線は廃止)
 a = ax[0][0]
 if len(ppb) > 5:
     p = np.array(ppb, float); tp = np.array(ppb_t, float)
     lock = np.median(p[len(p) * 2 // 3:]); ss = np.std(p[len(p) // 3:])
-    a.plot(tp, p, color="#38bdf8", lw=1.4)
-    a.set_ylim(min(0, p.min()), max(p) * 1.12 + 1)
-    a.set_title(f"A. GPSDO: 起動で水晶 +{lock/1000:.2f}ppm を学習しロック→保持 (定常 σ≈{ss:.0f}ppb)", fontsize=11)
-    a.set_xlabel("起動からの時間 [s]"); a.set_ylabel("推定周波数オフセット [ppb] (水晶 vs GPS)")
-    a.grid(True, alpha=0.2)
+    a.semilogy(tp, np.maximum(np.abs(p - lock), 0.3), color="#38bdf8", lw=1.4)
+    a.set_title(f"A. GPSDO: 起動からズレが減衰 = 水晶 +{lock/1000:.2f}ppm を学習しロック (定常 σ≈{ss:.0f}ppb)", fontsize=10.5)
+    a.set_xlabel("起動からの時間 [s]"); a.set_ylabel("ロック値までのズレ |freq−lock| [ppb] (log)")
+    a.grid(True, which="both", alpha=0.2)
 
 # B: 時刻同期 ns 級 (±10ns spec 帯)
 a = ax[0][1]
@@ -88,11 +87,11 @@ ho = np.array([x for x in gen_dev if 1000 < abs(x) < 50000], float)
 ho -= ho.mean() if len(ho) else 0
 bins = np.arange(-72, 73, 8)  # 8ns 刻み (PIO tick=16ns)
 if len(hp) > 4:
-    a.hist(hp, bins=bins, color="#36d399", alpha=0.6, label=f"PPS 入力 σ{hp.std():.0f}ns (n={len(hp)})")
+    a.hist(hp, bins=bins, color="#36d399", alpha=0.55, label=f"① 受信した GPS PPS (入力) σ{hp.std():.0f}ns")
 if len(ho) > 4:
-    a.hist(ho, bins=bins, color="#fbbf24", alpha=0.6, label=f"規律出力 σ{ho.std():.0f}ns (n={len(ho)})")
-a.set_title("C. PPS 入力 & 規律 PPS 出力 のジッタ — どちらも PIO 16ns が下限", fontsize=11)
-a.set_xlabel("各平均からのズレ [ns] (16ns=PIO 1tick)"); a.set_ylabel("count")
+    a.hist(ho, bins=bins, color="#fbbf24", alpha=0.55, label=f"② 自作の規律 PPS (出力) σ{ho.std():.0f}ns")
+a.set_title("C. 受信 PPS① と 自作の規律 PPS② のジッタ — 受信と同じ綺麗さで生成 (PIO 16ns)", fontsize=10.5)
+a.set_xlabel("各平均からのズレ [ns] (16ns = PIO 1tick の量子化)"); a.set_ylabel("count")
 a.legend(fontsize=9); a.grid(True, alpha=0.2)
 
 # D: 位相同期の収束 (symlog: ms〜µs を 1 枚に)
