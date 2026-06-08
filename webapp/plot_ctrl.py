@@ -68,7 +68,7 @@ for v in (1e6, 1e3, 1e2, -1e2, -1e3, -1e6):
     a.axhline(v, color="#eee", lw=0.5)
 a.axhline(0, color="#888", lw=0.8)
 a.set_title("出力位相 (symlog, 全構成 2.4ms から): P/PD=+370ns にドループ(I無し→offset) / "
-            "PI・PID=0中心だが Kp1/16 で振動 / PID+Smith=最速で σ38ns tight (1/8 は Smith が可能に)",
+            "PI・PID=0中心だが Kp1/16 で振動 / PID+Smith=最速で σ~数十ns tight (1/8 は Smith が可能に)",
             fontsize=8.8)
 a.set_xlabel("起動からのエッジ (≈秒)"); a.set_ylabel("UTC 秒境界からのズレ [ns]")
 a.legend(fontsize=9.5, loc="upper right"); a.grid(True, which="both", alpha=0.12)
