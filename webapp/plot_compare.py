@@ -62,8 +62,8 @@ fig.suptitle("stage②: 規律 PPS 出力の UTC 位相同期 — 旧(Instant制
 GLITCH = 3_000_000  # |hw|>3ms = PIO 周回グリッチ等の外れ値 → 表示・σ から除外
 
 
-def locked_sigma(hw, bound):  # 後半 2/3 で |hw|<bound の σ
-    s = hw[len(hw) // 3:]
+def locked_sigma(hw, bound):  # ロック確立後 (末尾 1/4) で |hw|<bound の σ
+    s = hw[len(hw) * 3 // 4:]
     s = s[np.abs(s) < bound]
     return np.std(s) if len(s) > 2 else float("nan")
 
@@ -80,12 +80,12 @@ if len(ohw):
     a.plot(ct, ch, ".-", color="#a78bfa", ms=2, lw=0.6, label=f"旧: Instant 制御 (ロック σ≈{locked_sigma(ohw, GLITCH)/1000:.0f}µs)")
 if len(nhw):
     ct, ch = clip(nt, nhw)
-    a.plot(ct, ch, ".-", color="#10b981", ms=2.5, lw=0.7, label=f"新: PIO ハード制御 (ロック σ≈{locked_sigma(nhw, 50_000):.0f}ns)")
+    a.plot(ct, ch, ".-", color="#10b981", ms=2.5, lw=0.7, label=f"新: PIO ハード制御 (ロック後 σ≈{locked_sigma(nhw, 50_000):.0f}ns = sub-µs)")
 a.set_yscale("symlog", linthresh=1000)
 for v in (1e6, -1e6, 1e3, -1e3):
     a.axhline(v, color="#ccc", lw=0.5, ls="--")
 a.axhline(0, color="#888", lw=0.7)
-a.set_title("A. 出力 PPS の UTC 秒からのズレ (PIO 真値, symlog) — 新は ~300ns へ収束", fontsize=10.5)
+a.set_title("A. 出力 PPS の UTC 秒からのズレ (PIO 真値, symlog) — 新は sub-µs に収束し保持", fontsize=10.5)
 a.set_xlabel("各 run の経過時間 [s]"); a.set_ylabel("UTC 秒境界からのズレ [ns]")
 a.legend(fontsize=9, loc="upper right"); a.grid(True, which="both", alpha=0.15)
 

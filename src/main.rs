@@ -91,12 +91,24 @@ static PPS_TS: Signal<CriticalSectionRawMutex, (u64, u64)> = Signal::new();
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<DisciplinedClock>> =
     BlockingMutex::new(RefCell::new(DisciplinedClock::new()));
 
+/// 位相制御の測定源。true=PIO ハード位相 (stage②, 本番)。false=旧 Instant 測定 (比較計測用)。
+const PHASE_USE_HW: bool = true;
 /// 位相同期のデッドバンド (ns)。この内なら無補正で周期を 16ns クリーンに保つ。
 /// PIO ハード位相 (ns クリーン) を使うので小さく取れる (Instant 時代は ms ノイズで 50µs だった)。
 const PHASE_DEADBAND_NS: i64 = 500;
+/// ロック判定: 位相がこの内 (5µs) のエッジを LOCK_HOLD 回連続でロック成立。
+const LOCK_NS: i64 = 5_000;
+const LOCK_HOLD: u32 = 5;
+/// 外れ値除去 (smart-friend 助言): ロック中にこの幅 (50µs) を超える位相は弱信号の不正 PPS/取りこぼし
+/// = 単発 garbage とみなし最大 OUTLIER_MAX 回まで棄却 (古い基準で巨大補正→出力 ~100ms ジャンプを防ぐ)。
+/// それ以上続けば本物の擾乱として再ロックに入る。水晶ドリフトは ~数十ns/s なので 50µs/1s 跳びは非物理。
+const OUTLIER_NS: i64 = 50_000;
+const OUTLIER_MAX: u32 = 8;
 
 /// 最新の GPS PPS エッジの生カウンタ値 (SM0)。stage② の PIO 位相計測で gen_capture が参照する。
 static C0_GPS: AtomicU32 = AtomicU32::new(0);
+/// GPS PPS エッジの世代カウンタ。出力エッジ間に進んでいなければ GPS 欠落 = C0_GPS は古い → 補正に使わない。
+static C0_GEN: AtomicU32 = AtomicU32::new(0);
 /// 1 秒のPIO tick 数 (= clk_sys / PIO_CYCLES_PER_TICK)。位相を mod 1秒する用。
 const TICKS_PER_SEC: i64 = 62_500_000; // 125MHz / 2
 
@@ -153,6 +165,7 @@ async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
     loop {
         let x = sm.rx().wait_pull().await; // エッジ時の自走ダウンカウンタ値
         C0_GPS.store(x, Ordering::Relaxed); // stage②: 最新 GPS エッジの生カウンタを共有
+        C0_GEN.fetch_add(1, Ordering::Relaxed); // 世代++ (gen_capture が欠落検出に使う)
         // エポックのアンカー用に Instant をエッジ直後に読む (µs ジッタは絶対オフセットのみに効く)。
         let inst_ns = now_local_ns();
 
@@ -237,10 +250,17 @@ async fn gen_capture_task(
     let ns_per_tick: i64 = PIO_CYCLES_PER_TICK as i64 * 1_000_000_000 / clk;
     let mut last_x: Option<u32> = None;
     let mut count: u32 = 0;
+    let mut last_gen: u32 = 0;
+    let mut lock_cnt: u32 = 0; // 連続で位相が小さかったエッジ数 (≥LOCK_HOLD でロック)
+    let mut reject_cnt: u32 = 0; // 連続で外れ値棄却したエッジ数
     loop {
         let x = sm.rx().wait_pull().await; // x = 出力エッジの生カウンタ (C2_out)
-        // 出力周期。PIO ~68s 周回グリッチの偽エッジは間隔が異常 → 位相補正に使わない (garbage hwphase で
-        // 出力が飛ぶのを防ぐ)。補正クランプ ±100ms 込みでも健全な間隔は 1s±~100ms なので ±300ms で判定。
+        // GPS PPS の世代。前回の出力エッジから進んでいなければ GPS 欠落 → C0_GPS が古い → 補正に使わない
+        // (弱信号で PPS が時々落ちると、古い基準で巨大補正が走り出力が ~100ms 飛ぶのを防ぐ。断中はホールド)。
+        let gen = C0_GEN.load(Ordering::Relaxed);
+        let fresh = gen != last_gen;
+        last_gen = gen;
+        // 出力周期。PIO ~68s 周回グリッチの偽エッジは間隔が異常 → 位相補正に使わない。
         let interval_ns = last_x.map(|lx| lx.wrapping_sub(x) as i64 * ns_per_tick);
         let sane = interval_ns.is_some_and(|iv| (iv - 1_000_000_000).abs() < 300_000_000);
         // stage② PIO ハード位相: 出力エッジ と 最新 GPS エッジ の生カウンタ差 (mod 1秒) を ns に。
@@ -253,14 +273,26 @@ async fn gen_capture_task(
             let c = c.borrow();
             (c.freq_ppb(), c.now_from_instant_ns(now_local_ns()).map(snap_to_second_ns))
         });
-        // 周期 = freq 補正済み 1 真秒 − 位相補正。位相は **PIO ハード位相 (ns クリーン) を連続 k=1/4** で。
-        // 測定がクリーンなので発振せずデッドバンドまで収束し保持 (旧 Instant の ±ms から大改善)。
+        // 周期 = freq 補正済み 1 真秒 − 位相補正。位相は **PIO ハード位相 (ns クリーン) を連続 k=1/16** で。
         let mut period = clk + clk * ppb / 1_000_000_000 - GEN_OVERHEAD;
-        if sane && c0 != 0 && hwphase_ns.abs() > PHASE_DEADBAND_NS {
-            // ゲインは小さめ (k=1/16)。ループ遅れに対し k=1/4 だと ±15µs のリミットサイクルが残ったため。
-            let corr = (hwphase_ns / 16).clamp(-100_000_000, 100_000_000);
-            period -= corr * clk / 1_000_000_000;
-        }
+        // 制御に使う位相: PIO ハード(stage②)。PHASE_USE_HW=false で旧 Instant 測定に切替 (比較計測用)。
+        let ctrl = if PHASE_USE_HW { hwphase_ns } else { phase.unwrap_or(0) };
+        // valid = この位相サンプルが信用できるか (GPS 新鮮 + 間隔健全)。
+        let valid = fresh && sane && c0 != 0;
+        if valid {
+            let locked = lock_cnt >= LOCK_HOLD;
+            if locked && ctrl.abs() > OUTLIER_NS && reject_cnt < OUTLIER_MAX {
+                reject_cnt += 1; // ロック中の単発 garbage → 補正せずホールド (出力を飛ばさない)
+            } else {
+                reject_cnt = 0;
+                if ctrl.abs() > PHASE_DEADBAND_NS {
+                    // k=1/16 (ループ遅れ d≈2 に対し k=1/4 だと ±15µs リミットサイクル)。クランプは保険。
+                    let corr = (ctrl / 16).clamp(-100_000_000, 100_000_000);
+                    period -= corr * clk / 1_000_000_000;
+                }
+                lock_cnt = if ctrl.abs() < LOCK_NS { (lock_cnt + 1).min(LOCK_HOLD) } else { 0 };
+            }
+        } // !valid (GPS 欠落等) は freq のみで自走 (holdover ホールド)、lock 状態は据え置き
         let _ = sm_gen.tx().try_push(period as u32);
         if let Some(iv) = interval_ns {
             count += 1;

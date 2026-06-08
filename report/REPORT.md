@@ -44,11 +44,16 @@ host テスト 35 green。
 
 位相を Instant でなく **PIO の生カウンタ差**で測る (出力エッジ vs GPS PPS、両 SM が同じ clk_sys)。
 旧(Instant 制御) と 新(PIO ハード制御) を同じ指標 (PIO 真値 `hwphase`) で比較:
-- **A. 出力位相**: 旧 = ±1.2ms をさまよう / 新 = 2.4ms から **~300ns (デッドバンド) へ収束** (~4000×)。
+- **A. 出力位相**: 旧 = ±1.2ms をさまよう / 新 = 取得後 **ロック後 σ~460ns (sub-µs) で数分間張り付く**。
 - **B. 測定精度**: 同じ出力を両方で測った差 = Instant の測定ノイズ **σ~360µs** (ウェイクアップ遅延) vs
   PIO **16ns** (~2万×)。この測定差が出力をどこまで締められるかを決める = stage ② の肝。
 
-`uv run webapp/plot_compare.py report/compare-old.log report/compare-new.log out.png` で再生成。
+**弱信号での蹴り対策 (定石)**: 窓際は GPS PPS が ~19% 欠落/不正。①GPS 世代が進まないエッジは補正スキップ
+(欠落ホールド)、②ロック中に 50µs 超の位相は単発 garbage として棄却 (外れ値除去)。これで ~100ms の蹴りが消え
+sub-µs を維持 (罠 15)。将来は freq(EMA)と位相の 2 ループを 1 つの type-II PI ループに畳むと更に堅牢 (NOTES)。
+
+`uv run webapp/plot_compare.py report/compare-old.log report/compare-new.log out.png` で再生成
+(`PHASE_USE_HW=false` でビルドした Instant 制御版が旧、`true` が新)。
 
 ## 設計の核と教訓
 
