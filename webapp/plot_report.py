@@ -56,16 +56,16 @@ for ln in log:
 fig, ax = plt.subplots(2, 2, figsize=(13, 8))
 fig.suptitle("pico-gnss: GPSDO 時刻同期・規律 PPS 出力 の実機評価", fontsize=14, fontweight="bold")
 
-# A: GPSDO ロック収束 (log: ロック値からの差) ← user 指摘で log に
+# A: GPSDO 周波数そのものを時間軸で直接 (0→+2.4ppm にランプ→保持 が一目で分かる)
 a = ax[0][0]
 if len(ppb) > 5:
     p = np.array(ppb, float); tp = np.array(ppb_t, float)
     lock = np.median(p[len(p) * 2 // 3:]); ss = np.std(p[len(p) // 3:])
-    a.semilogy(tp, np.maximum(np.abs(p - lock), 0.3), color="#38bdf8", lw=1.3)
-    a.axhline(max(ss, 0.5), color="#e11", ls="--", lw=1, label=f"定常ノイズフロア σ≈{ss:.1f}ppb")
-    a.set_title(f"A. GPSDO: 起動で水晶 +{lock/1000:.2f}ppm を学習しロック", fontsize=11)
-    a.set_xlabel("起動からの時間 [s]"); a.set_ylabel("|freq − ロック値| [ppb] (log)")
-    a.legend(fontsize=9); a.grid(True, which="both", alpha=0.2)
+    a.plot(tp, p, color="#38bdf8", lw=1.4)
+    a.set_ylim(min(0, p.min()), max(p) * 1.12 + 1)
+    a.set_title(f"A. GPSDO: 起動で水晶 +{lock/1000:.2f}ppm を学習しロック→保持 (定常 σ≈{ss:.0f}ppb)", fontsize=11)
+    a.set_xlabel("起動からの時間 [s]"); a.set_ylabel("推定周波数オフセット [ppb] (水晶 vs GPS)")
+    a.grid(True, alpha=0.2)
 
 # B: 時刻同期 ns 級 (±10ns spec 帯)
 a = ax[0][1]
