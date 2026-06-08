@@ -44,9 +44,10 @@ host テスト 35 green。
 
 位相を Instant でなく **PIO の生カウンタ差**で測る (出力エッジ vs GPS PPS、両 SM が同じ clk_sys)。
 旧(Instant 制御) と 新(PIO ハード制御) を同じ指標 (PIO 真値 `hwphase`) で比較:
-- **A. 出力位相**: 旧 = ±190µs をさまよう / 新(=PIO+Smith 制御) = 取得後 **UTC 秒 0 を中心に σ~35ns で
-  張り付く** (PIO 測定が tight ロックを可能にし、さらに下記 Smith 予測子で詰めた最終形)。同じ軸に制御項の
-  sim も重畳: **P のみ=ドループ(+550ns)**、**PI=D 無しで振動**(→ 制御項の詳細は tune.png / smith.png)。
+- **A. 出力位相**: 詰める 3 段階を実データで重畳 — **① Instant 測定で制御 = ロック不能 (±190µs)** /
+  **② PID (PIO 測定, Smith 無し) = ループ遅れで振動 (σ~300ns)** / **③ PID+Smith (遅延補償) = σ~35ns で
+  UTC 秒に貼り付く**。測定(Instant→PIO)と制御(PID→PID+Smith)の両方が効いているのが見える
+  (制御項の詳細は tune.png、Smith の before/after は smith.png)。
 - **B. 測定精度**: 同じ出力を両方で測った差 = Instant の測定ノイズ **σ~360µs** (ウェイクアップ遅延) vs
   PIO **16ns** (~2万×)。この測定差が出力をどこまで締められるかを決める = stage ② の肝。
 

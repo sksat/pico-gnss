@@ -32,6 +32,8 @@ out = sys.argv[3] if len(sys.argv) > 3 else "compare.png"
 import os
 _here = os.path.dirname(os.path.abspath(__file__))
 exp_path = sys.argv[4] if len(sys.argv) > 4 else os.path.join(_here, "../report/exp-capture.log")
+# PID(Smith 無し)=リミットサイクルの実機ログ。Instant→PID→PID+Smith の 3 段階を A に重ねる用。
+mid_path = sys.argv[5] if len(sys.argv) > 5 else os.path.join(_here, "../report/pid-capture.log")
 
 RE = re.compile(r"PPSGEN count=\d+ interval_ns=\d+ dev_ns=-?\d+ phase_ns=(-?\d+) hwphase_ns=(-?\d+)")
 TS = re.compile(r"(?:^|\s)(\d+\.\d+) \[")
@@ -115,32 +117,27 @@ def clip(t, hw):  # グリッチ (>3ms) を表示から除外
     return t[m], hw[m]
 
 
-# A: 出力位相 (PIO 真値 hwphase) 旧 vs 新。symlog で ms〜ns を 1 枚に。
+# A: 出力位相。測定(Instant→PIO) + 制御(PID→PID+Smith) の 3 段階を実データで symlog 重畳。
 a = ax[0]
 if len(ohw):
     ct, ch = clip(ot, ohw)
-    a.plot(ct, ch, ".-", color="#a78bfa", ms=2, lw=0.6, label=f"旧: Instant 制御 (ロック σ≈{locked_sigma(ohw, GLITCH)/1000:.0f}µs)")
+    a.plot(ct, ch, ".-", color="#a78bfa", ms=2, lw=0.6, label=f"① Instant 測定で制御: ロック不能 σ≈{locked_sigma(ohw, GLITCH)/1000:.0f}µs")
+try:  # ② PID (PIO 測定, Smith 無し) = ループ遅れでリミットサイクル
+    mt, _mph, mhw = parse(mid_path)
+    if len(mhw):
+        ct, ch = clip(mt, mhw)
+        a.plot(ct, ch, ".-", color="#f59e0b", ms=1.8, lw=0.6, alpha=0.85,
+               label=f"② PID (PIO測定, Smith無し): σ≈{locked_sigma(mhw, 50_000):.0f}ns 振動")
+except Exception as ex:
+    print(f"mid skip: {ex}")
 if len(nhw):
     ct, ch = clip(nt, nhw)
-    a.plot(ct, ch, ".-", color="#10b981", ms=2.5, lw=0.7, label=f"新: PIO+Smith 制御 (ロック後 σ≈{locked_sigma(nhw, 50_000):.0f}ns = 数十ns)")
-# 制御項の効果を同じ軸に重ねる (オフライン sim, 初期2µsオフセットから): P=ドループ / PI=振動 / PID=減衰。
-terms = None
-try:
-    terms = sim_terms(exp_path)
-except Exception as ex:
-    print(f"terms skip: {ex}")
-if terms:
-    # 新(実測)=PID なので、sim は参照として P(I無し=ドループ) と PI(D無し=振動) を重ねる。
-    styles = {"P のみ": ("#ef4444", ":", "sim P のみ(I無し→ドループ)"),
-              "PI": ("#f59e0b", "--", "sim PI(D無し→振動)")}
-    for name, (col, ls, lab) in styles.items():
-        p = terms[name]; s = p[len(p) // 2:]; sg = np.std(s[np.abs(s) < 50000])
-        a.plot(np.arange(len(p)), p, ls, color=col, lw=1.1, alpha=0.9, label=f"{lab} σ{sg:.0f}ns")
+    a.plot(ct, ch, ".-", color="#10b981", ms=2.5, lw=0.8, label=f"③ PID+Smith (遅延補償): σ≈{locked_sigma(nhw, 50_000):.0f}ns")
 a.set_yscale("symlog", linthresh=1000)
 for v in (1e6, -1e6, 1e3, -1e3):
     a.axhline(v, color="#ccc", lw=0.5, ls="--")
 a.axhline(0, color="#888", lw=0.7)
-a.set_title("A. 出力位相 (UTC秒からのズレ, symlog): 旧Instant=±ms / 新PIO+Smith=数十ns + 制御項の sim", fontsize=9.5)
+a.set_title("A. 出力位相 (symlog): ①Instant測定→②PIO+PID(振動)→③PID+Smith で詰める段階", fontsize=9.5)
 a.set_xlabel("経過時間[s] (実測) / エッジ (sim)"); a.set_ylabel("UTC 秒境界からのズレ [ns]")
 a.legend(fontsize=7.5, loc="upper right"); a.grid(True, which="both", alpha=0.15)
 
