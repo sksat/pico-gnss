@@ -159,7 +159,7 @@ interface Args {
 
 function parseArgs(argv: string[]): Args {
   const a: Args = {
-    port: 8080,
+    port: 8137,
     chip: "RP2040",
     elf: "../target/thumbv6m-none-eabi/debug/pico-gnss",
     replay: null,

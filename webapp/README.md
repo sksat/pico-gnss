@@ -29,12 +29,12 @@ pnpm start
 #    既にフラッシュ済みなら:  node dist/server.js --attach
 ```
 
-ブラウザで <http://localhost:8080> を開く。
+ブラウザで <http://localhost:8137> を開く。
 
 ### server オプション (`node dist/server.js ...`)
 `--replay <file>` 録画再生 (ループ) ・ `--attach` 再フラッシュせず attach ・
 `--elf <path>` (既定 `../target/thumbv6m-none-eabi/debug/pico-gnss`) ・
-`--chip <chip>` (既定 RP2040) ・ `--port <n>` (既定 8080)。
+`--chip <chip>` (既定 RP2040) ・ `--port <n>` (既定 8137)。
 
 ## firmware が出す行 (server がパース)
 ```
