@@ -97,10 +97,13 @@ if len(hp) > 4 and len(ho) > 4:
            label=[f"① 受信 GPS PPS σ{hp.std():.0f}ns", f"② 自作 規律 PPS σ{ho.std():.0f}ns"])
 for v in (16, -16):
     a.axvline(v, color="#bbb", lw=0.7, ls="--")
-a.set_title("C. PPS ジッタ分布: ほぼ全パルスが ±16ns 以内 = ジッタ小 (PIO 量子化)", fontsize=10)
+a.set_xlim(-56, 56)
+a.set_title("C. PPS ジッタ分布: ジッタは捕捉量子化 (16ns) の数段階に収まる = 量子化以下に安定", fontsize=9.5)
 a.set_xlabel("各平均からのズレ [ns] = ジッタ量 (破線=±16ns=PIO 1tick)")
 a.set_ylabel("該当パルス数 (頻度)")
-a.legend(fontsize=9); a.grid(True, alpha=0.2)
+a.text(0.5, 0.97, "棒が少ない=値が 16ns 刻みしか取れない (PIO 捕捉=2cyc@125MHz の分解能限界)",
+       transform=a.transAxes, ha="center", va="top", fontsize=7.5, color="#888")
+a.legend(fontsize=9, loc="upper right"); a.grid(True, alpha=0.2)
 
 # D: 位相同期の収束 (symlog: ms〜µs を 1 枚に)
 a = ax[1][1]
