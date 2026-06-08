@@ -34,7 +34,16 @@ pnpm start
 ### server オプション (`node dist/server.js ...`)
 `--replay <file>` 録画再生 (ループ) ・ `--attach` 再フラッシュせず attach ・
 `--elf <path>` (既定 `../target/thumbv6m-none-eabi/debug/pico-gnss`) ・
-`--chip <chip>` (既定 RP2040) ・ `--port <n>` (既定 8137)。
+`--chip <chip>` (既定 RP2040) ・ `--port <n>` (既定 8137) ・
+`--log <file>` 配信と同時に生ログを記録 (ダッシュボードを見ながらキャプチャ)。
+
+### オフライン解析 `analyze.py`
+`--log` で録ったログ (または `probe-rs run > x.log`) を集計するダッシュボードのオフライン版:
+```bash
+python3 analyze.py /tmp/eval.log
+```
+測位精度 (CEP/R95/2DRMS)・PPS ジッタ・GPSDO 安定度・時刻補正残差 (snap 済)・規律 PPS 出力ジッタ・
+holdover 誤差・衛星/C/N0 を出す。±1ms フィルタ・snap は firmware と揃えてある。
 
 ## firmware が出す行 (server がパース)
 ```
