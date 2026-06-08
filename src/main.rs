@@ -48,8 +48,8 @@ use heapless::String;
 use static_cell::StaticCell;
 
 use pico_gnss::{
-    civil_to_unix, parse_ddmmyy, parse_hhmmss, DisciplinedClock, NmeaLineAssembler, PpsEvent,
-    PpsTracker,
+    civil_to_unix, parse_ddmmyy, parse_hhmmss, snap_to_second_ns, DisciplinedClock,
+    NmeaLineAssembler, PpsEvent, PpsTracker,
 };
 
 bind_interrupts!(struct Irqs {
@@ -302,6 +302,7 @@ async fn main(spawner: Spawner) {
     let mut assembler = NmeaLineAssembler::new();
     let mut read_buf = [0u8; 64];
     let mut pending: Option<(u64, u64)> = None; // (PIO ns, Instant ns)
+    let mut pending_fresh = false; // 未消費の新しい PPS エッジがあるか
 
     loop {
         let n = match rx.read(&mut read_buf).await {
@@ -312,9 +313,10 @@ async fn main(spawner: Spawner) {
             Err(_) => continue,
         };
 
-        // PIO がラッチした最新 PPS エッジ (PIO ns, Instant ns) を覚えておく。
+        // PIO がラッチした最新 PPS エッジ (PIO ns, Instant ns) を覚えておく。新しく来たら fresh。
         if let Some(e) = PPS_TS.try_take() {
             pending = Some(e);
+            pending_fresh = true;
         }
 
         for &b in &read_buf[..n] {
@@ -335,17 +337,20 @@ async fn main(spawner: Spawner) {
             if s.get(3..6) == Some("RMC") {
                 let time = s.split(',').nth(1).and_then(parse_hhmmss);
                 let date = s.split(',').nth(9).and_then(parse_ddmmyy);
-                if let (Some((h, mi, se)), Some((d, mo, y)), Some((pio_ns, inst_ns))) =
-                    (time, date, pending)
+                // 新鮮な (未消費の) PPS エッジがある時だけペアする。PPS 欠落中は stale エッジを
+                // 同じ秒に何度もペアして err が ±整数秒の偽値になるため、fresh==true を条件にする。
+                if let (Some((h, mi, se)), Some((d, mo, y)), Some((pio_ns, inst_ns)), true) =
+                    (time, date, pending, pending_fresh)
                 {
+                    pending_fresh = false; // このエッジは消費した
                     let unix_s = civil_to_unix(y as i64, mo as i64, d as i64, h as i64, mi as i64, se as i64);
                     let target = unix_s * 1_000_000_000;
                     let (ppb, err_ns) = CLOCK.lock(|c| {
                         let mut c = c.borrow_mut();
                         // 補正後の時刻精度: このエッジの UTC を「更新前のクロック (前回エポック+周波数)」で
-                        // 予測し、実際の UTC 秒との差を取る = 1 秒 holdover 後の残差。PIO 時刻 (ns 精度) で
-                        // 計算するので err も ns 精度 (Instant の µs ジッタに汚されない)。
-                        let err = c.now_ns(pio_ns).map(|pred| pred - target).unwrap_or(0);
+                        // 予測し、実際の UTC 秒との差を取る = holdover 後の残差。PIO 時刻 (ns 精度) で計算。
+                        // PPS が複数秒途切れて復帰すると整数秒ズレるので最寄り秒へ snap し、真の sub 秒残差を出す。
+                        let err = c.now_ns(pio_ns).map(|pred| snap_to_second_ns(pred - target)).unwrap_or(0);
                         c.update_epoch(pio_ns, inst_ns, target);
                         (c.freq_ppb(), err)
                     });

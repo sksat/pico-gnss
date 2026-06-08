@@ -31,6 +31,15 @@ pub struct DisciplinedClock {
     last_instant_ns: Option<u64>, // 最後に規律した Instant 時刻 (holdover 計測)
 }
 
+/// 整数秒のズレを除いて sub 秒の残差だけ残す。
+/// 補正後の予測残差 (err) は、PPS が複数秒途切れた後の復帰時に PPS↔RMC のペアリングが整数秒
+/// ズレることがあり raw だと ~Ns の巨大値になる。最寄りの整数秒へ snap すると、その中に埋もれた
+/// **真の holdover 残差** (sub 秒) が取り出せる (例: 25_000_000_360 → 360ns = 25s holdover の誤差)。
+pub fn snap_to_second_ns(raw: i64) -> i64 {
+    let secs = (raw + raw.signum() * 500_000_000) / 1_000_000_000;
+    raw - secs * 1_000_000_000
+}
+
 impl DisciplinedClock {
     pub const fn new() -> Self {
         Self {
@@ -217,6 +226,19 @@ mod tests {
         }
         // ローカルは速いので、真の 1s 待つには +100µs 多くローカルで待つ。
         assert_eq!(c.true_to_local_ns(1_000_000_000), 1_000_000_000 + 100_000);
+    }
+
+    #[test]
+    fn snap_recovers_subsecond_residual() {
+        // 通常の小さい残差はそのまま。
+        assert_eq!(snap_to_second_ns(360), 360);
+        assert_eq!(snap_to_second_ns(-41), -41);
+        // 1 秒・25 秒の整数ズレに埋もれた残差を取り出す。
+        assert_eq!(snap_to_second_ns(1_000_000_041), 41);
+        assert_eq!(snap_to_second_ns(25_000_000_360), 360);
+        assert_eq!(snap_to_second_ns(-1_000_000_041), -41);
+        // 秒境界の手前 (1s より 100ns 手前) は -100ns。
+        assert_eq!(snap_to_second_ns(999_999_900), -100);
     }
 
     #[test]

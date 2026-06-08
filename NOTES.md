@@ -74,6 +74,10 @@ PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを�
   **±数µs** が床だったが、err はエッジ同士で測るので **エポックも予測も PIO の ns 時刻**にしたら
   **σ ≈ 11ns / peak-peak ~37ns** (16ns tick が床) まで下がった。補正なしなら毎秒 ~2.8µs ずれる。
   ※ 連続時計 (TIME 行) の絶対値は依然 µs アンカー (PIO は FIFO 経由でエッジ時しか読めないため)。
+- **PPS 欠落・holdover をまたぐ err**: ① **freshness ガード** — 新しい PPS エッジが来た時だけ RMC とペア
+  する (`pending_fresh`)。欠落中に stale エッジを複数秒へペアすると err が ±整数秒の偽値になるのを防ぐ
+  (実機ログで `pps_local_us` が複数秒重複して発覚)。② **`snap_to_second_ns`** — 復帰時の整数秒ズレを除いて
+  sub 秒残差だけ残す。これで **N 秒 holdover の真の時刻誤差**が読める (実データ: 25s holdover → 360ns)。
 - **補正タイマ**: `true_to_local_ns(true_ns)` で「真の時間で N 待つ」のに必要なローカル ns を得る
   (生の `Timer::after` は水晶公差 +2.7ppm 分ズレる)。これと `local_instant_for_unix_ns` が補正の素。
 - **規律 PPS 出力 — 2 段階**:
