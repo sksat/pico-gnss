@@ -122,7 +122,7 @@ if len(ohw):
     a.plot(ct, ch, ".-", color="#a78bfa", ms=2, lw=0.6, label=f"旧: Instant 制御 (ロック σ≈{locked_sigma(ohw, GLITCH)/1000:.0f}µs)")
 if len(nhw):
     ct, ch = clip(nt, nhw)
-    a.plot(ct, ch, ".-", color="#10b981", ms=2.5, lw=0.7, label=f"新: PIO ハード制御=PID (ロック後 σ≈{locked_sigma(nhw, 50_000):.0f}ns = sub-µs)")
+    a.plot(ct, ch, ".-", color="#10b981", ms=2.5, lw=0.7, label=f"新: PIO+Smith 制御 (ロック後 σ≈{locked_sigma(nhw, 50_000):.0f}ns = 数十ns)")
 # 制御項の効果を同じ軸に重ねる (オフライン sim, 初期2µsオフセットから): P=ドループ / PI=振動 / PID=減衰。
 terms = None
 try:
@@ -140,7 +140,7 @@ a.set_yscale("symlog", linthresh=1000)
 for v in (1e6, -1e6, 1e3, -1e3):
     a.axhline(v, color="#ccc", lw=0.5, ls="--")
 a.axhline(0, color="#888", lw=0.7)
-a.set_title("A. 出力位相 (UTC秒からのズレ, symlog): 旧Instant=±ms / 新PIO=sub-µs + 制御項 P/PI/PID の効果", fontsize=9.5)
+a.set_title("A. 出力位相 (UTC秒からのズレ, symlog): 旧Instant=±ms / 新PIO+Smith=数十ns + 制御項の sim", fontsize=9.5)
 a.set_xlabel("経過時間[s] (実測) / エッジ (sim)"); a.set_ylabel("UTC 秒境界からのズレ [ns]")
 a.legend(fontsize=7.5, loc="upper right"); a.grid(True, which="both", alpha=0.15)
 
