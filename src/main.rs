@@ -104,6 +104,10 @@ const LOCK_HOLD: u32 = 5;
 /// それ以上続けば本物の擾乱として再ロックに入る。水晶ドリフトは ~数十ns/s なので 50µs/1s 跳びは非物理。
 const OUTLIER_NS: i64 = 50_000;
 const OUTLIER_MAX: u32 = 8;
+/// 位相 I 項 (type-II PLL): ロック中、位相を周波数トリム ppb に積分してドループ(定常オフセット)を 0 に。
+/// ppb_trim -= ctrl/PHASE_I_DEN [ppb/edge]。P (÷16) より十分遅くして安定化。上限 ±3ppm。
+const PHASE_I_DEN: i64 = 128;
+const PPB_TRIM_MAX: i64 = 3_000;
 
 /// 最新の GPS PPS エッジの生カウンタ値 (SM0)。stage② の PIO 位相計測で gen_capture が参照する。
 static C0_GPS: AtomicU32 = AtomicU32::new(0);
@@ -253,6 +257,7 @@ async fn gen_capture_task(
     let mut last_gen: u32 = 0;
     let mut lock_cnt: u32 = 0; // 連続で位相が小さかったエッジ数 (≥LOCK_HOLD でロック)
     let mut reject_cnt: u32 = 0; // 連続で外れ値棄却したエッジ数
+    let mut ppb_trim: i64 = 0; // 位相 I 項 → 周波数トリム (ppb)。ドループ(定常オフセット)を 0 に。
     loop {
         let x = sm.rx().wait_pull().await; // x = 出力エッジの生カウンタ (C2_out)
         // GPS PPS の世代。前回の出力エッジから進んでいなければ GPS 欠落 → C0_GPS が古い → 補正に使わない
@@ -273,37 +278,42 @@ async fn gen_capture_task(
             let c = c.borrow();
             (c.freq_ppb(), c.now_from_instant_ns(now_local_ns()).map(snap_to_second_ns))
         });
-        // 周期 = freq 補正済み 1 真秒 − 位相補正。位相は **PIO ハード位相 (ns クリーン) を連続 k=1/16** で。
-        let mut period = clk + clk * ppb / 1_000_000_000 - GEN_OVERHEAD;
         // 制御に使う位相: PIO ハード(stage②)。PHASE_USE_HW=false で旧 Instant 測定に切替 (比較計測用)。
         let ctrl = if PHASE_USE_HW { hwphase_ns } else { phase.unwrap_or(0) };
         // valid = この位相サンプルが信用できるか (GPS 新鮮 + 間隔健全)。
         let valid = fresh && sane && c0 != 0;
+        let mut p_corr: i64 = 0; // 位相 P 項 (ns)。速い過渡を吸収。
         if valid {
             let locked = lock_cnt >= LOCK_HOLD;
             if locked && ctrl.abs() > OUTLIER_NS && reject_cnt < OUTLIER_MAX {
                 reject_cnt += 1; // ロック中の単発 garbage → 補正せずホールド (出力を飛ばさない)
             } else {
                 reject_cnt = 0;
+                // I 項: ロック中、位相を周波数トリムに積分 → 比例制御の定常オフセット(ドループ)を 0 に。
+                if locked {
+                    ppb_trim = (ppb_trim - ctrl / PHASE_I_DEN).clamp(-PPB_TRIM_MAX, PPB_TRIM_MAX);
+                }
+                // P 項: deadband 外のみ。k=1/16 (ループ遅れ d≈2 に k=1/4 だと ±15µs リミットサイクル)。
                 if ctrl.abs() > PHASE_DEADBAND_NS {
-                    // k=1/16 (ループ遅れ d≈2 に対し k=1/4 だと ±15µs リミットサイクル)。クランプは保険。
-                    let corr = (ctrl / 16).clamp(-100_000_000, 100_000_000);
-                    period -= corr * clk / 1_000_000_000;
+                    p_corr = (ctrl / 16).clamp(-100_000_000, 100_000_000);
                 }
                 lock_cnt = if ctrl.abs() < LOCK_NS { (lock_cnt + 1).min(LOCK_HOLD) } else { 0 };
             }
-        } // !valid (GPS 欠落等) は freq のみで自走 (holdover ホールド)、lock 状態は据え置き
+        } // !valid (GPS 欠落等) は freq+I のみで自走 (holdover ホールド)、lock 状態は据え置き
+        // 周期 = freq規律(ppb) + 位相I項(ppb_trim) − 位相P項(p_corr)。PIO ハード位相を type-II PLL で。
+        let period = clk + clk * (ppb + ppb_trim) / 1_000_000_000 - GEN_OVERHEAD - p_corr * clk / 1_000_000_000;
         let _ = sm_gen.tx().try_push(period as u32);
         if let Some(iv) = interval_ns {
             count += 1;
-            // phase_ns=旧(Instant), hwphase_ns=新(PIO ハード) を並べて出し精度比較できるように。
+            // phase_ns=旧(Instant), hwphase_ns=新(PIO ハード), trim_ppb=位相I項の周波数トリム。
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
                 phase.unwrap_or(0),
-                hwphase_ns
+                hwphase_ns,
+                ppb_trim
             );
         }
         last_x = Some(x);
