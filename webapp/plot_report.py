@@ -90,11 +90,11 @@ if len(errs) > 3:
 a = ax[1][0]
 hp = np.array(pps_dev, float); hp = hp - hp.mean() if len(hp) else hp
 ho = np.array([x for x in gen_dev if 1000 < abs(x) < 50000], float); ho = ho - ho.mean() if len(ho) else ho
-bins = np.arange(-72, 73, 8)
-if len(hp) > 4:
-    a.hist(hp, bins=bins, color="#0a9", alpha=0.55, label=f"① 受信 GPS PPS σ{hp.std():.0f}ns")
-if len(ho) > 4:
-    a.hist(ho, bins=bins, color="#e0a000", alpha=0.55, label=f"② 自作 規律 PPS σ{ho.std():.0f}ns")
+bins = np.arange(-72, 73, 16)  # 16ns = PIO 1tick 刻み
+if len(hp) > 4 and len(ho) > 4:
+    # 各ビンで①②を横に並べる (overlay でなく grouped = 高さが明確)
+    a.hist([hp, ho], bins=bins, color=["#0a9", "#e0a000"],
+           label=[f"① 受信 GPS PPS σ{hp.std():.0f}ns", f"② 自作 規律 PPS σ{ho.std():.0f}ns"])
 for v in (16, -16):
     a.axvline(v, color="#bbb", lw=0.7, ls="--")
 a.set_title("C. PPS ジッタ分布: ほぼ全パルスが ±16ns 以内 = ジッタ小 (PIO 量子化)", fontsize=10)
