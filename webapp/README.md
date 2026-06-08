@@ -37,13 +37,16 @@ pnpm start
 `--chip <chip>` (既定 RP2040) ・ `--port <n>` (既定 8137) ・
 `--log <file>` 配信と同時に生ログを記録 (ダッシュボードを見ながらキャプチャ)。
 
-### オフライン解析 `analyze.py`
-`--log` で録ったログ (または `probe-rs run > x.log`) を集計するダッシュボードのオフライン版:
+### オフライン解析 `analyze.py` / レポート図 `plot_report.py`
+`--log` で録ったログ (または `probe-rs run > x.log`) を集計/可視化する。**Python は uv で実行**
+(PEP 723 インラインメタデータで依存を隔離環境に自動構築。venv ファイルは不要):
 ```bash
-python3 analyze.py /tmp/eval.log
+uv run analyze.py /tmp/eval.log              # テキスト集計 (stdlib のみ)
+uv run plot_report.py /tmp/eval.log out.png  # 評価図 6 枚 (matplotlib/numpy)
 ```
 測位精度 (CEP/R95/2DRMS)・PPS ジッタ・GPSDO 安定度・時刻補正残差 (snap 済)・規律 PPS 出力ジッタ・
-holdover 誤差・衛星/C/N0 を出す。±1ms フィルタ・snap は firmware と揃えてある。
+位相同期の収束・holdover 誤差・衛星/C/N0 を出す。±1ms フィルタ・snap は firmware と揃えてある。
+生成例は [../report/REPORT.md](../report/REPORT.md)。
 
 ## firmware が出す行 (server がパース)
 ```

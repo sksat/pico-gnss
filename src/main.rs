@@ -29,8 +29,10 @@ use defmt::{info, warn};
 use defmt_rtt as _;
 use panic_probe as _;
 
-use embassy_executor::Spawner;
+use embassy_executor::{InterruptExecutor, Spawner};
 use embassy_rp::bind_interrupts;
+use embassy_rp::interrupt;
+use embassy_rp::interrupt::{InterruptExt, Priority};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::peripherals::{PIO0, UART0};
 use embassy_rp::pio::program::pio_asm;
@@ -90,6 +92,15 @@ static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<DisciplinedClock>> 
 
 /// 位相同期のデッドバンド (ns)。この内に入ったら補正を止め周期を 16ns クリーンに保つ。
 const PHASE_DEADBAND_NS: i64 = 50_000;
+
+/// gen_capture_task 用の高優先度割込エグゼキュータ。ループバックエッジ→Instant 読みの
+/// ウェイクアップ遅延 (thread executor だと UART 処理等で ~ms) を ~µs に下げ、位相測定を精密化する。
+static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
+
+#[interrupt]
+unsafe fn SWI_IRQ_0() {
+    EXECUTOR_HIGH.on_interrupt()
+}
 
 /// Instant を ns に (µs 分解能)。
 fn now_local_ns() -> u64 {
@@ -206,24 +217,23 @@ async fn gen_capture_task(
     let mut last_x: Option<u32> = None;
     let mut count: u32 = 0;
     let mut edge: u32 = 0;
-    let mut phase_ema: i64 = i64::MIN; // 位相の EMA (測定ノイズを平滑)。MIN=未測定
+    let mut phase_ema: i64 = i64::MIN; // 位相の EMA。MIN=未測定
     loop {
         let x = sm.rx().wait_pull().await;
         edge += 1;
         // 出力エッジの UTC 時刻 (Instant 経由) → 秒境界からのズレ = 位相。+ 現在の規律周波数。
+        // pps_task も gen_capture も高優先度割込で動くので、両 Instant 読みは低遅延 (~µs)。
         let (ppb, phase) = CLOCK.lock(|c| {
             let c = c.borrow();
             (c.freq_ppb(), c.now_from_instant_ns(now_local_ns()).map(snap_to_second_ns))
         });
-        // 位相を EMA 平滑 (Instant 測定は executor のウェイクアップ遅延で ~ms ノイズが乗る)。
         if let Some(ph) = phase {
             let ph = ph as i64;
             phase_ema = if phase_ema == i64::MIN { ph } else { phase_ema + (ph - phase_ema) / 4 };
         }
-        // 次周期 = freq 補正済み 1 真秒 (clk×(1+ppb/1e9)−overhead) − 位相補正。
-        // 位相同期は連続フィードバックだと測定遅れ+ノイズで発振したので、**EMA 平滑した位相で
-        // 8 エッジに 1 回だけ one-shot 補正**する。それ以外の周期は無補正で 16ns クリーンを保つ。
-        // late(phase>0)→周期短縮で次エッジ前倒し。1 周 ±100ms クランプ。freq 規律済みなので一度合えば保持。
+        // 次周期 = freq 補正済み 1 真秒 − 位相補正。位相の連続フィードバックは ~±1.5ms の構造ノイズで
+        // 発振し周期も汚すので、**EMA 平滑した位相で 8 エッジに 1 回だけ one-shot 補正**。それ以外は
+        // 無補正で周期を 16ns クリーンに保つ。位相はソフト限界 ~±1-2ms に整定 (ns 位相は stage ② ハード必須)。
         let mut period = clk + clk * ppb / 1_000_000_000 - GEN_OVERHEAD;
         if phase_ema != i64::MIN && edge % 8 == 0 && phase_ema.abs() > PHASE_DEADBAND_NS {
             let corr = phase_ema.clamp(-100_000_000, 100_000_000);
@@ -274,7 +284,12 @@ async fn main(spawner: Spawner) {
     pio_cfg.set_jmp_pin(&pps_pin);
     sm0.set_config(&pio_cfg);
     sm0.set_enable(true);
-    spawner.spawn(pps_task(sm0).unwrap());
+    // pps_task と gen_capture を高優先度割込エグゼキュータで動かす。両タスクが「PPS エッジの瞬間に
+    // Instant を読む」ので、ウェイクアップ遅延 (thread だと UART 処理等で ~ms) を ~µs に下げることが
+    // 位相同期の精度に直結する (GPS エッジの Instant = エポック基準、出力エッジの Instant = 位相)。
+    interrupt::SWI_IRQ_0.set_priority(Priority::P0);
+    let spawner_high = EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0);
+    spawner_high.spawn(pps_task(sm0).unwrap());
 
     // SM1: 規律 PPS 生成を GP3 へ。pull noblock で周期を保持し、毎周 X サイクル low + 短い high。
     // CPU (time_task) が ppb 補正した周期を毎秒 push。エッジは PIO ハード生成なので ns クリーン。
@@ -312,7 +327,7 @@ async fn main(spawner: Spawner) {
     sm2.set_enable(true);
 
     spawner.spawn(time_task().unwrap());
-    spawner.spawn(gen_capture_task(sm1, sm2).unwrap());
+    spawner_high.spawn(gen_capture_task(sm1, sm2).unwrap());
 
     // UART0: TX=GP0 (モジュール設定送信), RX=GP1 (NMEA 受信)。
     static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();

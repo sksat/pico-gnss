@@ -238,6 +238,28 @@ export function TimingPanel({ s, timing }: { s: GnssState; timing: Timing }) {
         ctx.textAlign = "left"; ctx.fillText("1s", 2, h - 2);
         ctx.textAlign = "right"; ctx.fillText(`${hMax.toFixed(0)}s`, w - 1, h - 2); ctx.fillText(`±${eMax.toFixed(0)}ns`, w - 1, 9);
       }} />
+      <div className="chart-label">PPS 出力 UTC 位相の収束 (符号付き log: ±1ms…±10ns) · ソフト同期</div>
+      <Canvas className="canvas-line" draw={(ctx, w, h) => {
+        const ph = s.phaseHist;
+        if (ph.length < 2) return;
+        // 符号付き log で ns〜ms の広いレンジを 1 枚に。slog(ns) = sign·log10(1+|ns|)。
+        const slog = (v: number) => Math.sign(v) * Math.log10(1 + Math.abs(v));
+        const M = 6.5; // log10(~3ms) 付近を上端に
+        const Y = (v: number) => h / 2 - (slog(v) / M) * (h / 2 - 4);
+        // 参照線: 0, ±1ms(6), ±100µs(5), ±10µs(4)。
+        ctx.font = "8px ui-monospace, monospace"; ctx.textAlign = "left";
+        for (const [lv, lab, col] of [[6, "±1ms", "#22303d"], [5, "±100µs", "#22303d"], [4, "±10µs", "#2a6b4f"]] as const) {
+          const yv = (lv / M) * (h / 2 - 4);
+          ctx.strokeStyle = col as string; ctx.beginPath();
+          ctx.moveTo(0, h / 2 - yv); ctx.lineTo(w, h / 2 - yv); ctx.moveTo(0, h / 2 + yv); ctx.lineTo(w, h / 2 + yv); ctx.stroke();
+          ctx.fillStyle = "#475569"; ctx.fillText(lab as string, 2, h / 2 - yv - 1);
+        }
+        ctx.strokeStyle = "#3a4a5a"; ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+        const d = ph.slice(-300), n = d.length;
+        ctx.strokeStyle = "#a78bfa"; ctx.lineWidth = 1.5; ctx.beginPath();
+        d.forEach((v, i) => { const x = n > 1 ? (i / (n - 1)) * w : w / 2; i ? ctx.lineTo(x, Y(v)) : ctx.moveTo(x, Y(v)); });
+        ctx.stroke();
+      }} />
       <dl className="kv compact stat3">
         <Row k="jitter σ" v={timing.n >= 2 ? `${timing.sigma.toFixed(1)} ns` : "—"} />
         <Row k="peak-peak" v={timing.n >= 2 ? `${timing.pp.toFixed(0)} ns` : "—"} />

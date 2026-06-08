@@ -115,6 +115,7 @@ export interface GnssState {
   gpsdo: Gpsdo | null;
   ppsOut: PpsOut | null;
   ppsGen: PpsGen | null;
+  phaseHist: number[]; // 規律 PPS 出力の UTC 位相 (ns) 履歴 — 同期の収束を見せる
   gst: Gst | null;
   fw: string | null;
   posHist: PosSample[];

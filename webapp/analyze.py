@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
 """pico-gnss の defmt ログ (probe-rs / server --log) をオフライン解析する。
 
-使い方:
-    python3 analyze.py <logfile>          # 例: server --log で録った /tmp/eval.log
+使い方 (標準ライブラリのみ。uv でも素の python でも可):
+    uv run analyze.py <logfile>          # 例: server --log で録った /tmp/eval.log
     probe-rs run --chip RP2040 <elf> > x.log 2>&1 && python3 analyze.py x.log
 
 NMEA / PPS / SYNC(err_ns,holdover) / TIME / PPSGEN を集計し、測位精度・PPS 時刻精度・

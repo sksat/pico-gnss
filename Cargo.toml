@@ -29,6 +29,7 @@ defmt-rtt = "1.0"
 embassy-executor = { version = "0.10.0", features = [
     "platform-cortex-m",
     "executor-thread",
+    "executor-interrupt",
     "defmt",
 ] }
 embassy-rp = { version = "0.10.0", features = [

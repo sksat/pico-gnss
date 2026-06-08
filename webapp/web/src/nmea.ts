@@ -84,6 +84,7 @@ export class Gnss {
   gpsdo: GnssState["gpsdo"] = null;
   ppsOut: GnssState["ppsOut"] = null;
   ppsGen: GnssState["ppsGen"] = null;
+  phaseHist: GnssState["phaseHist"] = [];
   private genDevs: number[] = [];
   gst: GnssState["gst"] = null;
   fw: GnssState["fw"] = null;
@@ -127,6 +128,8 @@ export class Gnss {
         const recent = this.genDevs.slice(-15);
         const jitter = recent.length >= 2 ? Math.max(...recent) - Math.min(...recent) : 0;
         this.ppsGen = { count: m.count, dev_ns: m.dev_ns, jitter_ns: jitter, phase_ns: m.phase_ns };
+        this.phaseHist.push(m.phase_ns); // 位相同期の収束を見せる時系列
+        if (this.phaseHist.length > 300) this.phaseHist.shift();
         break;
       }
       case "time":
@@ -259,6 +262,7 @@ export class Gnss {
       gpsdo: this.gpsdo,
       ppsOut: this.ppsOut,
       ppsGen: this.ppsGen,
+      phaseHist: this.phaseHist.slice(),
       gst: this.gst,
       fw: this.fw,
       posHist: this.posHist.slice(),
