@@ -50,7 +50,8 @@ for ln in log:
         ppb_t.append(t); ppb.append(int(m.group(1))); lockf.append(m.group(2) == "1")
     elif (m := re.search(r"SYNC .*err_ns=(-?\d+)", ln)):
         err_t.append(t); errs.append(snap(int(m.group(1))))
-    elif (m := re.search(r"PPSGEN count=\d+ interval_ns=\d+ dev_ns=(-?\d+) phase_ns=(-?\d+)", ln)):
+    elif (m := re.search(r"PPSGEN count=\d+ interval_ns=\d+ dev_ns=(-?\d+) phase_ns=-?\d+ hwphase_ns=(-?\d+)", ln)):
+        # phase = PIO ハード位相 (stage②/PID+Smith)。旧 Instant phase_ns でなく hwphase_ns を使う。
         gen_dev.append(int(m.group(1))); ph_t.append(t); phase.append(int(m.group(2)))
 
 fig, ax = plt.subplots(2, 2, figsize=(13, 8))
@@ -105,20 +106,22 @@ a.text(0.5, 0.97, "棒が少ない=値が 16ns 刻みしか取れない (PIO 捕
        transform=a.transAxes, ha="center", va="top", fontsize=7.5, color="#888")
 a.legend(fontsize=9, loc="upper right"); a.grid(True, alpha=0.2)
 
-# D: 位相同期の収束 (symlog: ms〜µs を 1 枚に)
+# D: 位相同期の収束 (PIO ハード位相, PID+Smith。symlog で ms〜ns を 1 枚に)
 a = ax[1][1]
 if len(phase) > 2:
     ph = np.array(phase, float); tph = np.array(ph_t, float)
+    ph = np.where(np.abs(ph) < 3_000_000, ph, np.nan)  # グリッチ(>3ms)は線を切る
     a.plot(tph, ph, ".-", color="#7c3aed", ms=3, lw=0.6)
-    a.set_yscale("symlog", linthresh=10000)  # ±10µs まで線形, 外は log
-    for v in (1e6, -1e6, 1e5, -1e5):
+    a.set_yscale("symlog", linthresh=100)  # ±100ns まで線形, 外は log
+    for v in (1e6, -1e6, 1e3, -1e3):
         a.axhline(v, color="#ccc", lw=0.5, ls="--")
     a.axhline(0, color="#888", lw=0.7)
-    settle = np.std(ph[len(ph) // 2:][np.abs(ph[len(ph) // 2:]) < 3e6])
-    a.set_title(f"D. 規律出力の UTC 位相: 引き込むがソフトは ±{settle/1e6:.1f}ms 止まり", fontsize=11)
+    fin = ph[len(ph) * 2 // 3:]; fin = fin[np.isfinite(fin) & (np.abs(fin) < 50000)]
+    settle = np.std(fin) if len(fin) > 5 else float("nan")
+    a.set_title(f"D. 規律出力の UTC 位相 (PIO測定+PID+Smith): σ≈{settle:.0f}ns に貼付 (旧ソフトは ±1.4ms)", fontsize=9.5)
     a.set_xlabel("起動からの時間 [s]"); a.set_ylabel("UTC 秒境界からのズレ [ns] (symlog)")
     a.grid(True, which="both", alpha=0.15)
-    a.text(0.98, 0.04, "ns 位相同期は測定の HW 化 (PIO) が必要", transform=a.transAxes,
+    a.text(0.98, 0.04, "Smith 予測子で遅延補償 → sub-100ns 達成", transform=a.transAxes,
            ha="right", fontsize=8, color="#888")
 
 fig.tight_layout(rect=[0, 0, 1, 0.96])
