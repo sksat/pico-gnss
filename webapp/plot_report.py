@@ -40,14 +40,14 @@ def tof(ln):  # 行頭の defmt タイムスタンプ = 起動からの秒
 
 
 # (t, value) で集める
-pps_dev, ppb_t, ppb, err_t, errs, gen_dev, ph_t, phase = [], [], [], [], [], [], [], []
+pps_dev, ppb_t, ppb, lockf, err_t, errs, gen_dev, ph_t, phase = [], [], [], [], [], [], [], [], []
 for ln in log:
     t = tof(ln)
     if (m := re.search(r"PPS count=\d+ interval_us=\d+ interval_ns=(\d+) state=(\w+) missed=\d+", ln)):
         if m.group(2) == "Locked" and abs(int(m.group(1)) - 1_000_000_000) < 1_000_000:
             pps_dev.append(int(m.group(1)) - 1_000_000_000)
-    elif (m := re.search(r"TIME unix_ns=\d+ ppb=(-?\d+)", ln)):
-        ppb_t.append(t); ppb.append(int(m.group(1)))
+    elif (m := re.search(r"TIME unix_ns=\d+ ppb=(-?\d+) holdover_ms=\d+ locked=([01])", ln)):
+        ppb_t.append(t); ppb.append(int(m.group(1))); lockf.append(m.group(2) == "1")
     elif (m := re.search(r"SYNC .*err_ns=(-?\d+)", ln)):
         err_t.append(t); errs.append(snap(int(m.group(1))))
     elif (m := re.search(r"PPSGEN count=\d+ interval_ns=\d+ dev_ns=(-?\d+) phase_ns=(-?\d+)", ln)):
@@ -56,18 +56,21 @@ for ln in log:
 fig, ax = plt.subplots(2, 2, figsize=(13, 8))
 fig.suptitle("pico-gnss: GPSDO 時刻同期・規律 PPS 出力 の実機評価", fontsize=14, fontweight="bold")
 
-# A: 推定周波数そのものを時間軸で (ランプ→平ら = ロックして保持。log の |距離| は 0 交差で
-#    下スパイクする artifact が出るので直接 freq を線形で)
+# A: ロック値からのズレ を log-y で (収束が見やすい)。ロック時点を縦線で明示。
 a = ax[0][0]
 if len(ppb) > 5:
     p = np.array(ppb, float); tp = np.array(ppb_t, float)
     lock = np.median(p[len(p) * 2 // 3:]); ss = np.std(p[len(p) // 3:])
-    a.plot(tp, p, color="#38bdf8", lw=1.4)
-    a.set_ylim(min(0, p.min()) - 20, max(p) * 1.1 + 1)
-    a.set_title(f"A. GPSDO: 起動で水晶の周波数誤差 +{lock/1000:.2f}ppm を学習しロック→保持 (定常 σ≈{ss:.0f}ppb)", fontsize=10)
+    a.semilogy(tp, np.maximum(np.abs(p - lock), 0.3), color="#38bdf8", lw=1.4)
+    lt = next((ppb_t[i] for i in range(len(lockf)) if lockf[i]), None)  # 最初に locked=1 になった時刻
+    if lt is not None:
+        a.axvline(lt, color="#e11", lw=1.3, ls="--")
+        a.annotate(f"ここでロック\n(8サンプル ≈{lt:.0f}s)", xy=(lt, max(p) * 0.5 + 1),
+                   xytext=(lt + 8, max(p) * 0.5 + 1), fontsize=8.5, color="#c00", va="center")
+    a.set_title(f"A. GPSDO: 起動で水晶ドリフト +{lock/1000:.2f}ppm を学習→ロック後は σ≈{ss:.0f}ppb で微振動", fontsize=10)
     a.set_xlabel("起動からの時間 [s]")
-    a.set_ylabel("RP2040 水晶の周波数誤差 [ppb]\n(理想=GPS との差。+ = 水晶が速い)")
-    a.grid(True, alpha=0.2)
+    a.set_ylabel("ロック値 (+%.2fppm) からのズレ [ppb] (log)" % (lock / 1000))
+    a.grid(True, which="both", alpha=0.2)
 
 # B: 時刻同期 ns 級 (±10ns spec 帯)
 a = ax[0][1]
@@ -83,19 +86,20 @@ if len(errs) > 3:
     a.set_xlabel("起動からの時間 [s]"); a.set_ylabel("補正後 UTC 残差 [ns]")
     a.legend(fontsize=9); a.grid(True, alpha=0.2)
 
-# C: PPS / 規律出力 ジッタ — 各パルスのズレを散布図で (各平均から ±16ns 以内を直接見せる)
+# C: PPS ジッタ分布 (ヒストグラム)。横=ズレ量[ns]=ジッタそのもの、縦=該当パルス数。
 a = ax[1][0]
 hp = np.array(pps_dev, float); hp = hp - hp.mean() if len(hp) else hp
 ho = np.array([x for x in gen_dev if 1000 < abs(x) < 50000], float); ho = ho - ho.mean() if len(ho) else ho
-if len(hp) > 2:
-    a.plot(hp, ".", color="#0a9", ms=3, alpha=0.6, label=f"① 受信した GPS PPS (入力) σ{hp.std():.0f}ns")
-if len(ho) > 2:
-    a.plot(ho, ".", color="#e0a000", ms=3, alpha=0.6, label=f"② 自作の規律 PPS (出力) σ{ho.std():.0f}ns")
-a.axhline(0, color="#888", lw=0.6)
+bins = np.arange(-72, 73, 8)
+if len(hp) > 4:
+    a.hist(hp, bins=bins, color="#0a9", alpha=0.55, label=f"① 受信 GPS PPS σ{hp.std():.0f}ns")
+if len(ho) > 4:
+    a.hist(ho, bins=bins, color="#e0a000", alpha=0.55, label=f"② 自作 規律 PPS σ{ho.std():.0f}ns")
 for v in (16, -16):
-    a.axhline(v, color="#bbb", lw=0.6, ls="--")
-a.set_title("C. 受信 PPS① と 自作の規律 PPS② のジッタ — 各点=1パルス、±16ns 以内 (PIO 量子化)", fontsize=10)
-a.set_xlabel("パルス番号 (1Hz なので ≈ 経過秒)"); a.set_ylabel("各平均からのズレ [ns] (破線=±16ns=1tick)")
+    a.axvline(v, color="#bbb", lw=0.7, ls="--")
+a.set_title("C. PPS ジッタ分布: ほぼ全パルスが ±16ns 以内 = ジッタ小 (PIO 量子化)", fontsize=10)
+a.set_xlabel("各平均からのズレ [ns] = ジッタ量 (破線=±16ns=PIO 1tick)")
+a.set_ylabel("該当パルス数 (頻度)")
 a.legend(fontsize=9); a.grid(True, alpha=0.2)
 
 # D: 位相同期の収束 (symlog: ms〜µs を 1 枚に)
