@@ -198,6 +198,17 @@ impl DisciplinedClock {
         Some(ei + d)
     }
 
+    /// 逆変換: 指定した UTC が来る **PIO timebase** の local 時刻 (ns)。`now_ns` の逆。
+    /// `fire_at_utc(T)` の核 — この値を PIO の生成/比較 SM に目標 tick として渡せば、UTC ちょうど T に
+    /// ピンを駆動できる。捕捉と同じ PIO timebase なので ns 精度。
+    pub fn local_pio_for_unix_ns(&self, unix_ns: i64) -> Option<i64> {
+        let ep = self.epoch_pio_ns? as i64;
+        let eu = self.epoch_unix_ns?;
+        let dt = unix_ns - eu; // 真の経過 (ns)
+        let d = dt + (dt as i128 * self.freq_mppb as i128 / 1_000_000_000_000i128) as i64;
+        Some(ep + d)
+    }
+
     /// 補正遅延の素: 「真の時間で `true_ns` 待つ」のに必要なローカルクロックの ns。
     /// ローカルは ppb 分速い/遅いので、その分だけ多く/少なく待つ。`Timer::after` に被せると
     /// 水晶公差でなく ±ppb の正確さで待てる (例: `after_micros(true_to_local_ns(us*1000)/1000)`)。
@@ -405,5 +416,38 @@ mod tests {
         assert!((back - target).abs() <= 2, "roundtrip off by {}", back - target);
         // 補正が効いていれば local 経過 > 真の経過 (水晶が速いぶん先に進む): +3ppm×3s ≈ +9µs。
         assert!(local > 1_000_000_000 + 3_000_000_000);
+    }
+
+    #[test]
+    fn pio_local_for_unix_roundtrips_with_now() {
+        // fire_at_utc の核: UTC → PIO tick の逆変換が now_ns (PIO tick → UTC) と往復一致する。
+        let mut c = DisciplinedClock::new();
+        for _ in 0..40 {
+            c.update_freq(1_000_000_000 + 3000); // +3 ppm
+        }
+        c.update_epoch(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
+        let target = 5_000_000_000_000 + 3_000_000_000; // 3 秒後の UTC
+        let tick = c.local_pio_for_unix_ns(target).unwrap(); // この PIO tick でピンを駆動すれば UTC=target
+        let back = c.now_ns(tick as u64).unwrap();
+        assert!((back - target).abs() <= 2, "roundtrip off by {}", back - target);
+        // 水晶が +3ppm 速いので、3 秒先の UTC に対し PIO tick は真の経過より先 (+9µs)。
+        assert!(tick > 1_000_000_000 + 3_000_000_000);
+    }
+
+    #[test]
+    fn pio_local_for_unix_none_before_epoch() {
+        let c = DisciplinedClock::new();
+        assert_eq!(c.local_pio_for_unix_ns(5_000_000_000_000), None);
+    }
+
+    #[test]
+    fn pio_local_for_unix_no_freq_offset_is_identity_shift() {
+        // freq=0 なら PIO tick = epoch_pio + (unix - epoch_unix) (補正なし)。
+        let mut c = DisciplinedClock::new();
+        c.update_epoch(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
+        assert_eq!(
+            c.local_pio_for_unix_ns(5_000_000_500_000),
+            Some(1_000_000_000 + 500_000)
+        );
     }
 }
