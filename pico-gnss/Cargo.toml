@@ -24,6 +24,7 @@ bench = ["dep:nmea"]
 
 [dependencies]
 gnssdo = { path = "../gnssdo" }
+rp-pps = { path = "../rp-pps", features = ["embassy-rp"] }
 heapless = "0.9.3"
 # The bench bin calls the nmea crate directly; the firmware itself uses gnssdo's built-in parser.
 nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }

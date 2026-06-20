@@ -1129,6 +1129,7 @@ dependencies = [
  "nmea",
  "panic-probe",
  "portable-atomic",
+ "rp-pps",
  "static_cell",
 ]
 

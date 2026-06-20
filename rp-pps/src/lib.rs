@@ -27,6 +27,10 @@
 
 use pio::Program;
 
+/// `embassy-rp` (async) backend — [`embassy::PpsCapture`] / [`embassy::PpsOutput`].
+#[cfg(feature = "embassy-rp")]
+pub mod embassy;
+
 /// `rp2040-hal` (blocking) backend — [`rp2040::PpsCapture`] / [`rp2040::PpsOutput`].
 #[cfg(feature = "rp2040-hal")]
 pub mod rp2040;

@@ -35,7 +35,6 @@ use embassy_rp::interrupt;
 use embassy_rp::interrupt::{InterruptExt, Priority};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::peripherals::{PIO0, UART0};
-use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{
     Config as PioConfig, Direction as PioDirection, InterruptHandler as PioInterruptHandler, Pio,
     StateMachine,
@@ -54,6 +53,7 @@ use gnssdo::{
     civil_to_unix, parse_rmc_time_date, snap_to_second_ns, DisciplinedClock, FreqUpdate,
     NmeaLineAssembler, PpsEvent, PpsTracker,
 };
+use rp_pps::embassy::{PpsCapture, PpsOutput};
 
 /// `FreqUpdate` を defmt ログ用の短い文字列に。
 fn freq_update_str(fu: FreqUpdate) -> &'static str {
@@ -75,9 +75,6 @@ const GNSS_BAUD: u32 = 9600;
 
 /// PIO 自走カウンタの 1 tick = 2 サイクル。
 const PIO_CYCLES_PER_TICK: u64 = 2;
-/// 規律 PPS 生成プログラム 1 周の固定オーバーヘッド (clk_sys サイクル)。X = 周期 - これ。
-/// ループバック計測で実測 1e9ns になるよう調整する値 (初期推定)。
-const GEN_OVERHEAD: i64 = 10;
 
 /// 運用モード = 受信機の dynamic model (MT3333 PMTK886)。
 /// **この GPSDO は固定 timing 用途**なので既定は `FixedTiming` (stationary)。受信機に
@@ -205,22 +202,22 @@ async fn send_pmtk<W: Write>(tx: &mut W, payload: &str) {
 
 /// PIO がラッチした PPS エッジを読み、間隔を ns で求めて出す + 周波数を規律するタスク。
 #[embassy_executor::task]
-async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
-    let ns_per_tick: u64 = PIO_CYCLES_PER_TICK * 1_000_000_000 / clk_sys_freq() as u64; // 16 @125MHz
+async fn pps_task(mut capture: PpsCapture<'static, PIO0, 0>) {
+    let clk = clk_sys_freq();
     let mut tracker = PpsTracker::new();
     let mut last_x: Option<u32> = None;
     let mut edge_ns: u64 = 0;
     let mut was_locked = false; // 直前エッジが Locked だったか (復帰検出用)
 
     loop {
-        let x = sm.rx().wait_pull().await; // エッジ時の自走ダウンカウンタ値
+        let x = capture.wait_edge().await; // エッジ時の自走ダウンカウンタ値
         C0_GPS.store(x, Ordering::Relaxed); // stage②: 最新 GPS エッジの生カウンタを共有
         C0_GEN.fetch_add(1, Ordering::Relaxed); // 世代++ (gen_capture が欠落検出に使う)
         // エポックのアンカー用に Instant をエッジ直後に読む (µs ジッタは絶対オフセットのみに効く)。
         let inst_ns = now_local_ns();
 
         let interval_ns = match last_x {
-            Some(lx) => lx.wrapping_sub(x) as u64 * ns_per_tick, // ダウンカウンタ: prev - curr
+            Some(lx) => rp_pps::interval_ns(lx, x, clk), // ダウンカウンタ: prev - curr (wrap 込み)
             None => 0,
         };
         last_x = Some(x);
@@ -306,7 +303,7 @@ async fn time_task() {
 /// ※ freq/位相規律はループバック (GP3→GP4 ジャンパ) 接続が前提。未接続だと初期周期で自走する。
 #[embassy_executor::task]
 async fn gen_capture_task(
-    mut sm_gen: StateMachine<'static, PIO0, 1>,
+    mut output: PpsOutput<'static, PIO0, 1>,
     mut sm: StateMachine<'static, PIO0, 2>,
     k: u32, // stage② 較正済みカウンタオフセット (C0−C2)
 ) {
@@ -398,9 +395,9 @@ async fn gen_capture_task(
         frac_acc += clk * (ppb * 1000 + ppb_trim);
         let freq_cycles = frac_acc.div_euclid(1_000_000_000_000);
         frac_acc = frac_acc.rem_euclid(1_000_000_000_000);
-        let period =
-            clk - GEN_OVERHEAD + freq_cycles - (p_corr + d_corr) * clk / 1_000_000_000;
-        let _ = sm_gen.tx().try_push(period as u32);
+        let period = clk - rp_pps::OUTPUT_OVERHEAD_CYCLES as i64 + freq_cycles
+            - (p_corr + d_corr) * clk / 1_000_000_000;
+        let _ = output.set_period(period as u32);
         if let Some(iv) = interval_ns {
             count += 1;
             // 制御信号を全部出力 → ホストでプラント同定 + ゲイン掃引シミュ + 項別比較ができる。
@@ -419,38 +416,19 @@ async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     info!("pico-gnss: start (NMEA on UART0/GP1 @ {} baud, PPS on GP2 via PIO, GPSDO)", GNSS_BAUD);
 
-    // PPS on GP2 を PIO0 SM0 でハードキャプチャ (自走ダウンカウンタを立ち上がりで push)。
-    let Pio { mut common, mut sm0, mut sm1, mut sm2, .. } = Pio::new(p.PIO0, Irqs);
-    let prg = pio_asm!(
-        ".wrap_target",
-        "low:",
-        "    jmp pin rising", // pin high → 立ち上がり (本物) → 捕捉
-        "    jmp x-- low",    // X--; X≠0 なら low へ。X=0 のときだけ下へ落ちる
-        "    jmp low",        // X=0 (周回) → 偽キャプチャせず継続 (~68s 毎の glitch を源で除去)
-        "rising:",
-        "    in x, 32",
-        "    push noblock",
-        "high:",
-        "    jmp x-- highchk",
-        "highchk:",
-        "    jmp pin high",
-        ".wrap",
-    );
-    let loaded = common.load_program(&prg.program);
-    let pps_pin = common.make_pio_pin(p.PIN_2);
+    // PPS on GP2 を PIO0 SM0 で rp-pps の PpsCapture でハードキャプチャ (~16ns 分解能)。
+    let Pio { mut common, sm0, sm1, mut sm2, .. } = Pio::new(p.PIO0, Irqs);
+    let mut capture = PpsCapture::new(&mut common, sm0, p.PIN_2);
+
+    // stage②: SM2 (ループバック位相計測。rp-pps 外の実験機能) は capture と GP2 を共有して生カウンタ差
+    // K=C0−C2 を較正する。embassy の set_jmp_pin は &Pin を要求し GP2 は一度しか make できないので、
+    // capture.jmp_pin() で GP2 Pin を借り、capture プログラムをもう一枚 load する。
+    let lb_loaded = common.load_program(&rp_pps::pps_capture_program());
     let lb_pin = common.make_pio_pin(p.PIN_4);
-    sm0.set_pin_dirs(PioDirection::In, &[&pps_pin]);
     sm2.set_pin_dirs(PioDirection::In, &[&lb_pin]);
-
-    // SM0: GP2 (GPS PPS) を捕捉。
     let mut cfg_gp2 = PioConfig::default();
-    cfg_gp2.use_program(&loaded, &[]);
-    cfg_gp2.set_jmp_pin(&pps_pin);
-    sm0.set_config(&cfg_gp2);
-    sm0.set_enable(true);
-
-    // stage②: SM2 を一旦 GP2 に向け、SM0 と同じ GPS エッジを両方で捕捉して生カウンタ差 K=C0−C2 を較正。
-    // 両 SM は同じ clk_sys なので K は定数。set_config でピンを変えても scratch X は保たれるので K は有効。
+    cfg_gp2.use_program(&lb_loaded, &[]);
+    cfg_gp2.set_jmp_pin(capture.jmp_pin()); // SM0 と同じ GP2 を捕捉
     sm2.set_config(&cfg_gp2);
     sm2.set_enable(true);
     let mut k: u32 = 0;
@@ -459,7 +437,7 @@ async fn main(spawner: Spawner) {
         for i in 0..7u32 {
             // PPS は fix 後のみ出る。各エッジ最大 30s 待ち、出なければ較正打ち切り (hw 位相無効)。
             match with_timeout(Duration::from_secs(30), async {
-                let c0 = sm0.rx().wait_pull().await;
+                let c0 = capture.wait_edge().await;
                 let c2 = sm2.rx().wait_pull().await;
                 (c0, c2)
             })
@@ -483,40 +461,21 @@ async fn main(spawner: Spawner) {
 
     // SM2 を GP4 (ループバック) に切替。set_config は X を触らないので K は有効のまま。
     let mut cfg_gp4 = PioConfig::default();
-    cfg_gp4.use_program(&loaded, &[]);
+    cfg_gp4.use_program(&lb_loaded, &[]);
     cfg_gp4.set_jmp_pin(&lb_pin);
     sm2.set_config(&cfg_gp4);
 
-    // SM1: 規律 PPS 生成を GP3 へ。pull noblock で周期を保持し、毎周 X サイクル low + 短い high。
-    // 周期は X に保持。カウントダウンは Y ← X を delay で潰すと 2 発目以降が壊れる (ハマった)。
-    let gen_prg = pio_asm!(
-        "    set pindirs, 1", // GP3 を出力に (起動時 1 回; SET ピン=GP3)
-        ".wrap_target",
-        "    pull noblock",  // OSR = 新周期 (FIFO 空なら X = 保持中の周期)
-        "    mov x, osr",    // X = 周期 (保持; カウントダウンでは触らない)
-        "    mov y, osr",    // Y = カウントダウン用コピー
-        "    set pins, 1 [10]", // 立ち上がりエッジ + ~88ns high
-        "    set pins, 0",   // 立ち下がり
-        "delay:",
-        "    jmp y-- delay", // Y+1 サイクル low (X は保持)
-        ".wrap",
-    );
-    let gen_loaded = common.load_program(&gen_prg.program);
-    let gen_pin = common.make_pio_pin(p.PIN_3);
-    sm1.set_pin_dirs(PioDirection::Out, &[&gen_pin]);
-    let mut gen_cfg = PioConfig::default();
-    gen_cfg.use_program(&gen_loaded, &[]);
-    gen_cfg.set_set_pins(&[&gen_pin]);
-    sm1.set_config(&gen_cfg);
-    let _ = sm1.tx().try_push((clk_sys_freq() as i64 - GEN_OVERHEAD) as u32); // 初期周期 (ppb=0)
-    sm1.set_enable(true);
+    // SM1: 規律 PPS 生成を GP3 へ (rp-pps の PpsOutput)。初期周期 = ppb=0 の 1Hz。周期は
+    // gen_capture_task が毎エッジ set_period で操舵する (servo は firmware 側に残す)。
+    let output =
+        PpsOutput::new(&mut common, sm1, p.PIN_3, rp_pps::output_period_cycles(clk_sys_freq()));
 
     // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
     interrupt::SWI_IRQ_0.set_priority(Priority::P0);
     let spawner_high = EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0);
-    spawner_high.spawn(pps_task(sm0).unwrap());
+    spawner_high.spawn(pps_task(capture).unwrap());
     spawner.spawn(time_task().unwrap());
-    spawner_high.spawn(gen_capture_task(sm1, sm2, k).unwrap());
+    spawner_high.spawn(gen_capture_task(output, sm2, k).unwrap());
 
     // UART0: TX=GP0 (モジュール設定送信), RX=GP1 (NMEA 受信)。
     static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
