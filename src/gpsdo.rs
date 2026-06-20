@@ -11,27 +11,66 @@
 //! (embassy Instant 等) から、と別々に与える。両者は単位 (ns) を揃えるだけでよい。
 //! いずれも HAL 非依存なので host で `cargo test-host` する。
 
-/// ロック後の EMA 平滑係数 alpha = 1/2^EMA_SHIFT (≈ 時定数 32 サンプル)。
-const EMA_SHIFT: u32 = 5;
-/// 収束中 (未ロック) の速い EMA 係数 alpha = 1/2^EMA_SHIFT_FAST (= 1/8)。
-/// 起動直後はまだ推定が無いので速く捕捉し、ロック後はゆっくり平滑してジッタを抑える。
-const EMA_SHIFT_FAST: u32 = 3;
-/// ロック判定に必要な周波数サンプル数。
-const LOCK_SAMPLES: u32 = 8;
-/// **非常停止**枠 (1s ± 1ms)。これより外れた間隔 (PIO ~68s 周回グリッチの偽短間隔
-/// ≈ -37ms や欠落の ~2s) は明らかに不正。50ms だと周回グリッチがすり抜けて EMA を
-/// 汚染した (実機評価で発覚)。これは通常の品質判定ではなく最後の安全網であり、
-/// 通常品質は下の収束ゲート / 残差ゲートで弾く (smart-friend GPT-5.5 の指摘)。
-const SANE_DEV_NS: i64 = 1_000_000;
-/// 未ロック (収束中) の絶対品質ゲート ±100µs。EMA がまだ信用できないので絶対値で弾く。
-/// 窓際弱信号の中規模 multipath (数十〜数百µs) が最初の数発に混じって EMA を汚すのを防ぐ。
-const CONVERGE_GATE_NS: i64 = 100_000;
-/// ロック後の残差ゲート: `|measured − EMA|` が ±5µs を超える単発は multipath とみなし棄却。
-/// 固定窓際の真のジッタは ns〜数十ns 級なので 5µs でも十分甘い安全側。
-const RESIDUAL_GATE_NS: i64 = 5_000;
-/// holdover/Irregular から復帰した直後、周波数 EMA 更新を保留するサンプル数。
-/// 復帰直後の PPS は受信機内部状態・NMEA 対応・PPS 位相がまだ整っておらず信用できない。
-const QUARANTINE_SAMPLES: u32 = 5;
+use core::num::{NonZeroU32, NonZeroU64};
+
+/// [`DisciplinedClock`] のチューニング設定。
+///
+/// 受信機・アンテナ・TCXO/水晶・PPS 捕捉分解能・運用形態 (固定/移動) で適値が変わるため、
+/// 固定 const ではなく設定可能にしている。`Default` (= [`DisciplinedClockConfig::DEFAULT`]) は
+/// GYSFFMANC (MT3333) + 窓際固定 + PIO ns 捕捉での実測整定値。
+///
+/// **不正値は型で排除する**: 0 や負だと意味を成さない/破綻するフィールド (サンプル数・各ゲート)
+/// は `NonZero*` にしてあり、不正値はそもそも構築できない。シフト量だけは上限制約 (0..=63) なので
+/// `NonZero` では表せず、使用時に `min(63)` でクランプする (i64 シフトのオーバーフロー回避)。
+///
+/// (`Debug`/`Default` は親 [`DisciplinedClock`] の derive が要求する最小限。
+///  比較や複製が要るようになるまで `Clone`/`PartialEq` 等は足さない。)
+#[derive(Debug)]
+pub struct DisciplinedClockConfig {
+    /// ロック後の EMA 平滑係数 alpha = 1/2^`ema_shift` (既定 5 ≈ 時定数 32 サンプル)。
+    /// 有効範囲 0..=63、超過分は内部で 63 にクランプする。
+    pub ema_shift: u32,
+    /// 収束中 (未ロック) の速い EMA 係数 alpha = 1/2^`ema_shift_fast` (既定 3 = 1/8)。
+    /// 起動直後はまだ推定が無いので速く捕捉し、ロック後はゆっくり平滑してジッタを抑える。
+    /// 有効範囲 0..=63 (`ema_shift` と同様クランプ)。
+    pub ema_shift_fast: u32,
+    /// ロック判定に必要な周波数サンプル数 (既定 8)。
+    pub lock_samples: NonZeroU32,
+    /// **非常停止**枠 (1s ± `sane_dev_ns`, 既定 1ms)。これより外れた間隔 (PIO ~68s 周回
+    /// グリッチの偽短間隔 ≈ -37ms や欠落の ~2s) は明らかに不正。50ms だと周回グリッチが
+    /// すり抜けて EMA を汚染した (実機評価で発覚)。通常の品質判定ではなく最後の安全網であり、
+    /// 通常品質は下の収束ゲート / 残差ゲートで弾く (smart-friend GPT-5.5 の指摘)。
+    pub sane_dev_ns: NonZeroU64,
+    /// 未ロック (収束中) の絶対品質ゲート (既定 ±100µs)。EMA がまだ信用できないので絶対値で弾く。
+    /// 窓際弱信号の中規模 multipath (数十〜数百µs) が最初の数発に混じって EMA を汚すのを防ぐ。
+    pub converge_gate_ns: NonZeroU64,
+    /// ロック後の残差ゲート: `|measured − EMA|` が `residual_gate_ns` (既定 ±5µs) を超える単発は
+    /// multipath とみなし棄却。固定窓際の真のジッタは ns〜数十ns 級なので 5µs でも十分甘い安全側。
+    pub residual_gate_ns: NonZeroU64,
+    /// holdover/Irregular から復帰した直後、周波数 EMA 更新を保留するサンプル数 (既定 5)。
+    /// 復帰直後の PPS は受信機内部状態・NMEA 対応・PPS 位相がまだ整っておらず信用できない。
+    /// 0 = 検疫しない (有効な設定なので `NonZero` にはしない)。
+    pub quarantine_samples: u32,
+}
+
+impl DisciplinedClockConfig {
+    /// 実測整定の既定値。`const fn` の [`DisciplinedClock::new`] から使えるよう const で保持。
+    pub const DEFAULT: Self = Self {
+        ema_shift: 5,
+        ema_shift_fast: 3,
+        lock_samples: NonZeroU32::new(8).unwrap(),
+        sane_dev_ns: NonZeroU64::new(1_000_000).unwrap(),
+        converge_gate_ns: NonZeroU64::new(100_000).unwrap(),
+        residual_gate_ns: NonZeroU64::new(5_000).unwrap(),
+        quarantine_samples: 5,
+    };
+}
+
+impl Default for DisciplinedClockConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// `update_freq` の結果。pps_task 側のログ/状態管理に使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +88,7 @@ pub enum FreqUpdate {
 /// PPS で規律されるクロックモデル。
 #[derive(Debug, Default)]
 pub struct DisciplinedClock {
+    config: DisciplinedClockConfig,
     freq_mppb: i64, // 周波数オフセット EMA (milli-ppb = ppb*1000, 高分解能保持用)
     samples: u32,
     quarantine: u32, // >0 の間は復帰検疫中 (周波数 EMA 更新を保留)
@@ -68,8 +108,15 @@ pub fn snap_to_second_ns(raw: i64) -> i64 {
 }
 
 impl DisciplinedClock {
+    /// 既定設定 ([`DisciplinedClockConfig::DEFAULT`]) で生成する。
     pub const fn new() -> Self {
+        Self::with_config(DisciplinedClockConfig::DEFAULT)
+    }
+
+    /// 設定を指定して生成する。`static` 初期化で使えるよう `const fn`。
+    pub const fn with_config(config: DisciplinedClockConfig) -> Self {
         Self {
+            config,
             freq_mppb: 0,
             samples: 0,
             quarantine: 0,
@@ -78,6 +125,11 @@ impl DisciplinedClock {
             epoch_unix_ns: None,
             last_instant_ns: None,
         }
+    }
+
+    /// 現在の設定。
+    pub fn config(&self) -> &DisciplinedClockConfig {
+        &self.config
     }
 
     /// 精密な PPS 間隔 (ns, 理想 1e9) から周波数オフセットを EMA 更新する。
@@ -93,7 +145,7 @@ impl DisciplinedClock {
     pub fn update_freq(&mut self, interval_ns: i64) -> FreqUpdate {
         let dev = interval_ns - 1_000_000_000; // = ppb
         // 1. 非常停止: ±1ms 外は wrap グリッチ/欠落。常に棄却。
-        if dev.abs() >= SANE_DEV_NS {
+        if dev.abs() >= self.config.sane_dev_ns.get() as i64 {
             return FreqUpdate::GatedSane;
         }
         // 2. 復帰検疫: 復帰直後 M サンプルは受信機内部状態・PPS 位相が未整合で信用できない
@@ -112,17 +164,23 @@ impl DisciplinedClock {
         // 3. 品質ゲート。
         if self.is_locked() {
             // ロック後: EMA からの残差が大きい単発は multipath。±1ms より遥かに厳しく弾く。
-            if (measured_mppb - self.freq_mppb).abs() > RESIDUAL_GATE_NS * 1000 {
+            if (measured_mppb - self.freq_mppb).abs() > self.config.residual_gate_ns.get() as i64 * 1000 {
                 return FreqUpdate::GatedQuality;
             }
         } else {
             // 収束中: EMA がまだ信用できないので絶対ゲートで中規模 multipath を弾く。
-            if dev.abs() > CONVERGE_GATE_NS {
+            if dev.abs() > self.config.converge_gate_ns.get() as i64 {
                 return FreqUpdate::GatedQuality;
             }
         }
         // 4. EMA 更新: f += (x − f) / 2^SHIFT。収束中は速い alpha=1/8 で捕捉。
-        let shift = if self.is_locked() { EMA_SHIFT } else { EMA_SHIFT_FAST };
+        // シフト量は 0..=63 にクランプして i64 シフトのオーバーフローを防ぐ (config doc 参照)。
+        let shift = if self.is_locked() {
+            self.config.ema_shift
+        } else {
+            self.config.ema_shift_fast
+        }
+        .min(63);
         self.freq_mppb += (measured_mppb - self.freq_mppb) >> shift;
         self.samples += 1;
         FreqUpdate::Applied
@@ -133,7 +191,7 @@ impl DisciplinedClock {
     /// 守るべき推定がまだ無い初回捕捉 (samples==0) では何もしない — 起動時の捕捉を遅らせない。
     pub fn start_quarantine(&mut self) {
         if self.samples > 0 {
-            self.quarantine = QUARANTINE_SAMPLES;
+            self.quarantine = self.config.quarantine_samples;
         }
     }
 
@@ -170,7 +228,7 @@ impl DisciplinedClock {
 
     /// 十分なサンプルで周波数がロックしたか。
     pub fn is_locked(&self) -> bool {
-        self.samples >= LOCK_SAMPLES
+        self.samples >= self.config.lock_samples.get()
     }
 
     /// **PIO timebase** の local 時刻 → 規律 UTC (Unix ns)。ns 精度。PPS エッジでの err 計測用。
@@ -228,6 +286,34 @@ impl DisciplinedClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::num::{NonZeroU32, NonZeroU64};
+
+    #[test]
+    fn custom_config_changes_lock_threshold() {
+        // lock_samples を 3 に下げると 3 サンプルでロックする (既定 8 とは異なる)。
+        let cfg = DisciplinedClockConfig {
+            lock_samples: NonZeroU32::new(3).unwrap(),
+            ..DisciplinedClockConfig::DEFAULT
+        };
+        let mut c = DisciplinedClock::with_config(cfg);
+        c.update_freq(1_000_002_500);
+        c.update_freq(1_000_002_500);
+        assert!(!c.is_locked());
+        c.update_freq(1_000_002_500);
+        assert!(c.is_locked());
+    }
+
+    #[test]
+    fn custom_converge_gate_admits_wider_outlier() {
+        // converge_gate_ns を広げると、既定 (±100µs) では弾かれる偏差を収束中でも採用する。
+        let cfg = DisciplinedClockConfig {
+            converge_gate_ns: NonZeroU64::new(500_000).unwrap(),
+            ..DisciplinedClockConfig::DEFAULT
+        };
+        let mut c = DisciplinedClock::with_config(cfg);
+        c.update_freq(1_000_002_500); // 基準確立
+        assert_eq!(c.update_freq(1_000_000_000 + 200_000), FreqUpdate::Applied);
+    }
 
     #[test]
     fn freq_converges_to_constant_offset() {
@@ -323,7 +409,7 @@ mod tests {
     fn fast_alpha_converges_within_few_samples() {
         let mut c = DisciplinedClock::new();
         // 未ロックの速い alpha=1/8 で、定常オフセットに数発で寄る。
-        for _ in 0..LOCK_SAMPLES {
+        for _ in 0..DisciplinedClockConfig::DEFAULT.lock_samples.get() {
             c.update_freq(1_000_003_000); // +3000ppb
         }
         // 1 発目で 3000 に張り付くので、ロック時点で既にほぼ 3000。
@@ -333,7 +419,7 @@ mod tests {
     #[test]
     fn not_locked_until_enough_samples() {
         let mut c = DisciplinedClock::new();
-        for _ in 0..(LOCK_SAMPLES - 1) {
+        for _ in 0..(DisciplinedClockConfig::DEFAULT.lock_samples.get() - 1) {
             c.update_freq(1_000_002_500);
         }
         assert!(!c.is_locked());

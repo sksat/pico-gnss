@@ -236,6 +236,7 @@ async fn pps_task(mut sm: StateMachine<'static, PIO0, 0>) {
             PpsEvent::First => ("First", 0),
             PpsEvent::Locked { .. } => ("Locked", 0),
             PpsEvent::Irregular { missed, .. } => ("Irregular", missed),
+            PpsEvent::NonMonotonic { .. } => ("NonMono", 0),
         };
         let locked = state == "Locked";
         // holdover/Irregular からの復帰 (前回非 Locked → 今回 Locked) を検出したら周波数を検疫する。
