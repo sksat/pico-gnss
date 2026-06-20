@@ -47,12 +47,9 @@ use embedded_io_async::Read;
 use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
-use gnssdo::{
-    Gnssdo, LoopMode, NmeaLineAssembler, PhaseLockLoop, PpsEvent, civil_to_unix,
-    parse_rmc_time_date, snap_to_second_ns,
-};
-use rp_pps::PpsSteer;
+use gnssdo::{Gnssdo, LoopMode, PhaseLockLoop, PpsEvent, snap_to_second_ns};
 use rp_pps::embassy::{SteeredPpsOutput, TimedPpsCapture};
+use rp_pps::{NmeaLineAssembler, PpsSteer, civil_to_unix, parse_rmc_time_date};
 
 /// 受信機固有レイヤ (MT3333/GYSFFMANC の PMTK 設定・ボーレート)。別受信機ならここだけ差し替え。
 mod mt3333;

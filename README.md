@@ -18,8 +18,9 @@ signal is lost.
 
 | Path | What |
 |---|---|
-| [`gnssdo/`](gnssdo/) | **Core library** ([crate `gnssdo`](gnssdo/README.md)). `no_std`, HAL-agnostic, integer-only, zero-dependency. Frequency (ppb) estimation, holdover, PPS tracking, NMEA/PPS time sync. Host-testable. |
-| [`pico-gnss/`](pico-gnss/) | RP2040 firmware (embassy-rp). PIO hardware PPS capture, clock discipline, disciplined PPS output. Embedded-only; uses `gnssdo`. |
+| [`gnssdo/`](gnssdo/) | **Discipline core** ([crate `gnssdo`](gnssdo/README.md)). `no_std`, HAL-agnostic, integer-only, **zero-dependency**. Frequency (ppb) estimation, holdover, PPS edge tracking, output phase-lock servo (PLL). Consumes timestamps + a UTC epoch. Host-testable. |
+| [`rp-pps/`](rp-pps/) | **RP2040/RP2350 PIO + receiver I/O** (crate `rp-pps`). Hardware PPS edge-capture & steerable 1PPS output, NMEA framing/parsing, PPS↔UTC-second pairing — produces the timestamps + epoch `gnssdo` consumes. HAL-agnostic core (host-testable) + embassy-rp / rp2040-hal backends. |
+| [`pico-gnss/`](pico-gnss/) | RP2040 firmware (embassy-rp). PIO hardware PPS capture, clock discipline, disciplined PPS output. Embedded-only; wires `gnssdo` + `rp-pps`. |
 | [`webapp/`](webapp/) | Real-time dashboard (React 19 + Vite + TypeScript), fed from the firmware's defmt/RTT output via a zero-dependency Node bridge. |
 | [`report/`](report/) | On-hardware evaluation logs and figures. |
 | [`NOTES.md`](NOTES.md) | Design decisions and hard-won gotchas. |

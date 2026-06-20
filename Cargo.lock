@@ -755,11 +755,6 @@ dependencies = [
 [[package]]
 name = "gnssdo"
 version = "0.1.0"
-dependencies = [
- "chrono",
- "heapless 0.9.3",
- "nmea",
-]
 
 [[package]]
 name = "half"
@@ -1336,7 +1331,10 @@ dependencies = [
 name = "rp-pps"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "embassy-rp",
+ "heapless 0.9.3",
+ "nmea",
  "pio",
  "rp2040-hal",
 ]

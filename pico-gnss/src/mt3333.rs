@@ -53,9 +53,9 @@ const PMTK_INIT: &[&str] = &[
     "PMTK605", // FW バージョン照会 → $PMTK705 で返る (ACK は無く応答が版情報)
 ];
 
-/// `$<payload>*<csum>\r\n` を組み立てて送る (汎用 NMEA チェックサムは gnssdo)。
+/// `$<payload>*<csum>\r\n` を組み立てて送る (汎用 NMEA チェックサムは rp-pps)。
 async fn send_pmtk<W: Write>(tx: &mut W, payload: &str) {
-    let cs = gnssdo::nmea_checksum(payload.as_bytes());
+    let cs = rp_pps::nmea_checksum(payload.as_bytes());
     // PMTK314 (NMEA 出力設定) は ~51 文字になるので余裕を持って 96。溢れると truncate されて
     // 不完全コマンドになり、モジュールに拒否される (実際にハマった)。
     let mut line: String<96> = String::new();

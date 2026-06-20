@@ -426,7 +426,7 @@ impl Gnssdo {
 
     /// Establish/refresh the UTC epoch by pairing a PPS edge with its UTC second. A thin passthrough
     /// to [`DisciplinedClock::update_epoch`]; NMEA parsing and the PPS↔NMEA pairing stay the caller's
-    /// ([`parse_rmc_time_date`](crate::parse_rmc_time_date) / [`PpsTimeSync`](crate::PpsTimeSync)).
+    /// (the `rp-pps` crate provides them).
     pub fn on_utc(&mut self, capture_ns: u64, query_ns: u64, unix_ns: i64) {
         self.clock.update_epoch(capture_ns, query_ns, unix_ns);
     }

@@ -21,12 +21,18 @@ It is HAL-agnostic: you pass timestamps as plain integers, so it runs on any MCU
   between a local timebase and disciplined UTC (and back), holdover-extrapolated.
 - `PpsTracker` — classifies a PPS edge stream as lock / missed-pulse / glitch /
   non-monotonic. Tolerance and nominal rate are configurable.
-- `PpsTimeSync` — pairs NMEA UTC with a PPS edge to establish a µs-precision UTC
-  epoch. The PPS↔NMEA second association (±1 s, receiver-dependent) is a type
-  (`PpsNmeaAssociation`) so the classic 1-second offset bug is hard to hit.
-- Minimal NMEA helpers (`parse_rmc_time_date`, `parse_hhmmss`, `civil_to_unix`, …)
-  for extracting time+date only — the core does **not** require a NMEA parser
-  (`PpsTimeSync` takes already-parsed values), so you can bring your own.
+- `PhaseLockLoop` — a type-II output-phase servo (P/I/D + Smith predictor) for
+  disciplining a *generated* 1PPS edge to the reference.
+- `Gnssdo` — a turn-key easy tier bundling `PpsTracker` + `DisciplinedClock` under
+  one good default discipline policy (feed-only-when-locked + holdover quarantine).
+
+## Scope
+
+This crate is just the **discipline**: it consumes a UTC epoch (`capture_ns ↔
+unix_ns`, via `update_epoch` / `Gnssdo::on_utc`) and PPS intervals, and is agnostic to
+*where* absolute time comes from. Decoding the time source (NMEA framing/parsing) and
+pairing a PPS edge with its UTC second are a separate responsibility — on the RP2040
+they live in the sibling [`rp-pps`](https://crates.io/crates/rp-pps) crate.
 
 ## Two timebases
 
@@ -59,15 +65,7 @@ Tuning (`DisciplinedClockConfig`, `PpsTrackerConfig`) is exposed; defaults are t
 measured settling values from a GYSFFMANC (MT3333) receiver. Invalid settings are
 made unrepresentable via `NonZero*` types.
 
-## Cargo features
-
-- **`external-nmea`** (off by default): delegate `parse_rmc_time_date`'s RMC parsing
-  to the [`nmea`](https://docs.rs/nmea) crate instead of the built-in parser. The
-  default in-house parser is zero-dependency and tiny; enable this only if you want
-  NMEA checksum validation or already depend on `nmea`. On an RP2040 the `nmea`-backed
-  path is ~17× slower per sentence and adds ~52 KB of `.text` — negligible at 1 Hz,
-  but the default keeps the core dependency-free.
-
-  Backend differences: the `nmea` crate validates checksums, interprets the year with
-  a century pivot (`yy=94`→1994), and rejects leap-second `ss=60`; the built-in parser
-  skips checksums, assumes 20xx, and accepts `ss=60`.
+The crate has **no dependencies and no Cargo features** — it is pure integer logic.
+NMEA decoding (with an optional `nmea`-crate backend) and the PPS↔UTC-second pairing
+that produce the epoch you feed to `update_epoch` live in the sibling
+[`rp-pps`](https://crates.io/crates/rp-pps) crate.

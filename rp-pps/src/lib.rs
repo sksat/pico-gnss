@@ -1,29 +1,37 @@
 #![cfg_attr(not(test), no_std)]
-//! `rp-pps`: RP2040/RP2350 PIO building blocks for a GNSS 1PPS timebase.
+//! `rp-pps`: RP2040/RP2350 PIO building blocks for a GNSS 1PPS timebase, plus NMEA time ingestion.
 //!
-//! This is the hardware companion to [`gnssdo`](https://docs.rs/gnssdo): `gnssdo` is the
-//! HAL-agnostic discipline core that turns integer-nanosecond timestamps into disciplined UTC,
-//! and `rp-pps` is what produces those timestamps (and a steerable 1PPS output) on the RP2040's
-//! PIO. The PIO hardware latches the PPS edge with ~16 ns resolution, free of the µs-scale jitter
-//! a software GPIO interrupt has on a Cortex-M0+.
+//! This is the device/receiver-facing companion to [`gnssdo`](https://docs.rs/gnssdo): `gnssdo` is
+//! the HAL-agnostic discipline core that turns timestamps + a UTC epoch into disciplined UTC, and
+//! `rp-pps` is what *produces* those inputs. It hardware-timestamps the PPS edge on the RP2040's
+//! PIO (~16 ns, free of the µs-scale jitter a software GPIO interrupt has on a Cortex-M0+), emits a
+//! steerable 1PPS, and decodes the receiver's NMEA to pair each edge with its UTC second.
 //!
 //! # Layers
 //!
-//! - **HAL-agnostic core** (this module, always available): the PIO programs
-//!   ([`pps_capture_program`], [`pps_output_program`]), their FIFO-word contracts, and the pure
-//!   tick↔ns / period-word math ([`interval_ns`], [`output_period_cycles_ppb`], …). No HAL
-//!   dependency, so it is `cargo test`-ed on the host. The programs are built with `pio::pio_asm!`
-//!   (not a HAL's re-export), so every backend loads the same [`pio::Program`].
+//! - **HAL-agnostic core** (always available, host-tested): the PIO programs
+//!   ([`pps_capture_program`], [`pps_output_program`]) and their FIFO-word contracts; the tick↔ns
+//!   / period-word math ([`interval_ns`], [`output_period_cycles_ppb`], …); NMEA framing/parsing
+//!   ([`NmeaLineAssembler`], [`parse_rmc_time_date`]); and the PPS↔UTC-second pairing
+//!   ([`PpsTimeSync`]). No HAL dependency. The programs are built with `pio::pio_asm!` (not a HAL's
+//!   re-export), so every backend loads the same [`pio::Program`].
 //! - **Backends** (thin, feature-gated): `embassy-rp` (async) and `rp2040-hal` (blocking/IRQ).
-//!   Each only loads a core program and moves one FIFO word per second — there is no unified
-//!   HAL trait, just a small concrete type per backend.
+//!   Each only loads a core program and moves one FIFO word per second — there is no unified HAL
+//!   trait, just a small concrete type per backend.
 //!
 //! # Scope
 //!
-//! `rp-pps` owns the *I/O*: capturing edges and emitting pulses. It deliberately does **not** own
-//! the discipline (frequency estimation, holdover — that is `gnssdo`) nor the phase servo
-//! (PI/PID/Smith control of the output) — those stay in the application. [`output_period_cycles_ppb`]
-//! is the generator *protocol* (what word to push for a given frequency offset), not a servo.
+//! `rp-pps` owns the *device/receiver I/O and time ingestion*: capturing edges, emitting pulses,
+//! and turning the receiver's NMEA + a PPS edge into a UTC epoch. It deliberately does **not** own
+//! the discipline (frequency estimation, holdover, the phase servo) — that is [`gnssdo`](https://docs.rs/gnssdo)'s
+//! job; feed it the timestamps and epoch this crate produces. [`output_period_cycles_ppb`] is the
+//! generator *protocol* (what word to push for a given frequency offset), not a servo.
+//!
+//! # Features
+//!
+//! - **`external-nmea`** (off by default): parse RMC with the [`nmea`](https://docs.rs/nmea) crate
+//!   instead of the zero-dependency built-in parser. See [`parse_rmc_time_date`] for the behavioural
+//!   differences (checksum validation, year pivot, leap-second handling).
 
 use pio::Program;
 
@@ -34,6 +42,15 @@ pub mod embassy;
 /// `rp2040-hal` (blocking) backend — [`rp2040::PpsCapture`] / [`rp2040::PpsOutput`].
 #[cfg(feature = "rp2040-hal")]
 pub mod rp2040;
+
+mod assembler;
+mod timesync;
+
+pub use assembler::{MAX_SENTENCE_LEN, NmeaLineAssembler, nmea_checksum, nmea_checksum_valid};
+pub use timesync::{
+    PpsNmeaAssociation, PpsTimeSync, RmcTimeDate, SyncPoint, civil_to_unix, days_from_civil,
+    parse_ddmmyy, parse_hhmmss, parse_rmc_time_date,
+};
 
 /// One capture tick = 2 PIO clock cycles: [`pps_capture_program`] advances its free-running
 /// counter once per 2 cycles (`jmp x--` in a 2-cycle loop), so at 125 MHz one tick is 16 ns.

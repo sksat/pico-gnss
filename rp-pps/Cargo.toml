@@ -1,12 +1,12 @@
 [package]
 name = "rp-pps"
 version = "0.1.0"
-description = "RP2040/RP2350 PIO building blocks for a GNSS 1PPS timebase: hardware edge-timestamp capture and steerable 1PPS output. HAL-agnostic core (PIO program + tick/ns math, host-testable) with thin embassy-rp / rp2040-hal backends."
+description = "RP2040/RP2350 PIO building blocks for a GNSS 1PPS timebase, plus NMEA time ingestion: hardware edge-timestamp capture, steerable 1PPS output, NMEA framing/parsing, and PPS↔UTC-second pairing. HAL-agnostic core (host-testable) with thin embassy-rp / rp2040-hal backends."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-keywords = ["pps", "pio", "rp2040", "gnss", "gpsdo"]
+keywords = ["pps", "pio", "rp2040", "gnss", "nmea"]
 categories = ["embedded", "no-std", "hardware-support"]
 
 [lib]
@@ -19,11 +19,22 @@ default = []
 embassy-rp = ["dep:embassy-rp"]
 # Thin blocking/IRQ backend over rp2040-hal (RP2040 only).
 rp2040-hal = ["dep:rp2040-hal"]
+# Parse RMC with the `nmea` crate instead of the built-in parser (default: built-in, zero-dep).
+# Measured on RP2040 (Cortex-M0+ @125MHz): built-in ~37us/RMC, ~0.8KB, no deps;
+# nmea ~619us/RMC (~17x slower), +~52KB .text, pulls in nom/chrono and ~6 crates.
+# Negligible at 1 Hz. Behaviour also differs: the nmea crate validates the checksum and uses a
+# century pivot for the year (yy=94 -> 1994); the built-in parser skips the checksum and assumes 20xx.
+external-nmea = ["dep:nmea", "dep:chrono"]
 
 [dependencies]
 # The PIO program is built HAL-agnostically here (via `pio::pio_asm!`, NOT a HAL's
 # re-export), so both backends load the same `pio::Program<32>`. embassy-rp 0.10,
 # rp2040-hal 0.12 and this crate all pin `pio` 0.3 — the program type is shared.
 pio = "0.3"
+# NMEA sentence framing buffer (assembler).
+heapless = "0.9.3"
 embassy-rp = { version = "0.10", optional = true, default-features = false }
 rp2040-hal = { version = "0.12", optional = true, default-features = false }
+nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }
+# Used by `external-nmea` to read fields from the nmea crate's chrono date/time types.
+chrono = { version = "0.4", default-features = false, optional = true }

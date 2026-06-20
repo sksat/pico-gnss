@@ -3,7 +3,7 @@ name = "gnssdo"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-description = "no_std, HAL-agnostic GNSS PPS disciplined clock & holdover core (GPSDO): crystal frequency (ppb) estimation, PPS edge tracking, and NMEA/PPS time synchronization. Integer-only, zero-dependency core."
+description = "no_std, HAL-agnostic GNSS-PPS-disciplined clock & holdover core (GPSDO): crystal frequency (ppb) estimation, PPS edge tracking, and an output phase-lock servo. Integer-only, zero-dependency."
 keywords = ["gnssdo", "gpsdo", "gnss", "pps", "no_std"]
 categories = ["embedded", "no-std", "science"]
 license.workspace = true
@@ -13,16 +13,5 @@ repository.workspace = true
 [lib]
 name = "gnssdo"
 
-[features]
-# Parse RMC with the `nmea` crate instead of the built-in parser (default: built-in, zero-dep).
-# Measured on RP2040 (Cortex-M0+ @125MHz): built-in ~37us/RMC, ~0.8KB, no deps;
-# nmea ~619us/RMC (~17x slower), +~52KB .text, pulls in nom/chrono and ~6 crates.
-# Negligible at 1 Hz. Behaviour also differs: the nmea crate validates the checksum and uses a
-# century pivot for the year (yy=94 -> 1994); the built-in parser skips the checksum and assumes 20xx.
-external-nmea = ["dep:nmea", "dep:chrono"]
-
-[dependencies]
-heapless = "0.9.3"
-nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }
-# Used by `external-nmea` to read fields from the nmea crate's chrono date/time types.
-chrono = { version = "0.4", default-features = false, optional = true }
+# No dependencies: the discipline core is pure integer logic. NMEA decoding and PPS↔time pairing
+# (which need heapless / the optional `nmea` crate) live in the sibling `rp-pps` crate.

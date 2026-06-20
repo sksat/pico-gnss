@@ -8,7 +8,7 @@
 //! jitter (tens of ms) and destroys the PPS's inherent precision. The PPS-edge↔UTC-second pairing
 //! must happen on an MCU that can timestamp the edge in µs.
 //!
-//! All of this is HAL-agnostic pure logic, so it is host-tested (`cargo test -p gnssdo`).
+//! All of this is HAL-agnostic pure logic, so it is host-tested (`cargo test -p rp-pps`).
 
 /// Days since 1970-01-01 (Howard Hinnant's algorithm, proleptic Gregorian).
 pub const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {

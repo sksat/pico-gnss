@@ -17,8 +17,9 @@ GNSS 受信機の 1Hz PPS 立ち上がりは UTC 秒境界を刻みます。本�
 
 | パス | 内容 |
 |---|---|
-| [`gnssdo/`](gnssdo/) | **コアライブラリ** ([crate `gnssdo`](gnssdo/README.md))。`no_std`・HAL 非依存・整数演算のみ・依存ゼロ。周波数 (ppb) 推定、holdover、PPS 追跡、NMEA/PPS 時刻同期。host テスト可能。 |
-| [`pico-gnss/`](pico-gnss/) | RP2040 firmware (embassy-rp)。PIO ハード PPS 捕捉、クロック規律、規律 PPS 出力。embedded 専用で `gnssdo` を使用。 |
+| [`gnssdo/`](gnssdo/) | **規律コア** ([crate `gnssdo`](gnssdo/README.md))。`no_std`・HAL 非依存・整数演算のみ・**依存ゼロ**。周波数 (ppb) 推定、holdover、PPS エッジ追跡、出力位相ロック servo (PLL)。timestamp と UTC epoch を消費。host テスト可能。 |
+| [`rp-pps/`](rp-pps/) | **RP2040/RP2350 PIO + 受信機 I/O** (crate `rp-pps`)。PPS エッジのハード捕捉・操舵可能な 1PPS 出力、NMEA フレーミング/パース、PPS↔UTC 秒の対応付け — `gnssdo` が消費する timestamp と epoch を生産。HAL 非依存コア (host テスト可) + embassy-rp / rp2040-hal backend。 |
+| [`pico-gnss/`](pico-gnss/) | RP2040 firmware (embassy-rp)。PIO ハード PPS 捕捉、クロック規律、規律 PPS 出力。embedded 専用で `gnssdo` + `rp-pps` を配線。 |
 | [`webapp/`](webapp/) | リアルタイムダッシュボード (React 19 + Vite + TypeScript)。firmware の defmt/RTT 出力を依存ゼロの Node ブリッジ経由で表示。 |
 | [`report/`](report/) | 実機評価のログと図。 |
 | [`NOTES.md`](NOTES.md) | 設計判断とハマった罠の記録。 |

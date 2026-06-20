@@ -18,15 +18,15 @@ path = "src/bin/bench_nmea_parse.rs"
 required-features = ["bench"]
 
 [features]
-# Parse RMC via the nmea crate (delegates to gnssdo's external-nmea; see the gnssdo crate).
-external-nmea = ["gnssdo/external-nmea"]
+# Parse RMC via the nmea crate (delegates to rp-pps's external-nmea; see the rp-pps crate).
+external-nmea = ["rp-pps/external-nmea"]
 bench = ["dep:nmea"]
 
 [dependencies]
 gnssdo = { path = "../gnssdo" }
 rp-pps = { path = "../rp-pps", features = ["embassy-rp"] }
 heapless = "0.9.3"
-# The bench bin calls the nmea crate directly; the firmware itself uses gnssdo's built-in parser.
+# The bench bin calls the nmea crate directly; the firmware itself uses rp-pps's built-in parser.
 nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }
 cortex-m = "0.7.7"
 cortex-m-rt = "0.7.3"
