@@ -43,6 +43,10 @@ body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; fo
 .conn .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--red); box-shadow: 0 0 8px var(--red); }
 .conn.up .dot { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
 .conn .src { font-family: var(--mono); }
+.demo-toggle { font: inherit; font-size: 11px; cursor: pointer; padding: 4px 10px; border-radius: 6px;
+  background: var(--panel); color: var(--muted); border: 1px solid var(--border); white-space: nowrap; }
+.demo-toggle:hover { color: var(--text); border-color: #2c3a48; }
+.demo-toggle.on { background: #103024; color: var(--accent); border-color: #1c5640; }
 
 /* ---- layout ---- */
 main { display: flex; flex-direction: column; gap: 12px; padding: 12px; }

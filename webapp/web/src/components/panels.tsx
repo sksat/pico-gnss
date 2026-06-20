@@ -5,6 +5,7 @@ import { snrColor, sysColor, SYS_INFO } from "../nmea";
 import { assessReception } from "../stats";
 import type { Accuracy, Timing } from "../stats";
 import type { GnssState } from "../types";
+import { MASK, redactNmea } from "../privacy";
 
 const QUALITY = ["No fix", "GPS", "DGPS", "PPS", "RTK", "Float RTK", "Estimated", "Manual", "Sim"];
 const p2 = (n: number) => String(n).padStart(2, "0");
@@ -43,7 +44,7 @@ function Clock({ epochMs, wall }: { epochMs: number | null; wall: number }) {
   return <div className="clock-time">{txt}</div>;
 }
 
-export function Header({ s, acc, timing }: { s: GnssState; acc: Accuracy; timing: Timing }) {
+export function Header({ s, acc, timing, demo, onToggleDemo }: { s: GnssState; acc: Accuracy; timing: Timing; demo: boolean; onToggleDemo: () => void }) {
   return (
     <header className="topbar">
       <div className="brand">
@@ -78,6 +79,13 @@ export function Header({ s, acc, timing }: { s: GnssState; acc: Accuracy; timing
         <span>{s.conn.text}</span>
         <span className="src">{s.conn.src}</span>
       </div>
+      <button
+        className={"demo-toggle" + (demo ? " on" : "")}
+        onClick={onToggleDemo}
+        title="位置情報 (緯度経度・地図・NMEA 座標) をマスク — 公開スクショ用"
+      >
+        {demo ? "🔒 privacy on" : "privacy"}
+      </button>
     </header>
   );
 }
@@ -98,7 +106,7 @@ export function ReceptionPanel({ s, timing }: { s: GnssState; timing: Timing }) 
   );
 }
 
-export function FixPanel({ s }: { s: GnssState }) {
+export function FixPanel({ s, demo }: { s: GnssState; demo: boolean }) {
   const f = s.fix;
   const cls = f.quality > 0 ? (f.quality >= 2 ? "dgps" : "ok") : "";
   return (
@@ -106,8 +114,8 @@ export function FixPanel({ s }: { s: GnssState }) {
       <h2>Fix</h2>
       <div className={"fix-status " + cls}>{f.quality > 0 ? (QUALITY[f.quality] ?? "FIX").toUpperCase() : "NO FIX"}</div>
       <dl className="kv">
-        <Row k="Lat" v={f.lat != null ? `${f.lat.toFixed(6)}  ${dms(f.lat, true)}` : "—"} />
-        <Row k="Lon" v={f.lon != null ? `${f.lon.toFixed(6)}  ${dms(f.lon, false)}` : "—"} />
+        <Row k="Lat" v={demo ? MASK : f.lat != null ? `${f.lat.toFixed(6)}  ${dms(f.lat, true)}` : "—"} />
+        <Row k="Lon" v={demo ? MASK : f.lon != null ? `${f.lon.toFixed(6)}  ${dms(f.lon, false)}` : "—"} />
         <Row k="Alt" v={f.alt != null ? `${f.alt.toFixed(1)} m` : "—"} />
         <Row k="Mode" v={f.mode === 3 ? "3D fix" : f.mode === 2 ? "2D fix" : "—"} />
         <Row k="Sats used" v={f.satsUsed ?? "—"} />
@@ -190,7 +198,7 @@ export function SatTable({ s }: { s: GnssState }) {
   );
 }
 
-export function ConsolePanel({ s }: { s: GnssState }) {
+export function ConsolePanel({ s, demo }: { s: GnssState; demo: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
   useEffect(() => {
@@ -211,7 +219,7 @@ export function ConsolePanel({ s }: { s: GnssState }) {
         {s.raw.map((l, i) => (
           <div className="ln" key={i}>
             <span className="ts">{l.ts}</span>
-            <span className={"t-" + l.kind}>{l.sentence}</span>
+            <span className={"t-" + l.kind}>{demo ? redactNmea(l.sentence) : l.sentence}</span>
           </div>
         ))}
       </div>
