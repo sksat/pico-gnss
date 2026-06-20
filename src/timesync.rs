@@ -55,6 +55,45 @@ pub fn parse_ddmmyy(field: &str) -> Option<(u8, u8, u16)> {
     Some((d, mo, 2000 + yy))
 }
 
+/// RMC センテンス文字列から `((時, 分, 秒), (日, 月, 西暦年))` を取り出す。RMC 以外・解析失敗は `None`。
+///
+/// 入力は assembler でフレーム済みの NMEA 1 文 (`$` + 2 文字 talker、例 `$GPRMC,...` `$GNRMC,...`) を想定。
+///
+/// default は自前パーサ。feature `nmea` を有効にすると [`nmea`](https://docs.rs/nmea) crate に委譲する。
+/// バックエンドで挙動が次のように異なる:
+/// - **checksum**: 自前=**非検証** / nmea=**検証** (不一致は `None`)。
+/// - **年**: 自前=**20xx 固定** (`2000+yy`) / nmea=**世紀ピボット** (`yy=94`→1994)。
+/// - **閏秒 `ss=60`**: 自前=**受理** (civil_to_unix が次分へ繰り上げ) / nmea=**拒否** (`None`)。
+/// - **速度/サイズ**: nmea は実機 RP2040 で約 **17x 遅く・firmware `.text` 約 +52KB** (1Hz では無視可)。
+#[cfg(not(feature = "nmea"))]
+pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16))> {
+    if sentence.get(3..6) != Some("RMC") {
+        return None;
+    }
+    let time = sentence.split(',').nth(1).and_then(parse_hhmmss)?;
+    let date = sentence.split(',').nth(9).and_then(parse_ddmmyy)?;
+    Some((time, date))
+}
+
+/// RMC から `((時,分,秒),(日,月,年))` を取り出す (nmea crate 版)。詳細は default 版の doc 参照。
+/// `nmea::parse_str` は **checksum を検証**してから RMC を取り出す (不一致は `None`)。
+#[cfg(feature = "nmea")]
+pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16))> {
+    use chrono::{Datelike, Timelike};
+    use nmea::ParseResult;
+    // parse_str は checksum 検証込みで sentence を解析し、RMC を ParseResult::RMC で返す。
+    let rmc = match nmea::parse_str(sentence).ok()? {
+        ParseResult::RMC(rmc) => rmc,
+        _ => return None,
+    };
+    let t = rmc.fix_time?;
+    let d = rmc.fix_date?;
+    Some((
+        (t.hour() as u8, t.minute() as u8, t.second() as u8),
+        (d.day() as u8, d.month() as u8, d.year() as u16),
+    ))
+}
+
 /// 確立した同期点: PPS エッジの local 時刻 ↔ その UTC 秒。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncPoint {
@@ -203,6 +242,35 @@ mod tests {
         assert_eq!(parse_hhmmss("12345"), None); // 短すぎ
         assert_eq!(parse_hhmmss("99xxss"), None);
         assert_eq!(parse_hhmmss("250000"), None); // 時 > 23
+    }
+
+    #[test]
+    fn parse_rmc_time_date_extracts_time() {
+        let s = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
+        let r = parse_rmc_time_date(s).unwrap();
+        assert_eq!(r.0, (12, 35, 19)); // 時刻は両バックエンドで一致
+        // 年解釈は異なる: 自前=20xx 固定 (2094)、nmea=世紀ピボット (1994)。
+        #[cfg(not(feature = "nmea"))]
+        assert_eq!(r.1, (23, 3, 2094));
+        #[cfg(feature = "nmea")]
+        assert_eq!(r.1, (23, 3, 1994));
+    }
+
+    #[test]
+    fn parse_rmc_time_date_rejects_non_rmc() {
+        let s = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47";
+        assert_eq!(parse_rmc_time_date(s), None);
+    }
+
+    #[test]
+    fn parse_rmc_time_date_checksum_behavior() {
+        // checksum を改ざんした RMC (正は *6A、誤の *00)。
+        let bad = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*00";
+        // 自前は checksum 非検証なので通る。nmea は parse_str が検証して弾く。
+        #[cfg(not(feature = "nmea"))]
+        assert!(parse_rmc_time_date(bad).is_some());
+        #[cfg(feature = "nmea")]
+        assert!(parse_rmc_time_date(bad).is_none());
     }
 
     #[test]

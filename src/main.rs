@@ -51,8 +51,8 @@ use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
 use pico_gnss::{
-    civil_to_unix, parse_ddmmyy, parse_hhmmss, snap_to_second_ns, DisciplinedClock,
-    FreqUpdate, NmeaLineAssembler, PpsEvent, PpsTracker,
+    civil_to_unix, parse_rmc_time_date, snap_to_second_ns, DisciplinedClock, FreqUpdate,
+    NmeaLineAssembler, PpsEvent, PpsTracker,
 };
 
 /// `FreqUpdate` を defmt ログ用の短い文字列に。
@@ -565,14 +565,10 @@ async fn main(spawner: Spawner) {
             }
 
             // RMC (日付+時刻) と直近 PPS エッジを対応付けて UTC エポックを固定する。
-            if s.get(3..6) == Some("RMC") {
-                let time = s.split(',').nth(1).and_then(parse_hhmmss);
-                let date = s.split(',').nth(9).and_then(parse_ddmmyy);
+            if let Some(((h, mi, se), (d, mo, y))) = parse_rmc_time_date(s) {
                 // 新鮮な (未消費の) PPS エッジがある時だけペアする。PPS 欠落中は stale エッジを
                 // 同じ秒に何度もペアして err が ±整数秒の偽値になるため、fresh==true を条件にする。
-                if let (Some((h, mi, se)), Some((d, mo, y)), Some((pio_ns, inst_ns)), true) =
-                    (time, date, pending, pending_fresh)
-                {
+                if let (Some((pio_ns, inst_ns)), true) = (pending, pending_fresh) {
                     pending_fresh = false; // このエッジは消費した
                     let unix_s = civil_to_unix(y as i64, mo as i64, d as i64, h as i64, mi as i64, se as i64);
                     let target = unix_s * 1_000_000_000;

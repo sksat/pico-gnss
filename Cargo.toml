@@ -12,9 +12,32 @@ name = "pico_gnss"
 name = "pico-gnss"
 path = "src/main.rs"
 
+# on-target ベンチ (src/bin/bench_nmea_parse.rs)。通常の build/test では作られない。
+# 実機で: cargo run --release --features bench --bin bench_nmea_parse
+[[bin]]
+name = "bench_nmea_parse"
+path = "src/bin/bench_nmea_parse.rs"
+required-features = ["bench"]
+
+[features]
+# NMEA の時刻/日付抽出を nmea crate に切り替える (default は自前パーサ)。
+# 性能/サイズ (実機 RP2040 Cortex-M0+ @125MHz 実測, src/bin/bench_nmea_parse.rs):
+#   自前  ≈ 37 µs/RMC・パース実体 ≈ 0.8KB・依存 0
+#   nmea  ≈ 619 µs/RMC (≈ 17x 遅い)・firmware .text +約 52KB・nom/chrono 等 6 crate
+# 1Hz 用途では速度差は無視できる (≈0.06% CPU)。
+# 挙動差: nmea は checksum 検証あり・年は世紀ピボット (yy=94→1994)、自前は未検証・20xx 固定。
+nmea = ["dep:nmea", "dep:chrono"]
+
+# on-target ベンチ用 (bench_nmea_parse バイナリを有効化、nmea も引く)。dev 計測専用。
+bench = ["nmea"]
+
 # lib が使う HAL 非依存の依存だけをここに。host (`cargo test-host`) でも build される。
 [dependencies]
 heapless = "0.9.3"
+# NMEA パースを nmea crate に切り替える feature 用 (任意・no_std)。
+nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }
+# nmea feature 時に RMC の時刻/日付 (chrono 型) からフィールドを取り出すため。
+chrono = { version = "0.4", default-features = false, optional = true }
 
 # firmware (組込ターゲット) 専用の依存。host ビルドには含まれないので、
 # `cargo test-host` (--target x86_64) では embassy / defmt を一切引かない。
