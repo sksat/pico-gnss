@@ -1,7 +1,8 @@
 [package]
 name = "pico-gnss"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
 publish = false
 
 # firmware 本体 (embassy-rp, no_std/no_main)。embedded 専用クレート。

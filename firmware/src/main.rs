@@ -178,7 +178,8 @@ static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
 
 #[interrupt]
 unsafe fn SWI_IRQ_0() {
-    EXECUTOR_HIGH.on_interrupt()
+    // edition 2024: unsafe fn の本体でも unsafe op は明示ブロックが要る。
+    unsafe { EXECUTOR_HIGH.on_interrupt() }
 }
 
 /// Instant を ns に (µs 分解能)。
@@ -325,9 +326,9 @@ async fn gen_capture_task(
         let x = sm.rx().wait_pull().await; // x = 出力エッジの生カウンタ (C2_out)
         // GPS PPS の世代。前回の出力エッジから進んでいなければ GPS 欠落 → C0_GPS が古い → 補正に使わない
         // (弱信号で PPS が時々落ちると、古い基準で巨大補正が走り出力が ~100ms 飛ぶのを防ぐ。断中はホールド)。
-        let gen = C0_GEN.load(Ordering::Relaxed);
-        let fresh = gen != last_gen;
-        last_gen = gen;
+        let cur_gen = C0_GEN.load(Ordering::Relaxed);
+        let fresh = cur_gen != last_gen;
+        last_gen = cur_gen;
         // 出力周期。PIO ~68s 周回グリッチの偽エッジは間隔が異常 → 位相補正に使わない。
         let interval_ns = last_x.map(|lx| lx.wrapping_sub(x) as i64 * ns_per_tick);
         let sane = interval_ns.is_some_and(|iv| (iv - 1_000_000_000).abs() < 300_000_000);

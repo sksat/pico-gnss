@@ -1,12 +1,13 @@
 [package]
 name = "gnssdo"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 description = "no_std, HAL-agnostic GNSS PPS disciplined clock & holdover core (GPSDO): crystal frequency (ppb) estimation, PPS edge tracking, and NMEA/PPS time synchronization. Integer-only, zero-dependency core."
 keywords = ["gnssdo", "gpsdo", "gnss", "pps", "no_std"]
 categories = ["embedded", "no-std", "science"]
-license = "MIT"
-repository = "https://github.com/sksat/pico-gnss-rs"
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
 
 [lib]
 name = "gnssdo"
