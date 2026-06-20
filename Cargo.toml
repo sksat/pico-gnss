@@ -11,3 +11,10 @@ edition = "2024"
 rust-version = "1.87"
 license = "MIT"
 repository = "https://github.com/sksat/pico-gnss-rs"
+
+# rp-pps depends on `gnssdo` by version (a normal crates.io dep in its published manifest); for
+# local development this redirects that dep to the in-tree copy, so workspace changes to gnssdo are
+# picked up without publishing. `cargo publish` ignores `[patch]`, so publish order is still
+# gnssdo -> rp-pps. (pico-gnss is publish=false and depends on gnssdo by path directly.)
+[patch.crates-io]
+gnssdo = { path = "gnssdo" }

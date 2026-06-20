@@ -51,9 +51,10 @@ rp2040-hal = { version = "0.12", optional = true, default-features = false }
 nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }
 # Used by `external-nmea` to read fields from the nmea crate's chrono date/time types.
 chrono = { version = "0.4", default-features = false, optional = true }
-# The discipline core, bundled by the `gnssdo` feature into `PpsGpsdo`. `version` is required for
-# publishing (rp-pps resolves it from crates.io; publish gnssdo first).
-gnssdo = { path = "../gnssdo", version = "0.1.0", optional = true }
+# The discipline core, bundled by the `gnssdo` feature into `PpsGpsdo`. A plain crates.io version
+# dep; the workspace root's `[patch.crates-io]` redirects it to the in-tree copy for local dev.
+# Publish gnssdo before rp-pps so this version resolves on crates.io.
+gnssdo = { version = "0.1.0", optional = true }
 # Used by the embassy-rp runner tasks (run_capture / run_nmea): the shared-state mutex and the
 # UART read trait. Versions pinned to embassy-rp 0.10's (so the firmware's types unify).
 embassy-sync = { version = "0.7.2", optional = true }
