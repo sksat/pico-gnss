@@ -9,8 +9,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  gnssdo:
-    name: gnssdo core (host)
+  cores:
+    name: cores (host) — gnssdo + rp-pps
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.0
@@ -19,12 +19,16 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - run: cargo fmt -p gnssdo --check
+      - run: cargo fmt -p rp-pps --check
       - run: cargo clippy -p gnssdo --all-features -- -D warnings
+      # rp-pps core only on the host; its HAL backends need a target + the downstream chip feature.
+      - run: cargo clippy -p rp-pps -- -D warnings
       - run: cargo test -p gnssdo
       - run: cargo test -p gnssdo --all-features
+      - run: cargo test -p rp-pps
 
-  pico-gnss:
-    name: pico-gnss (thumbv6m-none-eabi)
+  embedded:
+    name: embedded (thumbv6m-none-eabi)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.0
@@ -32,14 +36,19 @@ jobs:
         with:
           toolchain: stable
           target: thumbv6m-none-eabi
-      # `check` (not build) so CI needs neither flip-link nor a probe.
+          components: clippy
+      # Firmware `check` (not build): needs neither flip-link nor a probe. This also compiles
+      # rp-pps's embassy-rp backend, which can't be checked standalone (it needs the chip feature
+      # the firmware selects).
       - run: cargo check
         working-directory: pico-gnss
       - run: cargo check --all-features
         working-directory: pico-gnss
+      # rp-pps's rp2040-hal backend (RP2040-specific, no chip feature → checkable standalone).
+      - run: cargo clippy -p rp-pps --features rp2040-hal --target thumbv6m-none-eabi -- -D warnings
 
   msrv:
-    name: MSRV (gnssdo)
+    name: MSRV (cores)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.0
@@ -51,3 +60,4 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - run: cargo test -p gnssdo --all-features
+      - run: cargo test -p rp-pps
