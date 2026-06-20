@@ -5,32 +5,30 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# firmware 本体 (embassy-rp, no_std/no_main)。embedded 専用クレート。
 [[bin]]
 name = "pico-gnss"
 path = "src/main.rs"
 
-# on-target ベンチ (src/bin/bench_nmea_parse.rs)。通常 build では作られない (bench feature 必須)。
-# 実機で: cd firmware && cargo run --release --features bench --bin bench_nmea_parse
+# On-target benchmark; not built by a normal build (requires the `bench` feature).
+# On hardware: cd firmware && cargo run --release --features bench --bin bench_nmea_parse
 [[bin]]
 name = "bench_nmea_parse"
 path = "src/bin/bench_nmea_parse.rs"
 required-features = ["bench"]
 
 [features]
-# firmware の NMEA 抽出を nmea crate 版に切り替える (gnssdo の external-nmea feature を有効化)。
+# Parse RMC via the nmea crate (delegates to gnssdo's external-nmea; see the gnssdo crate).
 external-nmea = ["gnssdo/external-nmea"]
-# on-target ベンチを有効化。bench bin は nmea crate を直接呼ぶため dep:nmea を引く。
 bench = ["dep:nmea"]
 
 [dependencies]
 gnssdo = { path = "../gnssdo" }
 heapless = "0.9.3"
-# bench bin が nmea crate を直接呼ぶため (firmware 本体は default で gnssdo の自前パーサ)。
+# The bench bin calls the nmea crate directly; the firmware itself uses gnssdo's built-in parser.
 nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }
 cortex-m = "0.7.7"
 cortex-m-rt = "0.7.3"
-# embassy-rp 0.10 は defmt 1.x を要求する。logger も同世代の defmt-rtt 1.x を使う。
+# embassy-rp 0.10 requires defmt 1.x; keep defmt-rtt on the same 1.x generation.
 defmt = "1.0"
 defmt-rtt = "1.0"
 embassy-executor = { version = "0.10.0", features = [

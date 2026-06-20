@@ -1,11 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["gnssdo", "firmware"]
-# bare `cargo build`/`cargo test` は host 安全な gnssdo だけを対象にする。
-# firmware は embedded 専用なので明示的に (cd firmware / -p pico-gnss --target ...) ビルドする。
+# A bare `cargo build`/`cargo test` only targets the host-safe gnssdo.
+# Build the embedded-only firmware explicitly: cd firmware (or -p pico-gnss --target ...).
 default-members = ["gnssdo"]
 
-# メンバ共通のメタデータ (各クレートで `*.workspace = true` で継承)。
 [workspace.package]
 edition = "2024"
 license = "MIT"
