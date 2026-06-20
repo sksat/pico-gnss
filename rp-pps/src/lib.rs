@@ -27,6 +27,10 @@
 
 use pio::Program;
 
+/// `rp2040-hal` (blocking) backend — [`rp2040::PpsCapture`] / [`rp2040::PpsOutput`].
+#[cfg(feature = "rp2040-hal")]
+pub mod rp2040;
+
 /// One capture tick = 2 PIO clock cycles: [`pps_capture_program`] advances its free-running
 /// counter once per 2 cycles (`jmp x--` in a 2-cycle loop), so at 125 MHz one tick is 16 ns.
 /// This is a property of the program; the tests assert the program shape that guarantees it.
