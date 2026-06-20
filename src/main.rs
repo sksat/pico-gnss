@@ -285,7 +285,7 @@ async fn time_task() {
         let (now, ppb, holdover, locked) = CLOCK.lock(|c| {
             let c = c.borrow();
             // 連続クエリは Instant 系 (サブ秒は µs 精度)。エポックの絶対対応は Instant アンカー。
-            (c.now_from_instant_ns(local), c.freq_ppb(), c.holdover_ns(local), c.is_locked())
+            (c.now_from_query_ns(local), c.freq_ppb(), c.holdover_ns(local), c.is_locked())
         });
         if let Some(now) = now {
             info!(
@@ -339,7 +339,7 @@ async fn gen_capture_task(
         // 旧手法 (比較用 emit のみ): 出力エッジの UTC 時刻 (Instant 経由) → 秒境界からのズレ。
         let (ppb, phase) = CLOCK.lock(|c| {
             let c = c.borrow();
-            (c.freq_ppb(), c.now_from_instant_ns(now_local_ns()).map(snap_to_second_ns))
+            (c.freq_ppb(), c.now_from_query_ns(now_local_ns()).map(snap_to_second_ns))
         });
         // 制御に使う位相: PIO ハード(stage②)。PHASE_USE_HW=false で旧 Instant 測定に切替 (比較計測用)。
         let ctrl = if PHASE_USE_HW { hwphase_ns } else { phase.unwrap_or(0) };
@@ -577,11 +577,11 @@ async fn main(spawner: Spawner) {
                         // 補正後の時刻精度: このエッジの UTC を「更新前のクロック (前回エポック+周波数)」で
                         // 予測し、実際の UTC 秒との差を取る = holdover 後の残差。PIO 時刻 (ns 精度) で計算。
                         // PPS が複数秒途切れて復帰すると整数秒ズレるので最寄り秒へ snap し、真の sub 秒残差を出す。
-                        let err = c.now_ns(pio_ns).map(|pred| snap_to_second_ns(pred - target)).unwrap_or(0);
+                        let err = c.now_from_capture_ns(pio_ns).map(|pred| snap_to_second_ns(pred - target)).unwrap_or(0);
                         // fire_at_utc の検証: この UTC 秒が来る PIO tick を更新前クロックで逆予測し、実エッジ tick と比較。
                         // = 「fire_at_utc(この秒) が実際の秒境界からどれだけズレてピンを駆動するか」を既存 GPS PPS で実測。
                         let fire = c
-                            .local_pio_for_unix_ns(target)
+                            .capture_ns_for_unix_ns(target)
                             .map(|tick| snap_to_second_ns(tick - pio_ns as i64))
                             .unwrap_or(0);
                         // この sync が前回 sync から何 ms 経っているか (= この err が何秒 holdover の誤差か)。

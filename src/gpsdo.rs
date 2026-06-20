@@ -86,16 +86,23 @@ pub enum FreqUpdate {
 }
 
 /// PPS で規律されるクロックモデル。
+///
+/// 2 つの timebase を扱う (どちらも device の同じ発振器由来・整数 ns で渡す。HAL 非依存):
+/// - **capture timebase**: PPS エッジを高分解能で捕捉する系。err 計測や `fire_at_utc` の ns 精度に使う。
+///   RP2040 では PIO ハードキャプチャ (他チップではタイマ入力キャプチャ等)。
+/// - **query timebase**: 連続して読める系。ticker/holdover に使う。RP2040 では embassy `Instant`。
+///
+/// 両系のエポックは [`update_epoch`](Self::update_epoch) で同時に与える。
 #[derive(Debug, Default)]
 pub struct DisciplinedClock {
     config: DisciplinedClockConfig,
     freq_mppb: i64, // 周波数オフセット EMA (milli-ppb = ppb*1000, 高分解能保持用)
     samples: u32,
     quarantine: u32, // >0 の間は復帰検疫中 (周波数 EMA 更新を保留)
-    epoch_pio_ns: Option<u64>,     // PIO timebase のエポック (ns 精度, err/now_ns 用)
-    epoch_instant_ns: Option<u64>, // Instant timebase のエポック (連続クエリ/holdover 用)
+    epoch_capture_ns: Option<u64>,     // capture timebase のエポック (ns 精度, err/now_from_capture_ns 用)
+    epoch_query_ns: Option<u64>, // query timebase のエポック (連続クエリ/holdover 用)
     epoch_unix_ns: Option<i64>,
-    last_instant_ns: Option<u64>, // 最後に規律した Instant 時刻 (holdover 計測)
+    last_query_ns: Option<u64>, // 最後に規律した Instant 時刻 (holdover 計測)
 }
 
 /// 整数秒のズレを除いて sub 秒の残差だけ残す。
@@ -120,10 +127,10 @@ impl DisciplinedClock {
             freq_mppb: 0,
             samples: 0,
             quarantine: 0,
-            epoch_pio_ns: None,
-            epoch_instant_ns: None,
+            epoch_capture_ns: None,
+            epoch_query_ns: None,
             epoch_unix_ns: None,
-            last_instant_ns: None,
+            last_query_ns: None,
         }
     }
 
@@ -201,13 +208,13 @@ impl DisciplinedClock {
     }
 
     /// PPS エッジを UTC に対応付けてエポックを更新する。
-    /// `pio_ns` = PIO の ns 精度時刻 (err/now_ns 用)、`instant_ns` = 連続して読める Instant 時刻
+    /// `capture_ns` = PIO の ns 精度時刻 (err/now_from_capture_ns 用)、`query_ns` = 連続して読める Instant 時刻
     /// (ticker/holdover 用)。両者は同じ XOSC 由来で同じ周波数オフセットを持つ。
-    pub fn update_epoch(&mut self, pio_ns: u64, instant_ns: u64, unix_ns: i64) {
-        self.epoch_pio_ns = Some(pio_ns);
-        self.epoch_instant_ns = Some(instant_ns);
+    pub fn update_epoch(&mut self, capture_ns: u64, query_ns: u64, unix_ns: i64) {
+        self.epoch_capture_ns = Some(capture_ns);
+        self.epoch_query_ns = Some(query_ns);
         self.epoch_unix_ns = Some(unix_ns);
-        self.last_instant_ns = Some(instant_ns);
+        self.last_query_ns = Some(query_ns);
     }
 
     /// local 経過 d (ns) を周波数補正: 真の経過 = d - d*ppb/1e9 = d - d*mppb/1e12。
@@ -231,24 +238,24 @@ impl DisciplinedClock {
         self.samples >= self.config.lock_samples.get()
     }
 
-    /// **PIO timebase** の local 時刻 → 規律 UTC (Unix ns)。ns 精度。PPS エッジでの err 計測用。
-    pub fn now_ns(&self, pio_ns: u64) -> Option<i64> {
-        let ep = self.epoch_pio_ns?;
+    /// **capture timebase** の local 時刻 → 規律 UTC (Unix ns)。ns 精度。PPS エッジでの err 計測用。
+    pub fn now_from_capture_ns(&self, capture_ns: u64) -> Option<i64> {
+        let ep = self.epoch_capture_ns?;
         let eu = self.epoch_unix_ns?;
-        Some(eu + self.corrected(pio_ns as i64 - ep as i64))
+        Some(eu + self.corrected(capture_ns as i64 - ep as i64))
     }
 
-    /// **Instant timebase** の local 時刻 → 規律 UTC。連続クエリ (ticker) 用。サブ秒は Instant の µs 精度。
-    pub fn now_from_instant_ns(&self, instant_ns: u64) -> Option<i64> {
-        let ei = self.epoch_instant_ns?;
+    /// **query timebase** の local 時刻 → 規律 UTC。連続クエリ (ticker) 用。サブ秒は Instant の µs 精度。
+    pub fn now_from_query_ns(&self, query_ns: u64) -> Option<i64> {
+        let ei = self.epoch_query_ns?;
         let eu = self.epoch_unix_ns?;
-        Some(eu + self.corrected(instant_ns as i64 - ei as i64))
+        Some(eu + self.corrected(query_ns as i64 - ei as i64))
     }
 
-    /// 逆変換: 指定した UTC が来る **Instant timebase** の local 時刻 (ns)。周波数補正込み。
+    /// 逆変換: 指定した UTC が来る **query timebase** の local 時刻 (ns)。周波数補正込み。
     /// 「正確な UTC 時刻 T に何かを実行する」スケジューリングや、補正済みの待ち時間に使う。
-    pub fn local_instant_for_unix_ns(&self, unix_ns: i64) -> Option<i64> {
-        let ei = self.epoch_instant_ns? as i64;
+    pub fn query_ns_for_unix_ns(&self, unix_ns: i64) -> Option<i64> {
+        let ei = self.epoch_query_ns? as i64;
         let eu = self.epoch_unix_ns?;
         let dt = unix_ns - eu; // 真の経過 (ns)
         // local 経過 = 真 / (1 - ppb/1e9) ≈ 真 + 真*ppb/1e9。mppb は ppb*1000。
@@ -256,11 +263,11 @@ impl DisciplinedClock {
         Some(ei + d)
     }
 
-    /// 逆変換: 指定した UTC が来る **PIO timebase** の local 時刻 (ns)。`now_ns` の逆。
+    /// 逆変換: 指定した UTC が来る **capture timebase** の local 時刻 (ns)。`now_from_capture_ns` の逆。
     /// `fire_at_utc(T)` の核 — この値を PIO の生成/比較 SM に目標 tick として渡せば、UTC ちょうど T に
-    /// ピンを駆動できる。捕捉と同じ PIO timebase なので ns 精度。
-    pub fn local_pio_for_unix_ns(&self, unix_ns: i64) -> Option<i64> {
-        let ep = self.epoch_pio_ns? as i64;
+    /// ピンを駆動できる。捕捉と同じ capture timebase なので ns 精度。
+    pub fn capture_ns_for_unix_ns(&self, unix_ns: i64) -> Option<i64> {
+        let ep = self.epoch_capture_ns? as i64;
         let eu = self.epoch_unix_ns?;
         let dt = unix_ns - eu; // 真の経過 (ns)
         let d = dt + (dt as i128 * self.freq_mppb as i128 / 1_000_000_000_000i128) as i64;
@@ -274,10 +281,10 @@ impl DisciplinedClock {
         true_ns + (true_ns as i128 * self.freq_mppb as i128 / 1_000_000_000_000i128) as i64
     }
 
-    /// 最後に PPS で規律してからの経過 (holdover 時間, ns)。Instant timebase で渡す。
-    pub fn holdover_ns(&self, instant_ns: u64) -> u64 {
-        match self.last_instant_ns {
-            Some(t) => instant_ns.saturating_sub(t),
+    /// 最後に PPS で規律してからの経過 (holdover 時間, ns)。query timebase で渡す。
+    pub fn holdover_ns(&self, query_ns: u64) -> u64 {
+        match self.last_query_ns {
+            Some(t) => query_ns.saturating_sub(t),
             None => 0,
         }
     }
@@ -432,7 +439,7 @@ mod tests {
         let mut c = DisciplinedClock::new();
         c.update_epoch(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
         // freq=0 → 補正なし。0.5s 後。
-        assert_eq!(c.now_ns(1_500_000_000), Some(5_000_500_000_000));
+        assert_eq!(c.now_from_capture_ns(1_500_000_000), Some(5_000_500_000_000));
     }
 
     #[test]
@@ -445,7 +452,7 @@ mod tests {
         assert_eq!(c.freq_ppb(), 100_000);
         c.update_epoch(0, 0, 0);
         // local 経過 1e9 ns。真の経過 = 1e9 - 1e9*1e5/1e12 = 1e9 - 1e5。
-        assert_eq!(c.now_ns(1_000_000_000), Some(1_000_000_000 - 100_000));
+        assert_eq!(c.now_from_capture_ns(1_000_000_000), Some(1_000_000_000 - 100_000));
     }
 
     #[test]
@@ -484,7 +491,7 @@ mod tests {
     #[test]
     fn now_is_none_before_epoch() {
         let c = DisciplinedClock::new();
-        assert_eq!(c.now_ns(123), None);
+        assert_eq!(c.now_from_capture_ns(123), None);
     }
 
     #[test]
@@ -497,8 +504,8 @@ mod tests {
         c.update_epoch(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
         // 3 秒後の UTC が来る local 時刻を求め、その local で now すれば元の UTC に戻る (Instant 系)。
         let target = 5_000_000_000_000 + 3_000_000_000;
-        let local = c.local_instant_for_unix_ns(target).unwrap();
-        let back = c.now_from_instant_ns(local as u64).unwrap();
+        let local = c.query_ns_for_unix_ns(target).unwrap();
+        let back = c.now_from_query_ns(local as u64).unwrap();
         assert!((back - target).abs() <= 2, "roundtrip off by {}", back - target);
         // 補正が効いていれば local 経過 > 真の経過 (水晶が速いぶん先に進む): +3ppm×3s ≈ +9µs。
         assert!(local > 1_000_000_000 + 3_000_000_000);
@@ -506,15 +513,15 @@ mod tests {
 
     #[test]
     fn pio_local_for_unix_roundtrips_with_now() {
-        // fire_at_utc の核: UTC → PIO tick の逆変換が now_ns (PIO tick → UTC) と往復一致する。
+        // fire_at_utc の核: UTC → PIO tick の逆変換が now_from_capture_ns (PIO tick → UTC) と往復一致する。
         let mut c = DisciplinedClock::new();
         for _ in 0..40 {
             c.update_freq(1_000_000_000 + 3000); // +3 ppm
         }
         c.update_epoch(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
         let target = 5_000_000_000_000 + 3_000_000_000; // 3 秒後の UTC
-        let tick = c.local_pio_for_unix_ns(target).unwrap(); // この PIO tick でピンを駆動すれば UTC=target
-        let back = c.now_ns(tick as u64).unwrap();
+        let tick = c.capture_ns_for_unix_ns(target).unwrap(); // この PIO tick でピンを駆動すれば UTC=target
+        let back = c.now_from_capture_ns(tick as u64).unwrap();
         assert!((back - target).abs() <= 2, "roundtrip off by {}", back - target);
         // 水晶が +3ppm 速いので、3 秒先の UTC に対し PIO tick は真の経過より先 (+9µs)。
         assert!(tick > 1_000_000_000 + 3_000_000_000);
@@ -523,7 +530,7 @@ mod tests {
     #[test]
     fn pio_local_for_unix_none_before_epoch() {
         let c = DisciplinedClock::new();
-        assert_eq!(c.local_pio_for_unix_ns(5_000_000_000_000), None);
+        assert_eq!(c.capture_ns_for_unix_ns(5_000_000_000_000), None);
     }
 
     #[test]
@@ -532,7 +539,7 @@ mod tests {
         let mut c = DisciplinedClock::new();
         c.update_epoch(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
         assert_eq!(
-            c.local_pio_for_unix_ns(5_000_000_500_000),
+            c.capture_ns_for_unix_ns(5_000_000_500_000),
             Some(1_000_000_000 + 500_000)
         );
     }
