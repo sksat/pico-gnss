@@ -312,6 +312,24 @@ impl DisciplinedClock {
         Some(ep + d)
     }
 
+    /// **Prediction residual** (ns): how far the disciplined clock's predicted UTC for a capture
+    /// edge at `capture_ns` differs from that edge's known true UTC `unix_ns`, snapped to the
+    /// nearest second (so a multi-second PPS gap doesn't read as an integer-second offset). This is
+    /// the GPSDO's "how accurate is my disciplined time" self-check. `None` before the epoch is set.
+    pub fn prediction_residual_ns(&self, capture_ns: u64, unix_ns: i64) -> Option<i64> {
+        self.now_from_capture_ns(capture_ns)
+            .map(|predicted| snap_to_second_ns(predicted - unix_ns))
+    }
+
+    /// **Fire residual** (ns): if [`capture_ns_for_unix_ns`](Self::capture_ns_for_unix_ns) were used
+    /// to schedule an output edge at `unix_ns`, how far (snapped) it would land from the edge
+    /// actually captured at `capture_ns` — i.e. the accuracy of the inverse (fire-at-UTC) path,
+    /// measured against a real reference edge. `None` before the epoch is set.
+    pub fn fire_residual_ns(&self, capture_ns: u64, unix_ns: i64) -> Option<i64> {
+        self.capture_ns_for_unix_ns(unix_ns)
+            .map(|tick| snap_to_second_ns(tick - capture_ns as i64))
+    }
+
     /// The basis of a corrected delay: the local-clock ns needed to "wait `true_ns` of true time".
     /// The local clock is ppb fast/slow, so wait that much more/less. Layered over `Timer::after`
     /// it lets you wait with ±ppb accuracy rather than crystal tolerance
@@ -602,5 +620,34 @@ mod tests {
             c.capture_ns_for_unix_ns(5_000_000_500_000),
             Some(1_000_000_000 + 500_000)
         );
+    }
+
+    #[test]
+    fn residuals_are_zero_when_edge_matches_utc() {
+        let mut c = DisciplinedClock::new();
+        c.update_epoch(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
+        // An edge 1 s after the epoch whose true UTC is exactly 1 s after the epoch UTC (freq 0).
+        let cap = 1_000_000_000 + 1_000_000_000;
+        let utc = 5_000_000_000_000 + 1_000_000_000;
+        assert_eq!(c.prediction_residual_ns(cap, utc), Some(0));
+        assert_eq!(c.fire_residual_ns(cap, utc), Some(0));
+    }
+
+    #[test]
+    fn residuals_reflect_a_late_edge() {
+        let mut c = DisciplinedClock::new();
+        c.update_epoch(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
+        let utc = 5_000_000_000_000 + 1_000_000_000;
+        let cap = 1_000_000_000 + 1_000_000_000 + 500; // edge 500 ns late vs the UTC second
+        // predicted UTC is 500 ns ahead of true UTC; the scheduled tick is 500 ns before the edge.
+        assert_eq!(c.prediction_residual_ns(cap, utc), Some(500));
+        assert_eq!(c.fire_residual_ns(cap, utc), Some(-500));
+    }
+
+    #[test]
+    fn residuals_none_before_epoch() {
+        let c = DisciplinedClock::new();
+        assert_eq!(c.prediction_residual_ns(123, 456), None);
+        assert_eq!(c.fire_residual_ns(123, 456), None);
     }
 }

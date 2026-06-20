@@ -384,16 +384,10 @@ async fn main(spawner: Spawner) {
                     let target = unix_s * 1_000_000_000;
                     let (ppb, err_ns, fire_ns, hold_ms) = CLOCK.lock(|c| {
                         let mut c = c.borrow_mut();
-                        // 補正後の時刻精度: このエッジの UTC を「更新前のクロック (前回エポック+周波数)」で
-                        // 予測し、実際の UTC 秒との差を取る = holdover 後の残差。PIO 時刻 (ns 精度) で計算。
-                        // PPS が複数秒途切れて復帰すると整数秒ズレるので最寄り秒へ snap し、真の sub 秒残差を出す。
-                        let err = c.now_from_capture_ns(pio_ns).map(|pred| snap_to_second_ns(pred - target)).unwrap_or(0);
-                        // fire_at_utc の検証: この UTC 秒が来る PIO tick を更新前クロックで逆予測し、実エッジ tick と比較。
-                        // = 「fire_at_utc(この秒) が実際の秒境界からどれだけズレてピンを駆動するか」を既存 GPS PPS で実測。
-                        let fire = c
-                            .capture_ns_for_unix_ns(target)
-                            .map(|tick| snap_to_second_ns(tick - pio_ns as i64))
-                            .unwrap_or(0);
+                        // 補正後の時刻精度 (予測残差) と fire_at_utc の逆予測残差 = GPSDO 自己診断。
+                        // どちらも更新前クロックで計算し、複数秒 holdover の整数秒ズレは snap で除く (gnssdo)。
+                        let err = c.prediction_residual_ns(pio_ns, target).unwrap_or(0);
+                        let fire = c.fire_residual_ns(pio_ns, target).unwrap_or(0);
                         // この sync が前回 sync から何 ms 経っているか (= この err が何秒 holdover の誤差か)。
                         let hold = (c.holdover_ns(inst_ns) / 1_000_000) as u32;
                         c.update_epoch(pio_ns, inst_ns, target);
