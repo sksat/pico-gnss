@@ -127,6 +127,55 @@ pub fn ns_per_tick(clk_hz: u32) -> u64 {
     CAPTURE_CYCLES_PER_TICK as u64 * 1_000_000_000 / clk_hz as u64
 }
 
+/// One captured edge, timed against the previous one (see [`PpsEdgeTimeline`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimedEdge {
+    /// The raw down-counter value at this edge.
+    pub raw: u32,
+    /// Nanoseconds since the previous edge (0 on the first edge).
+    pub interval_ns: u64,
+    /// Running nanoseconds since the first observed edge (a continuous capture timeline).
+    pub edge_ns: u64,
+}
+
+/// Turns a stream of raw capture-counter values into timed edges: it keeps the previous value,
+/// computes the [`interval_ns`] (wrap-handled), and accumulates a running `edge_ns` timeline. This
+/// is the small bit of capture-side bookkeeping every caller would otherwise hand-roll; it knows
+/// nothing about discipline (feed `edge_ns` / `interval_ns` to `gnssdo` yourself).
+#[derive(Debug)]
+pub struct PpsEdgeTimeline {
+    clk_hz: u32,
+    last: Option<u32>,
+    edge_ns: u64,
+}
+
+impl PpsEdgeTimeline {
+    /// Create for a given system clock.
+    pub const fn new(clk_hz: u32) -> Self {
+        Self {
+            clk_hz,
+            last: None,
+            edge_ns: 0,
+        }
+    }
+
+    /// Record a raw capture-counter value (e.g. from `wait_edge()`); returns the interval since the
+    /// previous edge and the running timeline. The first call returns `interval_ns = edge_ns = 0`.
+    pub fn observe(&mut self, raw: u32) -> TimedEdge {
+        let interval_ns = match self.last {
+            Some(prev) => interval_ns(prev, raw, self.clk_hz),
+            None => 0,
+        };
+        self.last = Some(raw);
+        self.edge_ns += interval_ns;
+        TimedEdge {
+            raw,
+            interval_ns,
+            edge_ns: self.edge_ns,
+        }
+    }
+}
+
 /// Capture ticks in one second at a given system clock (`clk_hz / CAPTURE_CYCLES_PER_TICK`;
 /// 62_500_000 at 125 MHz). A property of [`pps_capture_program`]; used to fold a phase to ±½ s.
 pub fn capture_ticks_per_second(clk_hz: u32) -> u32 {
@@ -389,5 +438,32 @@ mod tests {
         // negative phase_corr lengthens.
         let mut d2 = OutputPeriodDither::new();
         assert_eq!(d2.next_period(125_000_000, 0, -8), 124_999_991);
+    }
+
+    #[test]
+    fn edge_timeline_first_edge_is_zero() {
+        let mut t = PpsEdgeTimeline::new(125_000_000);
+        let e = t.observe(1000);
+        assert_eq!(
+            e,
+            TimedEdge {
+                raw: 1000,
+                interval_ns: 0,
+                edge_ns: 0
+            }
+        );
+    }
+
+    #[test]
+    fn edge_timeline_accumulates_1hz() {
+        let mut t = PpsEdgeTimeline::new(125_000_000);
+        // down-counter: 62.5M ticks/s; first edge then two ~1 s edges (wrap-handled).
+        t.observe(0xFFFF_FFFF);
+        let e1 = t.observe(0xFFFF_FFFF - 62_500_000);
+        assert_eq!(e1.interval_ns, 1_000_000_000);
+        assert_eq!(e1.edge_ns, 1_000_000_000);
+        let e2 = t.observe(0xFFFF_FFFF - 125_000_000);
+        assert_eq!(e2.interval_ns, 1_000_000_000);
+        assert_eq!(e2.edge_ns, 2_000_000_000);
     }
 }

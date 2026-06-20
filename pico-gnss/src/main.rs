@@ -113,10 +113,8 @@ fn now_local_ns() -> u64 {
 /// PIO がラッチした PPS エッジを読み、間隔を ns で求めて出す + 周波数を規律するタスク。
 #[embassy_executor::task]
 async fn pps_task(mut capture: PpsCapture<'static, PIO0, 0>) {
-    let clk = clk_sys_freq();
+    let mut timeline = rp_pps::PpsEdgeTimeline::new(clk_sys_freq());
     let mut tracker = PpsTracker::new();
-    let mut last_x: Option<u32> = None;
-    let mut edge_ns: u64 = 0;
     let mut was_locked = false; // 直前エッジが Locked だったか (復帰検出用)
 
     loop {
@@ -126,21 +124,18 @@ async fn pps_task(mut capture: PpsCapture<'static, PIO0, 0>) {
         // エポックのアンカー用に Instant をエッジ直後に読む (µs ジッタは絶対オフセットのみに効く)。
         let inst_ns = now_local_ns();
 
-        let interval_ns = match last_x {
-            Some(lx) => rp_pps::interval_ns(lx, x, clk), // ダウンカウンタ: prev - curr (wrap 込み)
-            None => 0,
-        };
-        last_x = Some(x);
-        edge_ns += interval_ns;
+        // last_x 管理・interval・累積 edge_ns は rp-pps の timeline に委譲。
+        let edge = timeline.observe(x);
+        let interval_ns = edge.interval_ns;
 
         // PIO の ns 精度時刻 (edge_ns) と Instant を main へ。err/エポックは edge_ns 基準で ns 精度。
-        PPS_TS.signal((edge_ns, inst_ns));
+        PPS_TS.signal((edge.edge_ns, inst_ns));
 
         // 先に PpsTracker で品質を判定する。周波数 EMA は **Locked のエッジでのみ**規律する
         // (Irregular/First の間隔を入れると holdover/PPSGEN の土台が腐る — smart-friend GPT-5.5)。
         let count = tracker.count() + 1;
         let interval_us = interval_ns / 1000;
-        let (state, missed): (&str, u32) = match tracker.record(edge_ns / 1000) {
+        let (state, missed): (&str, u32) = match tracker.record(edge.edge_ns / 1000) {
             PpsEvent::First => ("First", 0),
             PpsEvent::Locked { .. } => ("Locked", 0),
             PpsEvent::Irregular { missed, .. } => ("Irregular", missed),
