@@ -173,12 +173,12 @@ export function AccuracyPanel({ s, acc }: { s: GnssState; acc: Accuracy }) {
   );
 }
 
-// ---------- PPS / time precision ----------
-export function TimingPanel({ s, timing }: { s: GnssState; timing: Timing }) {
+// ---------- PPS precision (interval / jitter / clock err) ----------
+export function PrecisionPanel({ s, timing }: { s: GnssState; timing: Timing }) {
   const dev = s.ppsDev;
   return (
     <section className="panel">
-      <h2>PPS / time precision <span className="hdr-aux">{timing.n} samples · PIO 16ns</span></h2>
+      <h2>PPS precision <span className="hdr-aux">{timing.n} samples · PIO 16ns</span></h2>
       <div className="chart-label">interval deviation (ns) · history</div>
       <Canvas className="canvas-line" draw={(ctx, w, h) => {
         if (dev.length < 2) return;
@@ -218,6 +218,20 @@ export function TimingPanel({ s, timing }: { s: GnssState; timing: Timing }) {
         ctx.fillText(`+${maxAbs.toFixed(0)}ns`, 2, 9); ctx.fillText(`-${maxAbs.toFixed(0)}ns`, 2, h - 3);
         drawLine(ctx, w, h, e.slice(-240), "#34d399", -maxAbs, maxAbs, 3);
       }} />
+      <dl className="kv compact stat3">
+        <Row k="jitter σ" v={timing.n >= 2 ? `${timing.sigma.toFixed(1)} ns` : "—"} />
+        <Row k="peak-peak" v={timing.n >= 2 ? `${timing.pp.toFixed(0)} ns` : "—"} />
+        <Row k="clock err σ" v={s.errHist.length >= 5 ? `${Math.sqrt(s.errHist.reduce((a, x) => a + x * x, 0) / s.errHist.length).toFixed(1)} ns` : "—"} />
+      </dl>
+    </section>
+  );
+}
+
+// ---------- Holdover & generated-PPS output phase ----------
+export function OutputPanel({ s }: { s: GnssState }) {
+  return (
+    <section className="panel">
+      <h2>Holdover &amp; PPS output <span className="hdr-aux">{s.holdoverPts.length} pts</span></h2>
       <div className="chart-label">holdover 経過 (s) → 補正後誤差 (ns) · 途切れが長いほど誤差↑ (黄=PPS断復帰)</div>
       <Canvas className="canvas-line" draw={(ctx, w, h) => {
         const pts = s.holdoverPts;
@@ -261,13 +275,12 @@ export function TimingPanel({ s, timing }: { s: GnssState; timing: Timing }) {
         ctx.stroke();
       }} />
       <dl className="kv compact stat3">
-        <Row k="jitter σ" v={timing.n >= 2 ? `${timing.sigma.toFixed(1)} ns` : "—"} />
-        <Row k="peak-peak" v={timing.n >= 2 ? `${timing.pp.toFixed(0)} ns` : "—"} />
-        <Row k="osc offset" v={timing.n >= 2 ? `${timing.ppm >= 0 ? "+" : ""}${timing.ppm.toFixed(2)} ppm` : "—"} />
-        <Row k="clock err σ" v={s.errHist.length >= 5 ? `${Math.sqrt(s.errHist.reduce((a, x) => a + x * x, 0) / s.errHist.length).toFixed(1)} ns` : "—"} />
         <Row k="max holdover" v={s.holdoverPts.length ? `${Math.max(...s.holdoverPts.map((p) => p.h)).toFixed(0)} s` : "—"} />
-        <Row k="missed" v={s.pps?.missed ?? 0} />
+        <Row k="PPS gen jitter" v={s.ppsGen ? `${s.ppsGen.jitter_ns} ns` : "—"} />
+        <Row k="PPS gen phase" v={s.ppsGen ? (Math.abs(s.ppsGen.phase_ns) < 1000 ? `${s.ppsGen.phase_ns} ns` : `${(s.ppsGen.phase_ns / 1e6).toFixed(2)} ms`) : "—"} />
       </dl>
+      <p className="hint">補正後誤差は holdover (PPS 断) が長いほど増える。下段は生成 PPS 出力 (GP3→GP4 loopback) の
+        UTC 位相がソフト同期で収束する様子。</p>
     </section>
   );
 }
