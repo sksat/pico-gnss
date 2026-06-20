@@ -127,6 +127,75 @@ pub fn ns_per_tick(clk_hz: u32) -> u64 {
     CAPTURE_CYCLES_PER_TICK as u64 * 1_000_000_000 / clk_hz as u64
 }
 
+/// Capture ticks in one second at a given system clock (`clk_hz / CAPTURE_CYCLES_PER_TICK`;
+/// 62_500_000 at 125 MHz). A property of [`pps_capture_program`]; used to fold a phase to ±½ s.
+pub fn capture_ticks_per_second(clk_hz: u32) -> u32 {
+    clk_hz / CAPTURE_CYCLES_PER_TICK
+}
+
+/// Phase, in capture ticks, of an output edge relative to a reference edge — both captured on the
+/// free-running down-counter of [`pps_capture_program`] (on two state machines), given the
+/// calibrated constant offset between those counters ([`calibrate_loopback_offset`]). Folded to
+/// ±½ second.
+///
+/// For a 1PPS loopback the two edges fall within the same second, so `reference − output − offset`
+/// fits a signed 32-bit tick count (< 2³¹ ticks ≈ 34 s at 125 MHz); larger separations aren't
+/// meaningful here.
+pub fn loopback_phase_ticks(
+    reference_capture: u32,
+    output_capture: u32,
+    offset_ticks: u32,
+    ticks_per_second: u32,
+) -> i32 {
+    let elapsed = reference_capture
+        .wrapping_sub(output_capture)
+        .wrapping_sub(offset_ticks) as i32;
+    let m = ticks_per_second as i32;
+    let r = elapsed % m;
+    if r > m / 2 {
+        r - m
+    } else if r < -m / 2 {
+        r + m
+    } else {
+        r
+    }
+}
+
+/// Phase, in nanoseconds, of an output 1PPS edge relative to the reference edge:
+/// [`loopback_phase_ticks`] converted to ns (multiply-before-divide, exact at 125 MHz where one
+/// tick is 16 ns). Feed this to a phase servo (e.g. `gnssdo`'s `PhaseLockLoop`).
+pub fn loopback_phase_ns(
+    reference_capture: u32,
+    output_capture: u32,
+    offset_ticks: u32,
+    clk_hz: u32,
+) -> i64 {
+    let ticks = loopback_phase_ticks(
+        reference_capture,
+        output_capture,
+        offset_ticks,
+        capture_ticks_per_second(clk_hz),
+    ) as i128;
+    (ticks * CAPTURE_CYCLES_PER_TICK as i128 * 1_000_000_000 / clk_hz as i128) as i64
+}
+
+/// Calibrate the constant counter offset between two capture state machines from samples of the
+/// **same** edge captured on both — `(reference_capture, output_capture)` pairs — as the mean of
+/// `reference − output` in ticks. `None` if there are no samples. Run once at start-up with both
+/// SMs pointed at the reference, then pass the result as `offset_ticks` to [`loopback_phase_ns`].
+pub fn calibrate_loopback_offset<I: IntoIterator<Item = (u32, u32)>>(samples: I) -> Option<u32> {
+    let (mut sum, mut n): (i64, i64) = (0, 0);
+    for (reference, output) in samples {
+        sum += reference.wrapping_sub(output) as i32 as i64;
+        n += 1;
+    }
+    if n == 0 {
+        None
+    } else {
+        Some((sum / n) as i32 as u32)
+    }
+}
+
 /// Nominal output period word for exactly 1 Hz at a given system clock (no frequency correction).
 pub fn output_period_cycles(clk_hz: u32) -> u32 {
     clk_hz - OUTPUT_OVERHEAD_CYCLES
@@ -262,6 +331,54 @@ mod tests {
         assert_eq!(p0, 124_999_990);
         assert_eq!(p1, 124_999_991);
         // average = 124_999_990.5 = nominal + 0.5 cycle (sub-cycle resolution)
+    }
+
+    #[test]
+    fn ticks_per_second_at_125mhz() {
+        assert_eq!(capture_ticks_per_second(125_000_000), 62_500_000);
+    }
+
+    #[test]
+    fn loopback_phase_zero_when_aligned() {
+        // output edge exactly `offset` ticks behind the reference → phase 0.
+        let k = 1000;
+        let gps = 5_000_000u32;
+        let out = gps.wrapping_sub(k);
+        assert_eq!(loopback_phase_ticks(gps, out, k, 62_500_000), 0);
+        assert_eq!(loopback_phase_ns(gps, out, k, 125_000_000), 0);
+    }
+
+    #[test]
+    fn loopback_phase_lead_and_lag() {
+        // reference 100 ticks ahead of output → +100 ticks = +1600 ns at 125 MHz.
+        assert_eq!(loopback_phase_ticks(100, 0, 0, 62_500_000), 100);
+        assert_eq!(loopback_phase_ns(100, 0, 0, 125_000_000), 1600);
+        // output ahead of reference → negative.
+        assert_eq!(loopback_phase_ticks(0, 100, 0, 62_500_000), -100);
+        assert_eq!(loopback_phase_ns(0, 100, 0, 125_000_000), -1600);
+    }
+
+    #[test]
+    fn loopback_phase_folds_to_half_second() {
+        let tps = 62_500_000;
+        // just under a full second wraps to a small negative (the next second's edge).
+        assert_eq!(loopback_phase_ticks(tps - 10, 0, 0, tps), -10);
+        // just over half a second folds to the negative side.
+        assert_eq!(
+            loopback_phase_ticks(tps / 2 + 5, 0, 0, tps),
+            (tps / 2 + 5) as i32 - tps as i32
+        );
+    }
+
+    #[test]
+    fn calibrate_offset_averages_same_edge_diffs() {
+        // constant reference−output diff of 1000 ticks → offset 1000.
+        assert_eq!(
+            calibrate_loopback_offset([(5000u32, 4000u32), (8000, 7000), (12345, 11345)]),
+            Some(1000)
+        );
+        let empty: [(u32, u32); 0] = [];
+        assert_eq!(calibrate_loopback_offset(empty), None);
     }
 
     #[test]
