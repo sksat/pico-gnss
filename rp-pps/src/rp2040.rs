@@ -47,6 +47,54 @@ impl<P: PIOExt, SM: StateMachineIndex> PpsCapture<P, SM> {
     }
 }
 
+/// [`PpsCapture`] paired with a [`PpsEdgeTimeline`](crate::PpsEdgeTimeline): each captured edge comes
+/// back already timed (interval + running timeline). The easy tier over the capture primitives.
+///
+/// Reach for the fine tier ([`PpsCapture`] + [`crate::PpsEdgeTimeline`] held separately) when you
+/// need the raw counter at a different point than the timed edge (e.g. sharing the edge with another
+/// state machine for loopback phase).
+pub struct TimedPpsCapture<P: PIOExt, SM: StateMachineIndex> {
+    capture: PpsCapture<P, SM>,
+    timeline: crate::PpsEdgeTimeline,
+}
+
+impl<P: PIOExt, SM: StateMachineIndex> TimedPpsCapture<P, SM> {
+    /// Install the capture program (see [`PpsCapture::new`]) and pair it with a fresh timeline for
+    /// `clk_hz`.
+    ///
+    /// # Panics
+    /// If the program does not fit in the PIO's instruction memory.
+    pub fn new(
+        pio: &mut PIO<P>,
+        sm: UninitStateMachine<(P, SM)>,
+        pps_gpio: u8,
+        clk_hz: u32,
+    ) -> Self {
+        Self {
+            capture: PpsCapture::new(pio, sm, pps_gpio),
+            timeline: crate::PpsEdgeTimeline::new(clk_hz),
+        }
+    }
+
+    /// Non-blocking: if an edge was captured since the last call, return it timed against the
+    /// previous one ([`PpsCapture::try_read`] then [`crate::PpsEdgeTimeline::observe`]); else `None`.
+    pub fn try_timed_edge(&mut self) -> Option<crate::TimedEdge> {
+        self.capture
+            .try_read()
+            .map(|raw| self.timeline.observe(raw))
+    }
+
+    /// Borrow the underlying raw capture (the fine tier).
+    pub fn capture(&self) -> &PpsCapture<P, SM> {
+        &self.capture
+    }
+
+    /// Mutably borrow the underlying raw capture (e.g. [`PpsCapture::try_read`]).
+    pub fn capture_mut(&mut self) -> &mut PpsCapture<P, SM> {
+        &mut self.capture
+    }
+}
+
 /// Steerable 1PPS output on one state machine (see [`crate::pps_output_program`]).
 pub struct PpsOutput<P: PIOExt, SM: StateMachineIndex> {
     #[allow(dead_code)]
@@ -82,6 +130,57 @@ impl<P: PIOExt, SM: StateMachineIndex> PpsOutput<P, SM> {
     /// Returns `false` if the TX FIFO was full. Compute it with [`crate::output_period_cycles_ppb`].
     pub fn set_period(&mut self, period_word: u32) -> bool {
         self.tx.write(period_word)
+    }
+}
+
+/// [`PpsOutput`] paired with an [`OutputPeriodDither`](crate::OutputPeriodDither): steer the 1PPS by
+/// a total frequency offset + an immediate phase nudge in one call. The easy tier over the output
+/// primitives — it owns the sigma-delta accumulator and the system clock. Implements
+/// [`crate::PpsSteer`]. Use the fine tier ([`PpsOutput`] + [`crate::OutputPeriodDither`]) for a
+/// different dither policy or to reuse the period word.
+pub struct SteeredPpsOutput<P: PIOExt, SM: StateMachineIndex> {
+    output: PpsOutput<P, SM>,
+    dither: crate::OutputPeriodDither,
+    clk_hz: u32,
+}
+
+impl<P: PIOExt, SM: StateMachineIndex> SteeredPpsOutput<P, SM> {
+    /// Install the output program (see [`PpsOutput::new`]) starting at the nominal 1 Hz period for
+    /// `clk_hz` ([`crate::output_period_cycles`]), and pair it with a fresh dither.
+    ///
+    /// # Panics
+    /// If the program does not fit in the PIO's instruction memory.
+    pub fn new(
+        pio: &mut PIO<P>,
+        sm: UninitStateMachine<(P, SM)>,
+        out_gpio: u8,
+        clk_hz: u32,
+    ) -> Self {
+        Self {
+            output: PpsOutput::new(pio, sm, out_gpio, crate::output_period_cycles(clk_hz)),
+            dither: crate::OutputPeriodDither::new(),
+            clk_hz,
+        }
+    }
+
+    /// Borrow the underlying raw output (the fine tier).
+    pub fn output(&self) -> &PpsOutput<P, SM> {
+        &self.output
+    }
+
+    /// Mutably borrow the underlying raw output (e.g. a one-off [`PpsOutput::set_period`]).
+    pub fn output_mut(&mut self) -> &mut PpsOutput<P, SM> {
+        &mut self.output
+    }
+}
+
+impl<P: PIOExt, SM: StateMachineIndex> crate::PpsSteer for SteeredPpsOutput<P, SM> {
+    fn set_next_period(&mut self, freq_mppb: i64, phase_corr_ns: i64) -> u32 {
+        let period = self
+            .dither
+            .next_period(self.clk_hz, freq_mppb, phase_corr_ns);
+        let _ = self.output.set_period(period);
+        period
     }
 }
 

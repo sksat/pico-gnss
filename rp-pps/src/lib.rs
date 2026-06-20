@@ -315,6 +315,23 @@ pub trait PpsPeriodSet {
     fn set_period(&mut self, period_word: u32) -> bool;
 }
 
+/// Steer a 1PPS output by frequency + phase, shared across backends. The easy-tier counterpart to
+/// [`PpsPeriodSet`]: the implementor owns the [`OutputPeriodDither`] and system clock, so a control
+/// loop can drive the output with only servo quantities and stay generic over the HAL. Implemented
+/// by the `SteeredPpsOutput` of each backend.
+///
+/// There is deliberately no capture-side analogue: the timed-edge read splits into an `async`
+/// `next_edge()` (embassy) and a non-blocking `try_timed_edge()` (rp2040-hal), which — like
+/// [`PpsCaptureRead`]'s note on `wait_edge` — don't share one method cleanly. The HAL-generic
+/// primitive there is [`PpsCaptureRead`] plus [`PpsEdgeTimeline::observe`] on top.
+pub trait PpsSteer {
+    /// Compute the next period word from the total frequency offset `freq_mppb` (milli-ppb,
+    /// `crystal_ppb * 1000 + servo_trim_mppb`) and the immediate `phase_corr_ns` nudge, commit it to
+    /// the output, and return it. The push silently drops if the TX FIFO is full (the program holds
+    /// the previous period).
+    fn set_next_period(&mut self, freq_mppb: i64, phase_corr_ns: i64) -> u32;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

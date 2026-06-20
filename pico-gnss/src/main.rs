@@ -51,7 +51,8 @@ use gnssdo::{
     Gnssdo, LoopMode, NmeaLineAssembler, PhaseLockLoop, PpsEvent, civil_to_unix,
     parse_rmc_time_date, snap_to_second_ns,
 };
-use rp_pps::embassy::{PpsCapture, PpsOutput};
+use rp_pps::PpsSteer;
+use rp_pps::embassy::{SteeredPpsOutput, TimedPpsCapture};
 
 /// 受信機固有レイヤ (MT3333/GYSFFMANC の PMTK 設定・ボーレート)。別受信機ならここだけ差し替え。
 mod mt3333;
@@ -113,19 +114,16 @@ fn now_local_ns() -> u64 {
 
 /// PIO がラッチした PPS エッジを読み、間隔を ns で求めて出す + 周波数を規律するタスク。
 #[embassy_executor::task]
-async fn pps_task(mut capture: PpsCapture<'static, PIO0, 0>) {
-    let mut timeline = rp_pps::PpsEdgeTimeline::new(clk_sys_freq());
+async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
     let mut count: u32 = 0; // ログ用エッジ連番
 
     loop {
-        let x = capture.wait_edge().await; // エッジ時の自走ダウンカウンタ値
-        C0_GPS.store(x, Ordering::Relaxed); // stage②: 最新 GPS エッジの生カウンタを共有
+        // wait_edge + timeline.observe は TimedPpsCapture に委譲。生カウンタは edge.raw で取れる。
+        let edge = capture.next_edge().await;
+        C0_GPS.store(edge.raw, Ordering::Relaxed); // stage②: 最新 GPS エッジの生カウンタを共有
         C0_GEN.fetch_add(1, Ordering::Relaxed); // 世代++ (gen_capture が欠落検出に使う)
-        // エポックのアンカー用に Instant をエッジ直後に読む (µs ジッタは絶対オフセットのみに効く)。
+        // エポックのアンカー用に Instant を読む (µs ジッタは絶対オフセットのみに効く)。
         let inst_ns = now_local_ns();
-
-        // last_x 管理・interval・累積 edge_ns は rp-pps の timeline に委譲。
-        let edge = timeline.observe(x);
 
         // PIO の ns 精度時刻 (edge_ns) と Instant を main へ。err/エポックは edge_ns 基準で ns 精度。
         PPS_TS.signal((edge.edge_ns, inst_ns));
@@ -192,7 +190,7 @@ async fn time_task() {
 /// ※ freq/位相規律はループバック (GP3→GP4 ジャンパ) 接続が前提。未接続だと初期周期で自走する。
 #[embassy_executor::task]
 async fn gen_capture_task(
-    mut output: PpsOutput<'static, PIO0, 1>,
+    mut output: SteeredPpsOutput<'static, PIO0, 1>,
     mut sm: StateMachine<'static, PIO0, 2>,
     k: u32, // stage② 較正済みカウンタオフセット (C0−C2)
 ) {
@@ -200,9 +198,9 @@ async fn gen_capture_task(
     let mut last_x: Option<u32> = None;
     let mut count: u32 = 0;
     let mut last_gen: u32 = 0;
-    // 出力位相 PLL (制御=gnssdo) と sub-cycle period 生成 (I/O=rp-pps)。gains は PhaseLockLoopConfig。
+    // 出力位相 PLL (制御=gnssdo)。sub-cycle period 生成 (dither) + period word push は
+    // SteeredPpsOutput (rp-pps) が内包するので、ここは freq_mppb と phase_corr を渡すだけ。
     let mut pll = PhaseLockLoop::new();
-    let mut dither = rp_pps::OutputPeriodDither::new();
     loop {
         let x = sm.rx().wait_pull().await; // x = 出力エッジの生カウンタ (C2_out)
         // GPS PPS の世代。前回の出力エッジから進んでいなければ GPS 欠落 → C0_GPS が古い → 補正に使わない
@@ -245,8 +243,7 @@ async fn gen_capture_task(
         let u = pll.update(ctrl, valid);
         // 周波数 = 水晶推定(ppb) + PLL の I トリム(milli-ppb)。位相補正は dither が cycle に変換して引く。
         let freq_mppb = ppb * 1000 + u.freq_trim_mppb;
-        let period = dither.next_period(clk, freq_mppb, u.phase_corr_ns);
-        let _ = output.set_period(period);
+        let _ = output.set_next_period(freq_mppb, u.phase_corr_ns);
         if let Some(iv) = interval_ns {
             count += 1;
             // 制御信号を全部出力 → ホストでプラント同定 + ゲイン掃引シミュ + 項別比較ができる。
@@ -284,7 +281,7 @@ async fn main(spawner: Spawner) {
         mut sm2,
         ..
     } = Pio::new(p.PIO0, Irqs);
-    let mut capture = PpsCapture::new(&mut common, sm0, p.PIN_2);
+    let mut capture = TimedPpsCapture::new(&mut common, sm0, p.PIN_2, clk_sys_freq());
 
     // stage②: SM2 (ループバック位相計測。rp-pps 外の実験機能) は capture と GP2 を共有して生カウンタ差
     // K=C0−C2 を較正する。embassy の set_jmp_pin は &Pin を要求し GP2 は一度しか make できないので、
@@ -294,7 +291,7 @@ async fn main(spawner: Spawner) {
     sm2.set_pin_dirs(PioDirection::In, &[&lb_pin]);
     let mut cfg_gp2 = PioConfig::default();
     cfg_gp2.use_program(&lb_loaded, &[]);
-    cfg_gp2.set_jmp_pin(capture.jmp_pin()); // SM0 と同じ GP2 を捕捉
+    cfg_gp2.set_jmp_pin(capture.capture().jmp_pin()); // SM0 と同じ GP2 を捕捉 (fine tier へ escape)
     sm2.set_config(&cfg_gp2);
     sm2.set_enable(true);
     // SM0 と SM2 で同じ GP2 エッジを捕り、生カウンタ差 K=mean(C0−C2) を rp-pps で較正。
@@ -302,7 +299,7 @@ async fn main(spawner: Spawner) {
     let mut k_samples: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
     for i in 0..7u32 {
         match with_timeout(Duration::from_secs(30), async {
-            let c0 = capture.wait_edge().await;
+            let c0 = capture.capture_mut().wait_edge().await; // 較正は生カウンタ (fine tier へ escape)
             let c2 = sm2.rx().wait_pull().await;
             (c0, c2)
         })
@@ -332,14 +329,10 @@ async fn main(spawner: Spawner) {
     cfg_gp4.set_jmp_pin(&lb_pin);
     sm2.set_config(&cfg_gp4);
 
-    // SM1: 規律 PPS 生成を GP3 へ (rp-pps の PpsOutput)。初期周期 = ppb=0 の 1Hz。周期は
-    // gen_capture_task が毎エッジ set_period で操舵する (servo は firmware 側に残す)。
-    let output = PpsOutput::new(
-        &mut common,
-        sm1,
-        p.PIN_3,
-        rp_pps::output_period_cycles(clk_sys_freq()),
-    );
+    // SM1: 規律 PPS 生成を GP3 へ (rp-pps の SteeredPpsOutput)。初期周期 = ppb=0 の 1Hz (内部で
+    // output_period_cycles)。周期は gen_capture_task が毎エッジ set_next_period で操舵する
+    // (dither+period word 計算は rp-pps、servo=PLL は firmware 側に残す)。
+    let output = SteeredPpsOutput::new(&mut common, sm1, p.PIN_3, clk_sys_freq());
 
     // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
     interrupt::SWI_IRQ_0.set_priority(Priority::P0);
