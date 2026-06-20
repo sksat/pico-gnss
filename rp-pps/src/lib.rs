@@ -48,7 +48,7 @@ mod timesync;
 
 pub use assembler::{MAX_SENTENCE_LEN, NmeaLineAssembler, nmea_checksum, nmea_checksum_valid};
 pub use timesync::{
-    PpsNmeaAssociation, PpsTimeSync, RmcTimeDate, SyncPoint, civil_to_unix, days_from_civil,
+    PpsNmeaAssociation, PpsTimeSync, RmcTimeDate, SyncEpoch, civil_to_unix, days_from_civil,
     parse_ddmmyy, parse_hhmmss, parse_rmc_time_date,
 };
 

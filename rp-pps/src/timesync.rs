@@ -1,12 +1,13 @@
-//! Clock discipline via PPS (time sync).
+//! Pair a PPS edge with NMEA time to produce a UTC epoch.
 //!
-//! A GNSS 1PPS rising edge coincides with the UTC second boundary. By pairing the local timer
-//! value at that instant (e.g. RP2040 TIMER, 1µs resolution) with the UTC second obtained from
-//! NMEA, a µs-precision UTC epoch is maintained on the device.
+//! A GNSS 1PPS rising edge coincides with the UTC second boundary. [`PpsTimeSync`] timestamps the
+//! edge on the device's two timebases (capture + query, see [`SyncEpoch`]) and pairs it with the
+//! UTC second obtained from NMEA, yielding a [`SyncEpoch`] to feed the discipline core
+//! ([`gnssdo`](https://docs.rs/gnssdo)). This crate owns only the *pairing* (and the ±1 s
+//! receiver-dependent association); the disciplined clock / holdover / "now" queries are `gnssdo`.
 //!
-//! **Why on the device**: synchronizing on the host (over RTT/USB) adds the probe/USB round-trip
-//! jitter (tens of ms) and destroys the PPS's inherent precision. The PPS-edge↔UTC-second pairing
-//! must happen on an MCU that can timestamp the edge in µs.
+//! **Why on the device**: pairing on the host (over RTT/USB) adds the probe/USB round-trip jitter
+//! (tens of ms) and destroys the PPS's inherent precision; the edge must be timestamped on the MCU.
 //!
 //! All of this is HAL-agnostic pure logic, so it is host-tested (`cargo test -p rp-pps`).
 
@@ -102,15 +103,17 @@ pub fn parse_rmc_time_date(sentence: &str) -> Option<RmcTimeDate> {
     ))
 }
 
-/// An established sync point: a PPS edge's local time ↔ its UTC second.
+/// A UTC epoch from pairing a PPS edge with its UTC instant: the edge timestamped on both device
+/// timebases (integer ns) and the Unix-nanosecond instant it marks. Feed it straight to
+/// [`gnssdo`](https://docs.rs/gnssdo)'s `DisciplinedClock::update_epoch` / `Gnssdo::on_utc`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SyncPoint {
-    /// Local timer value (µs) at which the PPS edge was timestamped.
-    pub pps_local_us: u64,
-    /// The UTC second (Unix seconds) that this PPS edge points to.
-    pub unix_s: i64,
-    /// Deviation of the latest PPS interval from the ideal 1 s (= local oscillator drift, µs).
-    pub drift_us: i64,
+pub struct SyncEpoch {
+    /// High-resolution capture-timebase value (ns) at the PPS edge (e.g. RP2040 PIO capture).
+    pub capture_ns: u64,
+    /// Continuously-readable query-timebase value (ns) at the same edge (e.g. embassy `Instant`).
+    pub query_ns: u64,
+    /// The UTC instant (Unix nanoseconds) that this PPS edge marks.
+    pub unix_ns: i64,
 }
 
 /// How the second indicated by an NMEA time sentence (RMC/ZDA etc.) relates to the PPS edge it
@@ -147,16 +150,16 @@ impl PpsNmeaAssociation {
     }
 }
 
-/// State machine that disciplines the clock by pairing PPS edges with NMEA time.
+/// Pairs PPS edges with NMEA time to produce a UTC [`SyncEpoch`] for the discipline core.
+///
+/// It does only the *pairing* (including the ±1 s [`PpsNmeaAssociation`] correction). The
+/// disciplined clock, holdover and "now" queries are [`gnssdo`](https://docs.rs/gnssdo)'s job — feed
+/// the [`SyncEpoch`] this produces to `DisciplinedClock::update_epoch` / `Gnssdo::on_utc`.
 #[derive(Debug, Default)]
 pub struct PpsTimeSync {
     association: PpsNmeaAssociation,
-    last_date: Option<(u16, u8, u8)>, // (year, month, day)
-    pending_pps_us: Option<u64>,      // most recent PPS edge not yet paired with a UTC second
-    last_pps_us: Option<u64>,         // previous PPS edge, for the drift calculation
-    epoch_local_us: Option<u64>,      // established epoch: local reference
-    epoch_unix_s: Option<i64>,        // established epoch: UTC second
-    last_drift_us: i64,
+    last_date: Option<(u16, u8, u8)>, // (year, month, day) from RMC/ZDA
+    pending: Option<(u64, u64)>,      // (capture_ns, query_ns) of the most recent un-paired edge
 }
 
 impl PpsTimeSync {
@@ -170,61 +173,38 @@ impl PpsTimeSync {
         Self {
             association,
             last_date: None,
-            pending_pps_us: None,
-            last_pps_us: None,
-            epoch_local_us: None,
-            epoch_unix_s: None,
-            last_drift_us: 0,
+            pending: None,
         }
     }
 
-    /// Record a PPS rising edge at local time `local_us`.
-    /// If a previous edge exists, returns the drift (interval − 1 s, µs).
-    pub fn on_pps(&mut self, local_us: u64) -> Option<i64> {
-        let drift = self
-            .last_pps_us
-            .map(|prev| local_us as i64 - prev as i64 - 1_000_000);
-        if let Some(d) = drift {
-            self.last_drift_us = d;
-        }
-        self.last_pps_us = Some(local_us);
-        self.pending_pps_us = Some(local_us);
-        drift
+    /// Record a PPS rising edge, timestamped on the capture and query timebases (integer ns, see
+    /// [`SyncEpoch`]). The edge is held until the next [`on_time`](Self::on_time) pairs it.
+    pub fn on_pps_edge(&mut self, capture_ns: u64, query_ns: u64) {
+        self.pending = Some((capture_ns, query_ns));
     }
 
-    /// Update the date from RMC/ZDA.
+    /// Update the date from an RMC/ZDA sentence.
     pub fn set_date(&mut self, year: u16, month: u8, day: u8) {
         self.last_date = Some((year, month, day));
     }
 
-    /// Take the NMEA time (h,mi,s), pair it with the most recent PPS edge, and establish a sync
-    /// point. `None` if the date is unknown or no PPS has been seen.
-    pub fn on_time(&mut self, h: u8, mi: u8, s: u8) -> Option<SyncPoint> {
+    /// Pair the NMEA time `(h, mi, s)` with the most recent un-paired PPS edge and return the UTC
+    /// [`SyncEpoch`]. `None` if the date is unknown or no fresh edge is pending.
+    ///
+    /// Pairing **consumes** the edge: a second call with no new [`on_pps_edge`](Self::on_pps_edge)
+    /// in between returns `None`, so a stale edge is never paired to two different seconds (which
+    /// would inject a ±integer-second epoch error while PPS is missing).
+    pub fn on_time(&mut self, h: u8, mi: u8, s: u8) -> Option<SyncEpoch> {
         let (y, mo, d) = self.last_date?;
-        let pps = self.pending_pps_us?;
+        let (capture_ns, query_ns) = self.pending.take()?;
         // UTC second of the PPS edge = NMEA second + receiver-dependent correction (absorbs ±1 s).
         let unix_s = civil_to_unix(y as i64, mo as i64, d as i64, h as i64, mi as i64, s as i64)
             + self.association.edge_offset_seconds();
-        self.epoch_local_us = Some(pps);
-        self.epoch_unix_s = Some(unix_s);
-        self.pending_pps_us = None;
-        Some(SyncPoint {
-            pps_local_us: pps,
-            unix_s,
-            drift_us: self.last_drift_us,
+        Some(SyncEpoch {
+            capture_ns,
+            query_ns,
+            unix_ns: unix_s * 1_000_000_000,
         })
-    }
-
-    /// Whether sync has been established.
-    pub fn is_locked(&self) -> bool {
-        self.epoch_local_us.is_some() && self.epoch_unix_s.is_some()
-    }
-
-    /// Disciplined UTC (Unix µs) for an arbitrary local timer value. `None` if not synced.
-    pub fn now_unix_micros(&self, local_us: u64) -> Option<i64> {
-        let el = self.epoch_local_us?;
-        let eu = self.epoch_unix_s?;
-        Some(eu * 1_000_000 + (local_us as i64 - el as i64))
     }
 }
 
@@ -297,114 +277,90 @@ mod tests {
         assert_eq!(parse_ddmmyy("12"), None);
     }
 
-    #[test]
-    fn drift_is_none_then_interval_error() {
-        let mut ts = PpsTimeSync::new();
-        assert_eq!(ts.on_pps(1_000_000), None); // first edge has no previous
-        assert_eq!(ts.on_pps(2_000_050), Some(50)); // +50µs drift
-        assert_eq!(ts.on_pps(2_999_940), Some(-110)); // -110µs
-    }
+    // 1 s on the capture timebase, in ns (the tests use whole-second edges for clarity).
+    const NS: i64 = 1_000_000_000;
 
     #[test]
-    fn sync_requires_both_date_and_pps() {
+    fn epoch_requires_both_date_and_edge() {
         let mut ts = PpsTimeSync::new();
-        // Neither PPS-only nor time-only establishes sync.
-        assert!(ts.on_time(17, 6, 58).is_none());
-        ts.on_pps(1_000_000);
+        assert!(ts.on_time(17, 6, 58).is_none()); // nothing yet
+        ts.on_pps_edge(1_000_000_000, 5_000_000_000);
         assert!(ts.on_time(17, 6, 58).is_none()); // date not yet set
         ts.set_date(2026, 6, 7);
-        let sp = ts.on_time(17, 6, 58).unwrap();
-        assert_eq!(sp.pps_local_us, 1_000_000);
-        assert_eq!(sp.unix_s, civil_to_unix(2026, 6, 7, 17, 6, 58));
-        assert!(ts.is_locked());
+        let e = ts.on_time(17, 6, 58).unwrap();
+        assert_eq!(e.capture_ns, 1_000_000_000);
+        assert_eq!(e.query_ns, 5_000_000_000); // the two timebases are kept independent
+        assert_eq!(e.unix_ns, civil_to_unix(2026, 6, 7, 17, 6, 58) * NS);
     }
 
     #[test]
-    fn now_micros_interpolates_from_epoch() {
+    fn edge_paired_once_then_consumed() {
         let mut ts = PpsTimeSync::new();
         ts.set_date(2026, 6, 7);
-        ts.on_pps(1_000_000);
-        let sp = ts.on_time(17, 6, 58).unwrap();
-        let base = sp.unix_s * 1_000_000;
-        // the epoch itself
-        assert_eq!(ts.now_unix_micros(1_000_000), Some(base));
-        // 0.5 s later
-        assert_eq!(ts.now_unix_micros(1_500_000), Some(base + 500_000));
-        // before the epoch (a local value earlier than the PPS)
-        assert_eq!(ts.now_unix_micros(999_000), Some(base - 1_000));
+        ts.on_pps_edge(1_000_000_000, 1_000_000_000);
+        assert!(ts.on_time(17, 6, 58).is_some());
+        // No new edge: the stale edge is not paired to a second second (would be a ±1 s epoch jump).
+        assert!(ts.on_time(17, 6, 59).is_none());
+        // A fresh edge pairs again.
+        ts.on_pps_edge(2_000_000_000, 2_000_000_000);
+        assert!(ts.on_time(17, 6, 59).is_some());
     }
 
     #[test]
-    fn association_nmea_next_second_shifts_epoch_back() {
+    fn association_next_second_shifts_epoch_back() {
         // The receiver sends the "next" second early: the edge's UTC second is NMEA second − 1.
         let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsNextSecond);
         ts.set_date(2026, 6, 7);
-        ts.on_pps(1_000_000);
-        let sp = ts.on_time(17, 6, 58).unwrap();
+        ts.on_pps_edge(1_000_000_000, 1_000_000_000);
+        let e = ts.on_time(17, 6, 58).unwrap();
         // The default (SameSecond) would be 17:06:58, but NmeaIsNextSecond maps it to 17:06:57.
-        assert_eq!(sp.unix_s, civil_to_unix(2026, 6, 7, 17, 6, 57));
-        // `now` reflects the same epoch shift.
-        assert_eq!(
-            ts.now_unix_micros(1_000_000),
-            Some(civil_to_unix(2026, 6, 7, 17, 6, 57) * 1_000_000)
-        );
+        assert_eq!(e.unix_ns, civil_to_unix(2026, 6, 7, 17, 6, 57) * NS);
     }
 
     #[test]
-    fn association_nmea_previous_second_shifts_epoch_forward() {
+    fn association_previous_second_shifts_epoch_forward() {
         // The receiver reports the "previous" second: the edge's UTC second is NMEA second + 1.
         let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsPreviousSecond);
         ts.set_date(2026, 6, 7);
-        ts.on_pps(1_000_000);
-        let sp = ts.on_time(17, 6, 58).unwrap();
-        assert_eq!(sp.unix_s, civil_to_unix(2026, 6, 7, 17, 6, 59));
+        ts.on_pps_edge(1_000_000_000, 1_000_000_000);
+        let e = ts.on_time(17, 6, 58).unwrap();
+        assert_eq!(e.unix_ns, civil_to_unix(2026, 6, 7, 17, 6, 59) * NS);
     }
 
     #[test]
     fn association_handles_day_rollover() {
-        // 00:00:00 with NmeaIsNextSecond(-1) → previous day 23:59:59 (Unix-second math handles the rollover).
+        // 00:00:00 with NmeaIsNextSecond(-1) → previous day 23:59:59 (Unix-second math rolls over).
         let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsNextSecond);
         ts.set_date(2026, 6, 7);
-        ts.on_pps(5_000_000);
-        let sp = ts.on_time(0, 0, 0).unwrap();
-        assert_eq!(sp.unix_s, civil_to_unix(2026, 6, 6, 23, 59, 59));
-    }
-
-    #[test]
-    fn association_handles_year_rollover() {
-        // 2026-12-31 23:59:59 with NmeaIsPreviousSecond(+1) → 2027-01-01 00:00:00 (year rollover).
-        let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsPreviousSecond);
-        ts.set_date(2026, 12, 31);
-        ts.on_pps(1_000_000);
-        let sp = ts.on_time(23, 59, 59).unwrap();
-        assert_eq!(sp.unix_s, civil_to_unix(2027, 1, 1, 0, 0, 0));
+        ts.on_pps_edge(5_000_000_000, 5_000_000_000);
+        let e = ts.on_time(0, 0, 0).unwrap();
+        assert_eq!(e.unix_ns, civil_to_unix(2026, 6, 6, 23, 59, 59) * NS);
     }
 
     #[test]
     fn association_offset_does_not_accumulate() {
         // Across consecutive syncs the correction does not accumulate (not +1 per second; it applies
-        // equally to both epochs).
+        // equally to every epoch).
         let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsNextSecond);
         ts.set_date(2026, 6, 7);
-        ts.on_pps(1_000_000);
-        let s1 = ts.on_time(17, 6, 58).unwrap();
-        ts.on_pps(2_000_000);
-        let s2 = ts.on_time(17, 6, 59).unwrap();
-        assert_eq!(s2.unix_s - s1.unix_s, 1);
-        assert_eq!(s1.unix_s, civil_to_unix(2026, 6, 7, 17, 6, 57));
-        assert_eq!(s2.unix_s, civil_to_unix(2026, 6, 7, 17, 6, 58));
+        ts.on_pps_edge(1_000_000_000, 1_000_000_000);
+        let e1 = ts.on_time(17, 6, 58).unwrap();
+        ts.on_pps_edge(2_000_000_000, 2_000_000_000);
+        let e2 = ts.on_time(17, 6, 59).unwrap();
+        assert_eq!(e2.unix_ns - e1.unix_ns, NS);
+        assert_eq!(e1.unix_ns, civil_to_unix(2026, 6, 7, 17, 6, 57) * NS);
+        assert_eq!(e2.unix_ns, civil_to_unix(2026, 6, 7, 17, 6, 58) * NS);
     }
 
     #[test]
-    fn sync_advances_each_second() {
+    fn epoch_advances_each_second() {
         let mut ts = PpsTimeSync::new();
         ts.set_date(2026, 6, 7);
-        ts.on_pps(1_000_000);
-        let s1 = ts.on_time(17, 6, 58).unwrap();
-        ts.on_pps(2_000_000);
-        let s2 = ts.on_time(17, 6, 59).unwrap();
-        assert_eq!(s2.unix_s - s1.unix_s, 1);
-        assert_eq!(s2.pps_local_us, 2_000_000);
-        assert_eq!(s2.drift_us, 0); // exactly a 1 s interval
+        ts.on_pps_edge(1_000_000_000, 1_000_000_000);
+        let e1 = ts.on_time(17, 6, 58).unwrap();
+        ts.on_pps_edge(2_000_000_000, 2_000_000_000);
+        let e2 = ts.on_time(17, 6, 59).unwrap();
+        assert_eq!(e2.unix_ns - e1.unix_ns, NS);
+        assert_eq!(e2.capture_ns, 2_000_000_000);
     }
 }

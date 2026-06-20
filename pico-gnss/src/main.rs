@@ -49,7 +49,7 @@ use static_cell::StaticCell;
 
 use gnssdo::{Gnssdo, LoopMode, PhaseLockLoop, PpsEvent, snap_to_second_ns};
 use rp_pps::embassy::{SteeredPpsOutput, TimedPpsCapture};
-use rp_pps::{NmeaLineAssembler, PpsSteer, civil_to_unix, parse_rmc_time_date};
+use rp_pps::{NmeaLineAssembler, PpsSteer, PpsTimeSync, parse_rmc_time_date};
 
 /// 受信機固有レイヤ (MT3333/GYSFFMANC の PMTK 設定・ボーレート)。別受信機ならここだけ差し替え。
 mod mt3333;
@@ -353,8 +353,8 @@ async fn main(spawner: Spawner) {
 
     let mut assembler = NmeaLineAssembler::new();
     let mut read_buf = [0u8; 64];
-    let mut pending: Option<(u64, u64)> = None; // (PIO ns, Instant ns)
-    let mut pending_fresh = false; // 未消費の新しい PPS エッジがあるか
+    // RMC 時刻と直近 PPS エッジ (capture=PIO ns, query=Instant ns) を対応付けて epoch を作る (rp-pps)。
+    let mut timesync = PpsTimeSync::new();
 
     loop {
         let n = match rx.read(&mut read_buf).await {
@@ -365,10 +365,9 @@ async fn main(spawner: Spawner) {
             Err(_) => continue,
         };
 
-        // PIO がラッチした最新 PPS エッジ (PIO ns, Instant ns) を覚えておく。新しく来たら fresh。
-        if let Some(e) = PPS_TS.try_take() {
-            pending = Some(e);
-            pending_fresh = true;
+        // PIO がラッチした最新 PPS エッジ (capture=PIO ns, query=Instant ns) を timesync に渡す。
+        if let Some((capture_ns, query_ns)) = PPS_TS.try_take() {
+            timesync.on_pps_edge(capture_ns, query_ns);
         }
 
         for &b in &read_buf[..n] {
@@ -385,16 +384,13 @@ async fn main(spawner: Spawner) {
                 info!("FW {=str}", s);
             }
 
-            // RMC (日付+時刻) と直近 PPS エッジを対応付けて UTC エポックを固定する。
+            // RMC (日付+時刻) と直近 PPS エッジを対応付けて UTC エポックを固定する (対応付けは rp-pps の
+            // PpsTimeSync)。on_time は fresh なエッジを 1 回だけ消費するので、PPS 欠落中に stale エッジを
+            // 同じ秒に何度もペアして err が ±整数秒の偽値になることはない。
             if let Some(((h, mi, se), (d, mo, y))) = parse_rmc_time_date(s) {
-                // 新鮮な (未消費の) PPS エッジがある時だけペアする。PPS 欠落中は stale エッジを
-                // 同じ秒に何度もペアして err が ±整数秒の偽値になるため、fresh==true を条件にする。
-                if let (Some((pio_ns, inst_ns)), true) = (pending, pending_fresh) {
-                    pending_fresh = false; // このエッジは消費した
-                    let unix_s = civil_to_unix(
-                        y as i64, mo as i64, d as i64, h as i64, mi as i64, se as i64,
-                    );
-                    let target = unix_s * 1_000_000_000;
+                timesync.set_date(y, mo, d);
+                if let Some(epoch) = timesync.on_time(h, mi, se) {
+                    let target = epoch.unix_ns;
                     let (ppb, err_ns, fire_ns, hold_ms) = CLOCK.lock(|g| {
                         let mut g = g.borrow_mut();
                         // 補正後の時刻精度 (予測残差) と fire_at_utc の逆予測残差 = GPSDO 自己診断。
@@ -402,19 +398,22 @@ async fn main(spawner: Spawner) {
                         // 残差は fine 層 (DisciplinedClock) の API なので clock() で抜ける。
                         let err = g
                             .clock()
-                            .prediction_residual_ns(pio_ns, target)
+                            .prediction_residual_ns(epoch.capture_ns, target)
                             .unwrap_or(0);
-                        let fire = g.clock().fire_residual_ns(pio_ns, target).unwrap_or(0);
+                        let fire = g
+                            .clock()
+                            .fire_residual_ns(epoch.capture_ns, target)
+                            .unwrap_or(0);
                         // この sync が前回 sync から何 ms 経っているか (= この err が何秒 holdover の誤差か)。
-                        let hold = (g.holdover_ns(inst_ns) / 1_000_000) as u32;
-                        g.on_utc(pio_ns, inst_ns, target);
+                        let hold = (g.holdover_ns(epoch.query_ns) / 1_000_000) as u32;
+                        g.on_utc(epoch.capture_ns, epoch.query_ns, target);
                         (g.freq_ppb(), err, fire, hold)
                     });
                     // SYNC: err_ns=補正後の予測残差 (timestamp 側)、fire_ns=逆予測残差 (fire_at_utc 側)、holdover_ms=err の holdover 経過。
                     info!(
                         "SYNC pps_local_us={} unix_s={} drift_us={} err_ns={} fire_ns={} holdover_ms={}",
-                        pio_ns / 1000,
-                        unix_s,
+                        epoch.capture_ns / 1000,
+                        target / 1_000_000_000,
                         ppb / 1000,
                         err_ns,
                         fire_ns,

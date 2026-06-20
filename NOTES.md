@@ -18,16 +18,20 @@ GYSFFMANC ──NMEA(UART0 RX=GP1)──┐
   - `NMEA $GxXXX,...*hh`
   - `PPS count=<n> interval_us=<us> state=<First|Locked|Irregular> missed=<m>`
   - `SYNC pps_local_us=<t> unix_s=<s> drift_us=<d>`
-- **host テスト可能なロジックを `gnssdo` コア crate に分離** (Cargo workspace。`gnssdo/` = 依存ゼロの
-  no_std lib、`pico-gnss/` = embedded 専用)。コアは `cargo test -p gnssdo` で host 実行。firmware は
-  `cd pico-gnss && cargo run`。GPSDO 規律=`gnssdo/src/gpsdo.rs`、PPS=`pps.rs`、時刻同期=`timesync.rs`、
-  NMEA フレーミング=`assembler.rs`。
+- **host テスト可能なロジックを 2 つのコア crate に分離** (Cargo workspace, ともに host で `cargo test`):
+  - **`gnssdo/`** = 規律そのもの・**依存ゼロ** no_std lib。GPSDO 規律=`gpsdo.rs`、PPS エッジ分類=`pps.rs`、
+    出力位相 PLL=`pll.rs`。`update_epoch` で epoch を消費するだけで、時刻ソースには非依存。
+  - **`rp-pps/`** = RP2040 PIO I/O **+ 時刻取り込み**。PIO program/capture/output/dither、NMEA フレーミング=
+    `assembler.rs`、PPS↔UTC 秒の対応付け=`timesync.rs` (`PpsTimeSync`→`SyncEpoch`)。embassy-rp/rp2040-hal backend。
+  - **`pico-gnss/`** = embedded 専用 firmware (`cd pico-gnss && cargo run`)。両 crate を配線する。
 - webapp は **React 19 + Vite + TypeScript + react-leaflet**、Node ブリッジは依存ゼロ。
 
 ## 時刻同期の設計
 
-PPS 立ち上がりは UTC 秒境界。**その瞬間の local timer 値 (RP2040 TIMER, 1µs) を、後続 NMEA(RMC)
-の UTC 秒と対応付けて** µs 精度の UTC エポックを device 上に保持する ([`PpsTimeSync`])。
+PPS 立ち上がりは UTC 秒境界。**そのエッジを 2 系統 (capture=PIO ns / query=Instant ns) で打刻し、
+後続 NMEA(RMC) の UTC 秒と対応付けて** UTC エポックを device 上に確立する。対応付けは rp-pps の
+[`PpsTimeSync`] が担い (`on_pps_edge`/`set_date`/`on_time`→`SyncEpoch`)、その epoch を gnssdo の規律
+クロック (`Gnssdo::on_utc`/`DisciplinedClock::update_epoch`) に渡す。
 
 **なぜ firmware 側でやるか**: host (probe-rs RTT 経由) で同期すると USB/probe の往復ジッタ
 (数十 ms) が乗り、PPS 本来の精度が失われる。エッジを µs で刻める MCU 上で対応付けるのが必須。
@@ -77,8 +81,9 @@ PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを�
   **σ ≈ 11ns / peak-peak ~37ns** (16ns tick が下限) まで下がった。補正なしなら毎秒 ~2.8µs ずれる。
   ※ 連続時計 (TIME 行) の絶対値は依然 µs アンカー (PIO は FIFO 経由でエッジ時しか読めないため)。
 - **PPS 欠落・holdover をまたぐ err**: ① **freshness ガード** — 新しい PPS エッジが来た時だけ RMC とペア
-  する (`pending_fresh`)。欠落中に stale エッジを複数秒へペアすると err が ±整数秒の偽値になるのを防ぐ
-  (実機ログで `pps_local_us` が複数秒重複して発覚)。② **`snap_to_second_ns`** — 復帰時の整数秒ズレを除いて
+  する (`PpsTimeSync::on_time` が `Option::take` でエッジを 1 回だけ消費する)。欠落中に stale エッジを
+  複数秒へペアすると err が ±整数秒の偽値になるのを防ぐ (実機ログで `pps_local_us` が複数秒重複して発覚)。
+  ② **`snap_to_second_ns`** — 復帰時の整数秒ズレを除いて
   sub 秒残差だけ残す。これで **N 秒 holdover の真の時刻誤差**が読める (実データ: 25s holdover → 360ns)。
 - **補正タイマ**: `true_to_local_ns(true_ns)` で「真の時間で N 待つ」のに必要なローカル ns を得る
   (生の `Timer::after` は水晶公差 +2.7ppm 分ズレる)。これと `query_ns_for_unix_ns` が補正の素。
