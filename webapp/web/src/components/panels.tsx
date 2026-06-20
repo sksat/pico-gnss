@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Canvas } from "./Canvas";
 import { Row, drawSpark } from "./charts";
 import { snrColor, sysColor, SYS_INFO } from "../nmea";
+import { assessReception } from "../stats";
 import type { Accuracy, Timing } from "../stats";
 import type { GnssState } from "../types";
 
@@ -78,6 +79,22 @@ export function Header({ s, acc, timing }: { s: GnssState; acc: Accuracy; timing
         <span className="src">{s.conn.src}</span>
       </div>
     </header>
+  );
+}
+
+export function ReceptionPanel({ s, timing }: { s: GnssState; timing: Timing }) {
+  const r = assessReception(s, timing);
+  return (
+    <section className="panel a-rec">
+      <h2>Reception <span className="hdr-aux">timing quality ceiling</span></h2>
+      <div className={"fix-status " + r.cls}>{r.verdict}</div>
+      <dl className="kv compact">
+        {r.factors.map((x) => (
+          <Row key={x.k} k={x.k} v={<span style={{ color: x.color }}>{x.text}</span>} />
+        ))}
+      </dl>
+      <p className="hint">受信条件 (衛星数・幾何 HDOP・信号 C/N₀) が PPS タイミング σ の上限を決める。緑=good / 橙=fair / 赤=poor。</p>
+    </section>
   );
 }
 

@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { useGnss } from "./useGnss";
 import { computeAccuracy, computeTiming } from "./stats";
 import { AccuracyPanel, SkyPlot, SnrChart, TimeSeries, TimingPanel } from "./components/charts";
-import { ConsolePanel, FixPanel, Header, PpsPanel, SatTable, SyncPanel } from "./components/panels";
+import { ConsolePanel, FixPanel, Header, PpsPanel, ReceptionPanel, SatTable, SyncPanel } from "./components/panels";
 import { MapPanel } from "./components/MapPanel";
 
 export function App() {
@@ -15,6 +15,7 @@ export function App() {
       <Header s={s} acc={acc} timing={timing} />
       <main>
         <section className="grid">
+          <ReceptionPanel s={s} timing={timing} />
           <FixPanel s={s} />
           <PpsPanel s={s} />
           <SyncPanel s={s} />

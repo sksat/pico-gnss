@@ -1,4 +1,4 @@
-import type { PosSample } from "./types";
+import type { GnssState, PosSample } from "./types";
 
 export function mean(a: number[]): number {
   return a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0;
@@ -70,5 +70,73 @@ export function computeTiming(devNs: number[]): Timing {
     sigma: std(devNs),
     pp: Math.max(...devNs) - Math.min(...devNs),
     ppm: m / 1000,
+  };
+}
+
+// 受信条件の良し悪し = タイミング精度 (PPS σ) の上限。各要因を 0/1/2 で採点し色分けする。
+const REC_COLOR = ["#f87272" /*poor*/, "#fbbd23" /*fair*/, "#36d399" /*good*/] as const;
+export interface RecFactor {
+  k: string;
+  text: string;
+  color: string;
+}
+export interface Reception {
+  verdict: string; // GOOD / FAIR / POOR / NO FIX
+  cls: string; // good / fair / poor (CSS)
+  factors: RecFactor[];
+}
+
+/**
+ * fix / 衛星数 / 幾何 (HDOP) / 信号 (C/N₀) から受信条件を一目で評価する。
+ * 結果として律速される PPS jitter (σ) も末尾に並べる (これは結果であって採点には入れない)。
+ */
+export function assessReception(s: GnssState, timing: Timing): Reception {
+  const f = s.fix;
+  const col = (lvl: number) => REC_COLOR[lvl] ?? "#7a8a9a";
+
+  let fixLvl: number;
+  let fixText: string;
+  if (f.mode === 3) {
+    fixLvl = 2;
+    fixText = f.quality >= 2 ? "3D + SBAS" : "3D fix";
+  } else if (f.mode === 2) {
+    fixLvl = 1;
+    fixText = "2D fix";
+  } else {
+    fixLvl = 0;
+    fixText = "no fix";
+  }
+
+  const used = f.satsUsed ?? 0;
+  const satLvl = used >= 8 ? 2 : used >= 5 ? 1 : 0;
+
+  const h = f.hdop;
+  const hdopLvl = h == null ? 0 : h < 2 ? 2 : h < 5 ? 1 : 0;
+
+  const snrs = s.sats.filter((x) => s.usedPrn.has(x.prn) && x.snr != null && x.snr > 0).map((x) => x.snr!);
+  const cn0 = snrs.length ? snrs.reduce((a, b) => a + b, 0) / snrs.length : 0;
+  const cn0Lvl = snrs.length === 0 ? 0 : cn0 >= 38 ? 2 : cn0 >= 30 ? 1 : 0;
+
+  // 結果指標 (PPS interval σ)。採点には入れず、上限の現れとして表示。
+  const sig = timing.sigma;
+  const sigKnown = timing.n >= 5;
+  const sigLvl = sig < 100 ? 2 : sig < 1000 ? 1 : 0;
+  const sigText = !sigKnown ? "—" : Math.abs(sig) < 1000 ? `±${sig.toFixed(0)} ns` : `±${(sig / 1000).toFixed(2)} µs`;
+
+  const noFix = f.mode < 2;
+  const sum = fixLvl + satLvl + hdopLvl + cn0Lvl; // 0..8
+  const verdict = noFix ? "NO FIX" : sum >= 7 ? "GOOD" : sum >= 4 ? "OK" : "POOR";
+  const cls = noFix || sum < 4 ? "poor" : sum >= 7 ? "good" : "fair";
+
+  return {
+    verdict,
+    cls,
+    factors: [
+      { k: "Fix", text: fixText, color: col(fixLvl) },
+      { k: "Sats used", text: `${used} used / ${s.sats.length} in view`, color: col(satLvl) },
+      { k: "HDOP", text: h != null ? h.toFixed(1) : "—", color: col(hdopLvl) },
+      { k: "C/N₀ (used)", text: snrs.length ? `${cn0.toFixed(0)} dB-Hz avg` : "—", color: col(cn0Lvl) },
+      { k: "→ PPS jitter", text: sigText, color: sigKnown ? col(sigLvl) : "#7a8a9a" },
+    ],
   };
 }

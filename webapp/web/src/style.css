@@ -49,9 +49,9 @@ main { display: flex; flex-direction: column; gap: 12px; padding: 12px; }
 .grid {
   display: grid; gap: 12px;
   grid-template-columns: 280px 1fr 360px;
-  grid-template-areas: "fix map sky" "pps map snr" "sync map snr";
+  grid-template-areas: "rec map sky" "fix map snr" "pps map snr" "sync map snr";
 }
-.a-fix { grid-area: fix; } .a-pps { grid-area: pps; } .a-sync { grid-area: sync; }
+.a-rec { grid-area: rec; } .a-fix { grid-area: fix; } .a-pps { grid-area: pps; } .a-sync { grid-area: sync; }
 .a-map { grid-area: map; } .a-sky { grid-area: sky; } .a-snr { grid-area: snr; }
 .grid-detail { display: grid; gap: 12px; grid-template-columns: 1fr 1fr 1fr; }
 
@@ -74,6 +74,9 @@ main { display: flex; flex-direction: column; gap: 12px; padding: 12px; }
   border-radius: 6px; margin-bottom: 10px; background: #2a1620; color: var(--red); border: 1px solid #45202e; }
 .fix-status.ok { background: #0f2a20; color: var(--accent); border-color: #1c5640; }
 .fix-status.dgps { background: #112536; color: var(--blue); border-color: #1d3e5a; }
+.fix-status.good { background: #0f2a20; color: var(--accent); border-color: #1c5640; }
+.fix-status.fair { background: #2a2410; color: var(--amber); border-color: #564a1c; }
+.fix-status.poor { background: #2a1620; color: var(--red); border-color: #45202e; }
 
 .pps-big { font-family: var(--mono); font-size: 27px; font-weight: 600; color: #eaf2fb; }
 .pps-big .unit { font-size: 13px; color: var(--muted); margin-left: 4px; }
@@ -126,7 +129,7 @@ main { display: flex; flex-direction: column; gap: 12px; padding: 12px; }
 .console::-webkit-scrollbar-thumb, .table-wrap::-webkit-scrollbar-thumb { background: #243140; border-radius: 4px; }
 
 @media (max-width: 1100px) {
-  .grid { grid-template-columns: 1fr; grid-template-areas: "fix" "map" "sky" "snr" "pps" "sync"; }
+  .grid { grid-template-columns: 1fr; grid-template-areas: "rec" "fix" "map" "sky" "snr" "pps" "sync"; }
   .grid-detail { grid-template-columns: 1fr; }
   #map { min-height: 320px; }
 }
