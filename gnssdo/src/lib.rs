@@ -1,39 +1,42 @@
-//! `gnssdo`: GNSS PPS で規律されるクロック・holdover コア (GPS disciplined oscillator)。
+//! `gnssdo`: a GNSS-PPS-disciplined clock & holdover core (a GPSDO building block).
 //!
-//! HAL 非依存・整数演算のみ・no_std・依存ゼロ (default) の純粋ロジック。MCU/ホストを問わず
-//! **整数 ns タイムスタンプを渡す/受け取る**だけで動く (RP2040 で実動。STM32 等の入力キャプチャや
-//! ホストの `/dev/pps` でも同様)。
+//! HAL-agnostic, integer-only, `no_std`, zero-dependency (by default) pure logic. It runs on
+//! any MCU or host by just **passing/receiving integer-nanosecond timestamps** (runs on the
+//! RP2040; equally on an STM32 timer input-capture or a host's `/dev/pps`).
 //!
-//! - [`DisciplinedClock`]: PPS 間隔から水晶の周波数オフセット (ppb) を EMA 推定し、PPS が
-//!   切れている間 (holdover) も外挿して規律 UTC を保つ。capture/query の 2 timebase を扱う。
-//! - [`PpsTracker`]: PPS エッジ列のロック/欠落/非単調を判定する。
-//! - [`PpsTimeSync`]: NMEA 時刻と PPS エッジを対応付けて µs 精度の UTC エポックを確立する。
-//! - NMEA 抽出ヘルパ ([`parse_rmc_time_date`] 等): time+date のみの最小実装 (full parse は不要)。
+//! - [`DisciplinedClock`]: EMA-estimates the crystal frequency offset (ppb) from PPS intervals
+//!   and keeps disciplined UTC, extrapolating through holdover while PPS is lost. Works with two
+//!   timebases (capture/query).
+//! - [`PpsTracker`]: classifies a PPS edge stream (lock / missed / non-monotonic).
+//! - [`PpsTimeSync`]: pairs NMEA time with a PPS edge to establish a µs-precision UTC epoch.
+//! - NMEA helpers ([`parse_rmc_time_date`] etc.): minimal time+date extraction (no full parse).
 //!
-//! このコアは NMEA 解析自体を要求しない ([`PpsTimeSync`] はパース済みの値を受け取る) ため、
-//! 利用側は好きな NMEA パーサ (例 [`nmea`](https://docs.rs/nmea) crate) を併用できる。
-//! RP2040 firmware は同 repo の `firmware/` クレート (embassy-rp) を参照。
+//! The core does not require an NMEA parser itself ([`PpsTimeSync`] takes already-parsed values),
+//! so you may use any NMEA parser (e.g. the [`nmea`](https://docs.rs/nmea) crate) alongside it.
+//! The RP2040 firmware lives in the sibling `firmware/` crate (embassy-rp) in the same repo.
 //!
-//! テスト時のみ std を有効化。通常は no_std。
+//! `std` is enabled only under test; otherwise `no_std`.
 //!
 //! # Features
 //!
-//! - **`external-nmea`** (default 無効): [`parse_rmc_time_date`] の RMC 解析を
-//!   [`nmea`](https://docs.rs/nmea) crate に委譲する (自前パースの代わり)。default は依存ゼロの自前パーサ。
+//! - **`external-nmea`** (off by default): delegate [`parse_rmc_time_date`]'s RMC parsing to the
+//!   [`nmea`](https://docs.rs/nmea) crate instead of the built-in parser. The default is the
+//!   zero-dependency built-in parser.
 //!
-//!   有効時の差 (実機 RP2040 / Cortex-M0+ @125MHz 実測, firmware の `bench_nmea_parse` 参照):
+//!   Differences when enabled (measured on RP2040 / Cortex-M0+ @125MHz, see the firmware's
+//!   `bench_nmea_parse`):
 //!
-//!   | | 自前 (default) | `nmea` |
+//!   | | built-in (default) | `nmea` |
 //!   |---|---|---|
-//!   | RMC 1 文の time+date 抽出 | **≈ 37 µs** | **≈ 619 µs** (≈ 17x 遅い) |
-//!   | 利用側 `.text` 増分 | 0 (≈0.8KB の自前実体) | **+約 52KB** (nom/chrono 等 6 crate) |
-//!   | checksum 検証 | なし | **あり** (不一致は `None`) |
-//!   | 年の解釈 | 20xx 固定 | 世紀ピボット (`yy=94`→1994) |
-//!   | 閏秒 `ss=60` | 受理 (次分へ繰上) | 拒否 (`None`) |
+//!   | time+date from one RMC | **~37 µs** | **~619 µs** (~17x slower) |
+//!   | caller `.text` increase | 0 (~0.8 KB built-in) | **~+52 KB** (nom/chrono and ~6 crates) |
+//!   | checksum validation | none | **yes** (mismatch → `None`) |
+//!   | year interpretation | fixed 20xx | century pivot (`yy=94` → 1994) |
+//!   | leap second `ss=60` | accepted (rolls into next minute) | rejected (`None`) |
 //!
-//!   速度差は host では ≈4.3x だが M0+ は FPU 無しのため拡大する。いずれも 1Hz 用途では
-//!   無視できる (nmea でも ≈0.06% CPU)。default (自前) を推奨し、checksum 検証や
-//!   既存の `nmea` 依存を活かしたい場合のみ有効化する。
+//!   The slowdown is ~4.3x on the host but widens on the M0+ (no FPU). It is negligible at 1 Hz
+//!   either way (~0.06% CPU even with nmea). The default (built-in) is recommended; enable this
+//!   only if you want checksum validation or already depend on `nmea`.
 #![cfg_attr(not(test), no_std)]
 
 mod assembler;

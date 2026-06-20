@@ -1,16 +1,16 @@
-//! PPS によるクロック規律 (time sync)。
+//! Clock discipline via PPS (time sync).
 //!
-//! GNSS の 1PPS 立ち上がりは UTC 秒境界に一致する。その瞬間の local timer 値
-//! (RP2040 TIMER, 1µs 分解能) を、NMEA から得たその秒の UTC と対応付けることで、
-//! device 上に µs 精度の UTC エポックを保持する。
+//! A GNSS 1PPS rising edge coincides with the UTC second boundary. By pairing the local timer
+//! value at that instant (e.g. RP2040 TIMER, 1µs resolution) with the UTC second obtained from
+//! NMEA, a µs-precision UTC epoch is maintained on the device.
 //!
-//! **なぜ firmware でやるか**: host 側で RTT/USB 経由に同期すると probe/USB の
-//! 往復ジッタ (数十 ms) が乗り、PPS 本来の精度が失われる。PPS エッジ↔UTC 秒の
-//! 対応付けは、エッジを µs で刻める MCU 上で行うのが必須。
+//! **Why on the device**: synchronizing on the host (over RTT/USB) adds the probe/USB round-trip
+//! jitter (tens of ms) and destroys the PPS's inherent precision. The PPS-edge↔UTC-second pairing
+//! must happen on an MCU that can timestamp the edge in µs.
 //!
-//! いずれも HAL 非依存の純粋ロジックなので host で `cargo test-host` する。
+//! All of this is HAL-agnostic pure logic, so it is host-tested (`cargo test -p gnssdo`).
 
-/// 1970-01-01 からの経過日数 (Howard Hinnant のアルゴリズム, proleptic Gregorian)。
+/// Days since 1970-01-01 (Howard Hinnant's algorithm, proleptic Gregorian).
 pub const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
@@ -20,13 +20,13 @@ pub const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-/// UTC civil 日時 → Unix 秒 (閏秒は無視)。
+/// UTC civil datetime → Unix seconds (leap seconds ignored).
 pub const fn civil_to_unix(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
     days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s
 }
 
-/// NMEA の時刻フィールド `hhmmss.sss` から (時,分,秒) を取り出す。小数秒は捨てる
-/// (PPS 境界なので秒は整数)。
+/// Extract (hour, min, sec) from an NMEA time field `hhmmss.sss`. The fractional seconds are
+/// dropped (the second is an integer at the PPS boundary).
 pub fn parse_hhmmss(field: &str) -> Option<(u8, u8, u8)> {
     let int_part = field.split('.').next().unwrap_or(field);
     if int_part.len() < 6 {
@@ -41,7 +41,7 @@ pub fn parse_hhmmss(field: &str) -> Option<(u8, u8, u8)> {
     Some((h, mi, s))
 }
 
-/// NMEA の日付フィールド `ddmmyy` (RMC) から (日,月,西暦年) を取り出す。年は 20xx 前提。
+/// Extract (day, month, year) from an NMEA date field `ddmmyy` (RMC). The year assumes 20xx.
 pub fn parse_ddmmyy(field: &str) -> Option<(u8, u8, u16)> {
     if field.len() < 6 {
         return None;
@@ -55,16 +55,20 @@ pub fn parse_ddmmyy(field: &str) -> Option<(u8, u8, u16)> {
     Some((d, mo, 2000 + yy))
 }
 
-/// RMC センテンス文字列から `((時, 分, 秒), (日, 月, 西暦年))` を取り出す。RMC 以外・解析失敗は `None`。
+/// Extract `((hour, min, sec), (day, month, year))` from an RMC sentence. `None` for non-RMC or
+/// a parse failure.
 ///
-/// 入力は assembler でフレーム済みの NMEA 1 文 (`$` + 2 文字 talker、例 `$GPRMC,...` `$GNRMC,...`) を想定。
+/// The input is expected to be one assembler-framed NMEA sentence (`$` + 2-char talker, e.g.
+/// `$GPRMC,...` / `$GNRMC,...`).
 ///
-/// default は自前パーサ。feature `external-nmea` を有効にすると [`nmea`](https://docs.rs/nmea) crate に委譲する。
-/// バックエンドで挙動が次のように異なる:
-/// - **checksum**: 自前=**非検証** / nmea=**検証** (不一致は `None`)。
-/// - **年**: 自前=**20xx 固定** (`2000+yy`) / nmea=**世紀ピボット** (`yy=94`→1994)。
-/// - **閏秒 `ss=60`**: 自前=**受理** (civil_to_unix が次分へ繰り上げ) / nmea=**拒否** (`None`)。
-/// - **速度/サイズ**: nmea は実機 RP2040 で約 **17x 遅く・firmware `.text` 約 +52KB** (1Hz では無視可)。
+/// The default is the built-in parser. Enabling the `external-nmea` feature delegates to the
+/// [`nmea`](https://docs.rs/nmea) crate. The backends differ:
+/// - **checksum**: built-in = **not validated** / nmea = **validated** (mismatch → `None`).
+/// - **year**: built-in = **fixed 20xx** (`2000+yy`) / nmea = **century pivot** (`yy=94` → 1994).
+/// - **leap second `ss=60`**: built-in = **accepted** (civil_to_unix rolls into the next minute) /
+///   nmea = **rejected** (`None`).
+/// - **speed/size**: nmea is ~**17x slower** on the RP2040 and adds ~**+52 KB** of `.text`
+///   (negligible at 1 Hz).
 #[cfg(not(feature = "external-nmea"))]
 pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16))> {
     if sentence.get(3..6) != Some("RMC") {
@@ -75,13 +79,14 @@ pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16
     Some((time, date))
 }
 
-/// RMC から `((時,分,秒),(日,月,年))` を取り出す (nmea crate 版)。詳細は default 版の doc 参照。
-/// `nmea::parse_str` は **checksum を検証**してから RMC を取り出す (不一致は `None`)。
+/// Extract `((hour,min,sec),(day,month,year))` from RMC (nmea crate backend). See the default
+/// version's docs. `nmea::parse_str` **validates the checksum** before extracting RMC
+/// (mismatch → `None`).
 #[cfg(feature = "external-nmea")]
 pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16))> {
     use chrono::{Datelike, Timelike};
     use nmea::ParseResult;
-    // parse_str は checksum 検証込みで sentence を解析し、RMC を ParseResult::RMC で返す。
+    // parse_str parses the sentence including checksum validation and returns RMC as ParseResult::RMC.
     let rmc = match nmea::parse_str(sentence).ok()? {
         ParseResult::RMC(rmc) => rmc,
         _ => return None,
@@ -94,39 +99,42 @@ pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16
     ))
 }
 
-/// 確立した同期点: PPS エッジの local 時刻 ↔ その UTC 秒。
+/// An established sync point: a PPS edge's local time ↔ its UTC second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncPoint {
-    /// PPS エッジを刻んだ local timer 値 (µs)。
+    /// Local timer value (µs) at which the PPS edge was timestamped.
     pub pps_local_us: u64,
-    /// その PPS エッジが指す UTC 秒 (Unix 秒)。
+    /// The UTC second (Unix seconds) that this PPS edge points to.
     pub unix_s: i64,
-    /// 直近 PPS 間隔の理想 1s からのずれ (= local オシレータの drift, µs)。
+    /// Deviation of the latest PPS interval from the ideal 1 s (= local oscillator drift, µs).
     pub drift_us: i64,
 }
 
-/// PPS 立ち上がりエッジと、その後に届く NMEA 時刻文 (RMC/ZDA 等) が指す秒の対応。
+/// How the second indicated by an NMEA time sentence (RMC/ZDA etc.) relates to the PPS edge it
+/// follows.
 ///
-/// PPS のエッジは UTC 秒境界そのものを刻むが、その秒を表す NMEA 時刻文がエッジの
-/// **同じ秒 / 1 つ前 / 1 つ後** のどれを指すかは受信機依存。ずれても必ず **±1 秒以内**
-/// (エッジと NMEA 文の前後関係の問題で、2 秒以上ずれる正常動作は無い)。ここを誤ると確立する
-/// UTC エポックが丸ごと 1 秒ずれる — 本ライブラリ最大の事故要因なので、取りうる 3 値を列挙して
-/// 型で閉じている (任意秒オフセットは正常系に存在しないので受け付けない)。
+/// The PPS edge marks the UTC second boundary itself, but whether the NMEA time sentence refers to
+/// the **same / previous / next** second relative to that edge is receiver-dependent. Any offset is
+/// always **within ±1 second** (it is an ordering question between the edge and the sentence; a
+/// genuine ≥2 s offset does not occur in normal operation). Getting this wrong shifts the whole
+/// established UTC epoch by 1 second — the biggest footgun in this library — so the three possible
+/// values are enumerated and closed by the type (an arbitrary-second offset, which does not occur in
+/// normal operation, is not accepted).
 ///
-/// (`Debug`/`Default` は親 [`PpsTimeSync`] の derive が要求する最小限。)
+/// (`Debug`/`Default` is the minimum required by [`PpsTimeSync`]'s derive.)
 #[derive(Debug, Default)]
 pub enum PpsNmeaAssociation {
-    /// NMEA 時刻文はエッジと同じ秒を指す (大半の受信機)。既定。
+    /// The NMEA time sentence refers to the same second as the edge (most receivers). Default.
     #[default]
     SameSecond,
-    /// NMEA 時刻文はエッジの 1 つ前の秒を指す (エッジは NMEA より 1 秒後)。
+    /// The NMEA time sentence refers to the previous second (the edge is 1 s after the NMEA time).
     NmeaIsPreviousSecond,
-    /// NMEA 時刻文はエッジの 1 つ次の秒を指す (エッジは NMEA より 1 秒前)。
+    /// The NMEA time sentence refers to the next second (the edge is 1 s before the NMEA time).
     NmeaIsNextSecond,
 }
 
 impl PpsNmeaAssociation {
-    /// エッジの UTC 秒 = (NMEA 秒) + この補正 (±1 or 0)。
+    /// Edge UTC second = (NMEA second) + this correction (±1 or 0).
     const fn edge_offset_seconds(&self) -> i64 {
         match self {
             Self::SameSecond => 0,
@@ -136,25 +144,25 @@ impl PpsNmeaAssociation {
     }
 }
 
-/// PPS エッジと NMEA 時刻を対応付けてクロックを規律する state machine。
+/// State machine that disciplines the clock by pairing PPS edges with NMEA time.
 #[derive(Debug, Default)]
 pub struct PpsTimeSync {
     association: PpsNmeaAssociation,
     last_date: Option<(u16, u8, u8)>, // (year, month, day)
-    pending_pps_us: Option<u64>,      // まだ UTC とペアにしていない直近 PPS エッジ
-    last_pps_us: Option<u64>,         // drift 計算用の前回 PPS エッジ
-    epoch_local_us: Option<u64>,      // 確立エポック: local 基準
-    epoch_unix_s: Option<i64>,        // 確立エポック: UTC 秒
+    pending_pps_us: Option<u64>,      // most recent PPS edge not yet paired with a UTC second
+    last_pps_us: Option<u64>,         // previous PPS edge, for the drift calculation
+    epoch_local_us: Option<u64>,      // established epoch: local reference
+    epoch_unix_s: Option<i64>,        // established epoch: UTC second
     last_drift_us: i64,
 }
 
 impl PpsTimeSync {
-    /// 既定 ([`PpsNmeaAssociation::SameSecond`]) で生成する。
+    /// Create with the default ([`PpsNmeaAssociation::SameSecond`]).
     pub const fn new() -> Self {
         Self::with_association(PpsNmeaAssociation::SameSecond)
     }
 
-    /// PPS↔NMEA の秒対応を指定して生成する。`static` 初期化で使えるよう `const fn`。
+    /// Create with a given PPS↔NMEA second association. `const fn` so it can be used in `static` init.
     pub const fn with_association(association: PpsNmeaAssociation) -> Self {
         Self {
             association,
@@ -167,8 +175,8 @@ impl PpsTimeSync {
         }
     }
 
-    /// PPS 立ち上がりエッジを local 時刻 `local_us` で記録する。
-    /// 前回エッジがあれば drift (間隔 - 1s, µs) を返す。
+    /// Record a PPS rising edge at local time `local_us`.
+    /// If a previous edge exists, returns the drift (interval − 1 s, µs).
     pub fn on_pps(&mut self, local_us: u64) -> Option<i64> {
         let drift = self
             .last_pps_us
@@ -181,17 +189,17 @@ impl PpsTimeSync {
         drift
     }
 
-    /// RMC/ZDA から日付を更新する。
+    /// Update the date from RMC/ZDA.
     pub fn set_date(&mut self, year: u16, month: u8, day: u8) {
         self.last_date = Some((year, month, day));
     }
 
-    /// NMEA の時刻 (h,mi,s) を受け取り、直近 PPS エッジとペアにして同期点を確立する。
-    /// 日付未取得 or PPS 未受信なら `None`。
+    /// Take the NMEA time (h,mi,s), pair it with the most recent PPS edge, and establish a sync
+    /// point. `None` if the date is unknown or no PPS has been seen.
     pub fn on_time(&mut self, h: u8, mi: u8, s: u8) -> Option<SyncPoint> {
         let (y, mo, d) = self.last_date?;
         let pps = self.pending_pps_us?;
-        // PPS エッジが指す UTC 秒 = NMEA 秒 + 受信機依存補正 (±1 秒ズレ吸収)。
+        // UTC second of the PPS edge = NMEA second + receiver-dependent correction (absorbs ±1 s).
         let unix_s = civil_to_unix(y as i64, mo as i64, d as i64, h as i64, mi as i64, s as i64)
             + self.association.edge_offset_seconds();
         self.epoch_local_us = Some(pps);
@@ -204,12 +212,12 @@ impl PpsTimeSync {
         })
     }
 
-    /// 同期が確立しているか。
+    /// Whether sync has been established.
     pub fn is_locked(&self) -> bool {
         self.epoch_local_us.is_some() && self.epoch_unix_s.is_some()
     }
 
-    /// 任意の local timer 値に対する規律された UTC (Unix µs)。未同期なら `None`。
+    /// Disciplined UTC (Unix µs) for an arbitrary local timer value. `None` if not synced.
     pub fn now_unix_micros(&self, local_us: u64) -> Option<i64> {
         let el = self.epoch_local_us?;
         let eu = self.epoch_unix_s?;
@@ -225,7 +233,7 @@ mod tests {
     fn civil_to_unix_known_anchors() {
         assert_eq!(civil_to_unix(1970, 1, 1, 0, 0, 0), 0);
         assert_eq!(civil_to_unix(2000, 1, 1, 0, 0, 0), 946_684_800);
-        // 2026-06-07T17:06:59Z (今回の実測 fix。`date -u -d ... +%s` で検証済み)
+        // 2026-06-07T17:06:59Z (a measured fix; verified with `date -u -d ... +%s`)
         assert_eq!(civil_to_unix(2026, 6, 7, 17, 6, 59), 1_780_852_019);
     }
 
@@ -239,17 +247,17 @@ mod tests {
     #[test]
     fn parse_time_rejects_garbage() {
         assert_eq!(parse_hhmmss(""), None);
-        assert_eq!(parse_hhmmss("12345"), None); // 短すぎ
+        assert_eq!(parse_hhmmss("12345"), None); // too short
         assert_eq!(parse_hhmmss("99xxss"), None);
-        assert_eq!(parse_hhmmss("250000"), None); // 時 > 23
+        assert_eq!(parse_hhmmss("250000"), None); // hour > 23
     }
 
     #[test]
     fn parse_rmc_time_date_extracts_time() {
         let s = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
         let r = parse_rmc_time_date(s).unwrap();
-        assert_eq!(r.0, (12, 35, 19)); // 時刻は両バックエンドで一致
-        // 年解釈は異なる: 自前=20xx 固定 (2094)、nmea=世紀ピボット (1994)。
+        assert_eq!(r.0, (12, 35, 19)); // the time matches on both backends
+        // The year interpretation differs: built-in = fixed 20xx (2094), nmea = century pivot (1994).
         #[cfg(not(feature = "external-nmea"))]
         assert_eq!(r.1, (23, 3, 2094));
         #[cfg(feature = "external-nmea")]
@@ -264,9 +272,9 @@ mod tests {
 
     #[test]
     fn parse_rmc_time_date_checksum_behavior() {
-        // checksum を改ざんした RMC (正は *6A、誤の *00)。
+        // RMC with a tampered checksum (correct is *6A, wrong is *00).
         let bad = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*00";
-        // 自前は checksum 非検証なので通る。nmea は parse_str が検証して弾く。
+        // The built-in parser doesn't validate the checksum, so it passes; nmea's parse_str rejects it.
         #[cfg(not(feature = "external-nmea"))]
         assert!(parse_rmc_time_date(bad).is_some());
         #[cfg(feature = "external-nmea")]
@@ -282,14 +290,14 @@ mod tests {
     #[test]
     fn parse_date_rejects_garbage() {
         assert_eq!(parse_ddmmyy("00xx26"), None);
-        assert_eq!(parse_ddmmyy("001326"), None); // 月 13
+        assert_eq!(parse_ddmmyy("001326"), None); // month 13
         assert_eq!(parse_ddmmyy("12"), None);
     }
 
     #[test]
     fn drift_is_none_then_interval_error() {
         let mut ts = PpsTimeSync::new();
-        assert_eq!(ts.on_pps(1_000_000), None); // 初回は前回が無い
+        assert_eq!(ts.on_pps(1_000_000), None); // first edge has no previous
         assert_eq!(ts.on_pps(2_000_050), Some(50)); // +50µs drift
         assert_eq!(ts.on_pps(2_999_940), Some(-110)); // -110µs
     }
@@ -297,10 +305,10 @@ mod tests {
     #[test]
     fn sync_requires_both_date_and_pps() {
         let mut ts = PpsTimeSync::new();
-        // PPS だけ / 時刻だけでは確立しない
+        // Neither PPS-only nor time-only establishes sync.
         assert!(ts.on_time(17, 6, 58).is_none());
         ts.on_pps(1_000_000);
-        assert!(ts.on_time(17, 6, 58).is_none()); // 日付がまだ
+        assert!(ts.on_time(17, 6, 58).is_none()); // date not yet set
         ts.set_date(2026, 6, 7);
         let sp = ts.on_time(17, 6, 58).unwrap();
         assert_eq!(sp.pps_local_us, 1_000_000);
@@ -315,24 +323,24 @@ mod tests {
         ts.on_pps(1_000_000);
         let sp = ts.on_time(17, 6, 58).unwrap();
         let base = sp.unix_s * 1_000_000;
-        // エポックそのもの
+        // the epoch itself
         assert_eq!(ts.now_unix_micros(1_000_000), Some(base));
-        // 0.5s 後
+        // 0.5 s later
         assert_eq!(ts.now_unix_micros(1_500_000), Some(base + 500_000));
-        // エポック前 (PPS より前の local 値)
+        // before the epoch (a local value earlier than the PPS)
         assert_eq!(ts.now_unix_micros(999_000), Some(base - 1_000));
     }
 
     #[test]
     fn association_nmea_next_second_shifts_epoch_back() {
-        // 受信機が「次の秒」を先に送る: エッジの UTC 秒は NMEA 秒 - 1。
+        // The receiver sends the "next" second early: the edge's UTC second is NMEA second − 1.
         let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsNextSecond);
         ts.set_date(2026, 6, 7);
         ts.on_pps(1_000_000);
         let sp = ts.on_time(17, 6, 58).unwrap();
-        // 既定 (SameSecond) なら 17:06:58 だが、NmeaIsNextSecond で 17:06:57 に対応づく。
+        // The default (SameSecond) would be 17:06:58, but NmeaIsNextSecond maps it to 17:06:57.
         assert_eq!(sp.unix_s, civil_to_unix(2026, 6, 7, 17, 6, 57));
-        // now も同じエポックずれを反映する。
+        // `now` reflects the same epoch shift.
         assert_eq!(
             ts.now_unix_micros(1_000_000),
             Some(civil_to_unix(2026, 6, 7, 17, 6, 57) * 1_000_000)
@@ -341,7 +349,7 @@ mod tests {
 
     #[test]
     fn association_nmea_previous_second_shifts_epoch_forward() {
-        // 受信機が「前の秒」を報告する: エッジの UTC 秒は NMEA 秒 + 1。
+        // The receiver reports the "previous" second: the edge's UTC second is NMEA second + 1.
         let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsPreviousSecond);
         ts.set_date(2026, 6, 7);
         ts.on_pps(1_000_000);
@@ -351,7 +359,7 @@ mod tests {
 
     #[test]
     fn association_handles_day_rollover() {
-        // 00:00:00 で NmeaIsNextSecond(-1) → 前日 23:59:59 (unix 秒加算で日跨ぎも正しい)。
+        // 00:00:00 with NmeaIsNextSecond(-1) → previous day 23:59:59 (Unix-second math handles the rollover).
         let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsNextSecond);
         ts.set_date(2026, 6, 7);
         ts.on_pps(5_000_000);
@@ -361,7 +369,7 @@ mod tests {
 
     #[test]
     fn association_handles_year_rollover() {
-        // 2026-12-31 23:59:59 で NmeaIsPreviousSecond(+1) → 2027-01-01 00:00:00 (年跨ぎ)。
+        // 2026-12-31 23:59:59 with NmeaIsPreviousSecond(+1) → 2027-01-01 00:00:00 (year rollover).
         let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsPreviousSecond);
         ts.set_date(2026, 12, 31);
         ts.on_pps(1_000_000);
@@ -371,7 +379,8 @@ mod tests {
 
     #[test]
     fn association_offset_does_not_accumulate() {
-        // 連続同期で補正が累積しない (毎秒 +1 されず、両エポックに同じだけ効く)。
+        // Across consecutive syncs the correction does not accumulate (not +1 per second; it applies
+        // equally to both epochs).
         let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsNextSecond);
         ts.set_date(2026, 6, 7);
         ts.on_pps(1_000_000);
@@ -393,6 +402,6 @@ mod tests {
         let s2 = ts.on_time(17, 6, 59).unwrap();
         assert_eq!(s2.unix_s - s1.unix_s, 1);
         assert_eq!(s2.pps_local_us, 2_000_000);
-        assert_eq!(s2.drift_us, 0); // ちょうど 1s 間隔
+        assert_eq!(s2.drift_us, 0); // exactly a 1 s interval
     }
 }

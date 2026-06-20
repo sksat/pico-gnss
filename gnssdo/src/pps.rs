@@ -1,39 +1,40 @@
-//! PPS (pulse-per-second) エッジ列の追跡。
+//! Tracking of the PPS (pulse-per-second) edge stream.
 //!
-//! GNSS の PPS は理想的には正確に 1Hz。受信した立ち上がりエッジの timestamp 列から、
-//! ロック (≈1s)・パルス欠落・グリッチ/ジッタを判定する。どのライブラリも提供しない
-//! アプリ固有ロジックなので、ここに置いて host で `cargo test-host` する。
+//! A GNSS PPS is ideally exactly 1 Hz. From the sequence of received rising-edge timestamps,
+//! this classifies lock (~1 s), missed pulses, and glitches/jitter. It is app-specific logic
+//! that no library provides, so it lives here and is host-tested (`cargo test -p gnssdo`).
 //!
-//! HAL 非依存: timestamp は単なるマイクロ秒の `u64`。firmware 側で
-//! `embassy_time::Instant::now().as_micros()` を渡す。
+//! HAL-agnostic: a timestamp is just a microsecond `u64`. On the firmware side, pass
+//! `embassy_time::Instant::now().as_micros()`.
 
 use core::num::NonZeroU64;
 
-/// PPS の公称間隔 (1 秒 = 1_000_000 us)。既定の 1Hz PPS 用。
+/// Nominal PPS interval (1 second = 1_000_000 us). Default for a 1 Hz PPS.
 pub const NOMINAL_US: u64 = 1_000_000;
 
-/// ロック判定の既定許容誤差 (±50ms)。これを超えると欠落 or グリッチ扱い。
+/// Default lock tolerance (±50 ms). Beyond this is treated as a missed pulse or a glitch.
 pub const TOLERANCE_US: u64 = 50_000;
 
-/// [`PpsTracker`] の設定。1Hz 以外の PPS (例: 10Hz) や、受信機・捕捉系に応じた
-/// 許容幅に対応するため設定可能にしている。`Default` は 1Hz・±50ms。
+/// Configuration for [`PpsTracker`]. Made configurable to support non-1 Hz PPS (e.g. 10 Hz) and
+/// receiver/capture-specific tolerances. `Default` is 1 Hz / ±50 ms.
 ///
-/// **注意**: `nominal_us` を 1Hz 以外にできるのは [`PpsTracker`] 単体のロック/欠落判定まで。
-/// GPSDO の周波数規律 ([`crate::DisciplinedClock::update_freq`]) は現状 **1Hz 前提** (間隔を
-/// 1e9 ns 基準で評価) なので、非 1Hz の `Locked` をそのまま周波数規律へ渡しても成立しない。
+/// **Note**: setting `nominal_us` to a non-1 Hz value only affects [`PpsTracker`]'s own lock/miss
+/// classification. The GPSDO frequency discipline ([`crate::DisciplinedClock::update_freq`]) is
+/// currently **1 Hz only** (it evaluates the interval against 1e9 ns), so feeding a non-1 Hz
+/// `Locked` straight into frequency discipline does not work.
 ///
-/// (`Debug`/`Default` は親 [`PpsTracker`] の derive が要求する最小限。)
+/// (`Debug`/`Default` is the minimum required by [`PpsTracker`]'s derive.)
 #[derive(Debug)]
 pub struct PpsTrackerConfig {
-    /// PPS の公称間隔 (µs)。1Hz なら 1_000_000。`NonZeroU64` で 0 (ゼロ除算) を型排除。
+    /// Nominal PPS interval (µs). 1_000_000 for 1 Hz. `NonZeroU64` rules out 0 (division by zero).
     pub nominal_us: NonZeroU64,
-    /// ロック判定の許容誤差 (µs)。公称 ± これ以内を Locked とする。欠落時は倍数ぶん広げる。
-    /// 0 も有効 (公称ちょうどのみ Locked とする厳格判定) なので `NonZero` にはしない。
+    /// Lock tolerance (µs). Within nominal ± this is Locked; widened by the multiple on misses.
+    /// 0 is valid too (strict: only an exact nominal locks), so it is not `NonZero`.
     pub tolerance_us: u64,
 }
 
 impl PpsTrackerConfig {
-    /// 既定値 (1Hz, ±50ms)。`const fn` の [`PpsTracker::new`] から使えるよう const。
+    /// Defaults (1 Hz, ±50 ms). `const` so the `const fn` [`PpsTracker::new`] can use it.
     pub const DEFAULT: Self = Self {
         nominal_us: NonZeroU64::new(NOMINAL_US).unwrap(),
         tolerance_us: TOLERANCE_US,
@@ -46,21 +47,22 @@ impl Default for PpsTrackerConfig {
     }
 }
 
-/// 1 エッジを記録したときの判定結果。
+/// Result of recording one edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PpsEvent {
-    /// 最初のエッジ (間隔は未確定)。
+    /// First edge (interval not yet known).
     First,
-    /// 公称 1s ± 許容誤差。安定ロック。
+    /// Nominal 1 s ± tolerance. Stable lock.
     Locked { interval_us: u64 },
-    /// 公称から外れた。`missed` は推定欠落パルス数 (グリッチ/ジッタなら 0)。
+    /// Off-nominal. `missed` is the estimated number of dropped pulses (0 for a glitch/jitter).
     Irregular { interval_us: u64, missed: u32 },
-    /// 入力 timestamp が前回より過去だった (タイマ巻き戻り/順序逆転/リセット)。`backwards_us` は
-    /// 戻った量。間隔が測れないので規律には使わない。内部状態は今回値へ rebase し次エッジから再開する。
+    /// The input timestamp went backwards (timer wrap / out-of-order / reset). `backwards_us` is
+    /// how far back. No interval can be measured, so it is not used for discipline; internal state
+    /// rebases to the current value and resumes from the next edge.
     NonMonotonic { backwards_us: u64 },
 }
 
-/// PPS エッジ列の state machine。
+/// State machine over the PPS edge stream.
 #[derive(Debug, Default)]
 pub struct PpsTracker {
     config: PpsTrackerConfig,
@@ -69,12 +71,12 @@ pub struct PpsTracker {
 }
 
 impl PpsTracker {
-    /// 既定設定 (1Hz, ±50ms) で生成する。
+    /// Create with the defaults (1 Hz, ±50 ms).
     pub const fn new() -> Self {
         Self::with_config(PpsTrackerConfig::DEFAULT)
     }
 
-    /// 設定を指定して生成する。`static` 初期化で使えるよう `const fn`。
+    /// Create with a given configuration. `const fn` so it can be used in `static` init.
     pub const fn with_config(config: PpsTrackerConfig) -> Self {
         Self {
             config,
@@ -83,35 +85,36 @@ impl PpsTracker {
         }
     }
 
-    /// 現在の設定。
+    /// Current configuration.
     pub fn config(&self) -> &PpsTrackerConfig {
         &self.config
     }
 
-    /// これまでに記録したエッジ総数。
+    /// Total number of edges recorded so far.
     pub fn count(&self) -> u32 {
         self.count
     }
 
-    /// 立ち上がりエッジを 1 つ記録し、判定結果を返す。
-    /// `now_us` は単調増加するマイクロ秒タイムスタンプ。
+    /// Record one rising edge and return the classification.
+    /// `now_us` is a monotonically increasing microsecond timestamp.
     pub fn record(&mut self, now_us: u64) -> PpsEvent {
         self.count += 1;
         let nominal = self.config.nominal_us.get();
         let event = match self.last_us {
             None => PpsEvent::First,
-            // 巻き戻り (タイマ wrap/順序逆転/リセット): 間隔が測れない。黙って 0 にせず報告する。
+            // Backwards (timer wrap / out-of-order / reset): no interval; report it instead of
+            // silently producing 0.
             Some(prev) if now_us < prev => PpsEvent::NonMonotonic {
                 backwards_us: prev - now_us,
             },
             Some(prev) => {
-                let interval = now_us - prev; // 上のガードで now_us >= prev
-                // 公称間隔の何倍に最も近いか (四捨五入)。
+                let interval = now_us - prev; // now_us >= prev guaranteed by the guard above
+                // Nearest integer multiple of the nominal interval (rounded).
                 let n = (interval + nominal / 2) / nominal;
                 if n >= 1 {
                     let expected = n * nominal;
                     let error = interval.abs_diff(expected);
-                    // 倍数ぶんだけ許容誤差も広げる。
+                    // Widen the tolerance by the multiple as well.
                     if error <= self.config.tolerance_us * n {
                         if n == 1 {
                             PpsEvent::Locked {
@@ -130,7 +133,7 @@ impl PpsTracker {
                         }
                     }
                 } else {
-                    // 0.5s 未満 = グリッチ。
+                    // Under 0.5 s = glitch.
                     PpsEvent::Irregular {
                         interval_us: interval,
                         missed: 0,
@@ -152,14 +155,14 @@ mod tests {
     fn non_monotonic_input_is_reported_and_rebases() {
         let mut t = PpsTracker::new();
         t.record(2_000_000);
-        // 前回より過去 → 黙って 0 にせず NonMonotonic (戻り量 500ms) を返す。
+        // Earlier than the previous edge → NonMonotonic (500 ms back), not a silent 0.
         assert_eq!(
             t.record(1_500_000),
             PpsEvent::NonMonotonic {
                 backwards_us: 500_000
             }
         );
-        // 今回値へ rebase 済みなので、次の +1s は通常通り Locked に復帰する。
+        // Already rebased to the current value, so the next +1 s locks again as usual.
         assert_eq!(
             t.record(2_500_000),
             PpsEvent::Locked {
@@ -171,7 +174,7 @@ mod tests {
 
     #[test]
     fn custom_tolerance_tightens_lock_window() {
-        // 許容を ±5ms に絞ると、既定 (±50ms) では Locked だった +30ms ジッタが Irregular になる。
+        // With ±5 ms tolerance, a +30 ms jitter that was Locked at the default (±50 ms) is Irregular.
         let cfg = PpsTrackerConfig {
             tolerance_us: 5_000,
             ..PpsTrackerConfig::DEFAULT
@@ -189,7 +192,7 @@ mod tests {
 
     #[test]
     fn custom_nominal_supports_non_1hz() {
-        // 公称 100ms (10Hz) でも 1 周期は Locked。1Hz 固定でない汎用性の確認。
+        // With a 100 ms nominal (10 Hz), one period still Locks. Confirms it is not 1 Hz-only.
         let cfg = PpsTrackerConfig {
             nominal_us: NonZeroU64::new(100_000).unwrap(),
             ..PpsTrackerConfig::DEFAULT
@@ -228,7 +231,7 @@ mod tests {
     fn small_jitter_within_tolerance_is_locked() {
         let mut t = PpsTracker::new();
         t.record(0);
-        // +30ms のジッタは許容内。
+        // +30 ms jitter is within tolerance.
         assert_eq!(
             t.record(1_030_000),
             PpsEvent::Locked {
@@ -241,7 +244,7 @@ mod tests {
     fn one_missed_pulse() {
         let mut t = PpsTracker::new();
         t.record(0);
-        // ~2s 空く = 1 パルス欠落。
+        // ~2 s gap = 1 dropped pulse.
         assert_eq!(
             t.record(2_000_000),
             PpsEvent::Irregular {
@@ -268,7 +271,7 @@ mod tests {
     fn too_short_is_glitch() {
         let mut t = PpsTracker::new();
         t.record(0);
-        // 0.2s = グリッチ (欠落ではない)。
+        // 0.2 s = glitch (not a dropped pulse).
         assert_eq!(
             t.record(200_000),
             PpsEvent::Irregular {
@@ -282,7 +285,7 @@ mod tests {
     fn off_nominal_between_multiples_is_glitch() {
         let mut t = PpsTracker::new();
         t.record(0);
-        // 1.5s は 1 倍にも 2 倍にも遠い = ジッタ扱い (missed=0)。
+        // 1.5 s is far from both 1x and 2x = jitter (missed=0).
         assert_eq!(
             t.record(1_500_000),
             PpsEvent::Irregular {
@@ -297,7 +300,7 @@ mod tests {
         let mut t = PpsTracker::new();
         t.record(0);
         t.record(2_000_000); // missed 1
-        // 次が再び 1s ならロックに戻る。
+        // If the next one is 1 s again, it returns to lock.
         assert_eq!(
             t.record(3_000_000),
             PpsEvent::Locked {
