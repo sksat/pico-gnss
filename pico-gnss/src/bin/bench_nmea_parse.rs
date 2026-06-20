@@ -59,8 +59,16 @@ async fn main(_spawner: Spawner) {
     let nm_us = t1.elapsed().as_micros();
     core::hint::black_box(acc2);
 
-    info!("in-house: {} us total = {} ns/iter", ih_us, ih_us * 1000 / N as u64);
-    info!("nmea    : {} us total = {} ns/iter", nm_us, nm_us * 1000 / N as u64);
+    info!(
+        "in-house: {} us total = {} ns/iter",
+        ih_us,
+        ih_us * 1000 / N as u64
+    );
+    info!(
+        "nmea    : {} us total = {} ns/iter",
+        nm_us,
+        nm_us * 1000 / N as u64
+    );
     info!("ratio x100 (nmea / in-house): {}", nm_us * 100 / ih_us);
     loop {
         Timer::after_secs(3600).await;

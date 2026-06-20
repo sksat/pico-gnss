@@ -30,26 +30,26 @@ use panic_probe as _;
 
 use embassy_executor::{InterruptExecutor, Spawner};
 use embassy_rp::bind_interrupts;
+use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::interrupt;
 use embassy_rp::interrupt::{InterruptExt, Priority};
-use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::peripherals::{PIO0, UART0};
 use embassy_rp::pio::{
     Config as PioConfig, Direction as PioDirection, InterruptHandler as PioInterruptHandler, Pio,
     StateMachine,
 };
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{with_timeout, Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::Read;
 use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
 use gnssdo::{
-    civil_to_unix, parse_rmc_time_date, snap_to_second_ns, DisciplinedClock, FreqUpdate, LoopMode,
-    NmeaLineAssembler, PhaseLockLoop, PpsEvent, PpsTracker,
+    Gnssdo, LoopMode, NmeaLineAssembler, PhaseLockLoop, PpsEvent, civil_to_unix,
+    parse_rmc_time_date, snap_to_second_ns,
 };
 use rp_pps::embassy::{PpsCapture, PpsOutput};
 
@@ -65,9 +65,10 @@ bind_interrupts!(struct Irqs {
 /// PIO 時刻は ns 精度 (err/エポック計算用)、Instant は連続クエリ (ticker/holdover) のアンカー用。
 static PPS_TS: Signal<CriticalSectionRawMutex, (u64, u64)> = Signal::new();
 
-/// GPSDO の規律クロック。pps_task が周波数を、main が UTC エポックを更新し、time_task が読む。
-static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<DisciplinedClock>> =
-    BlockingMutex::new(RefCell::new(DisciplinedClock::new()));
+/// GPSDO の規律状態 (gnssdo の easy tier)。pps_task が周波数を、main が UTC エポックを更新し、
+/// time_task が読む。PPS 分類 + Locked のみ規律 + 復帰 quarantine の policy は Gnssdo::on_pps が内包。
+static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<Gnssdo>> =
+    BlockingMutex::new(RefCell::new(Gnssdo::new()));
 
 /// 位相制御の測定源。true=PIO ハード位相 (stage②, 本番)。false=旧 Instant 測定 (比較計測用)。
 const PHASE_USE_HW: bool = true;
@@ -114,8 +115,7 @@ fn now_local_ns() -> u64 {
 #[embassy_executor::task]
 async fn pps_task(mut capture: PpsCapture<'static, PIO0, 0>) {
     let mut timeline = rp_pps::PpsEdgeTimeline::new(clk_sys_freq());
-    let mut tracker = PpsTracker::new();
-    let mut was_locked = false; // 直前エッジが Locked だったか (復帰検出用)
+    let mut count: u32 = 0; // ログ用エッジ連番
 
     loop {
         let x = capture.wait_edge().await; // エッジ時の自走ダウンカウンタ値
@@ -126,40 +126,33 @@ async fn pps_task(mut capture: PpsCapture<'static, PIO0, 0>) {
 
         // last_x 管理・interval・累積 edge_ns は rp-pps の timeline に委譲。
         let edge = timeline.observe(x);
-        let interval_ns = edge.interval_ns;
 
         // PIO の ns 精度時刻 (edge_ns) と Instant を main へ。err/エポックは edge_ns 基準で ns 精度。
         PPS_TS.signal((edge.edge_ns, inst_ns));
 
-        // 先に PpsTracker で品質を判定する。周波数 EMA は **Locked のエッジでのみ**規律する
-        // (Irregular/First の間隔を入れると holdover/PPSGEN の土台が腐る — smart-friend GPT-5.5)。
-        let count = tracker.count() + 1;
-        let interval_us = interval_ns / 1000;
-        let (state, missed): (&str, u32) = match tracker.record(edge.edge_ns / 1000) {
+        // 品質判定 → Locked のみ周波数規律 → holdover/Irregular からの復帰時 quarantine、の policy は
+        // gnssdo easy tier (Gnssdo::on_pps) に集約済み。ここは I/O と log だけ (薄い)。
+        count += 1;
+        let step = CLOCK.lock(|g| {
+            g.borrow_mut()
+                .on_pps(edge.edge_ns / 1000, edge.interval_ns as i64)
+        });
+        let (state, missed): (&str, u32) = match step.event {
             PpsEvent::First => ("First", 0),
             PpsEvent::Locked { .. } => ("Locked", 0),
             PpsEvent::Irregular { missed, .. } => ("Irregular", missed),
             PpsEvent::NonMonotonic { .. } => ("NonMono", 0),
         };
-        let locked = state == "Locked";
-        // holdover/Irregular からの復帰 (前回非 Locked → 今回 Locked) を検出したら周波数を検疫する。
-        let recovered = locked && !was_locked;
-        was_locked = locked;
-        // PIO の精密な間隔で水晶の周波数オフセットを規律 (Locked のときだけ、多段ゲート経由)。
-        let fu = if interval_ns > 0 && locked {
-            CLOCK.lock(|c| {
-                let mut c = c.borrow_mut();
-                if recovered {
-                    c.start_quarantine();
-                }
-                c.update_freq(interval_ns as i64)
-            })
-        } else {
-            FreqUpdate::GatedQuality
-        };
+        // freq= は規律した時だけ ok/sane/gate/quar、規律しなかったエッジは none。
+        let freq = step.freq.map_or("none", |fu| fu.as_str());
         info!(
             "PPS count={} interval_us={} interval_ns={} state={=str} missed={} freq={}",
-            count, interval_us, interval_ns, state, missed, fu.as_str()
+            count,
+            edge.interval_ns / 1000,
+            edge.interval_ns,
+            state,
+            missed,
+            freq
         );
     }
 }
@@ -171,10 +164,15 @@ async fn time_task() {
     loop {
         Timer::after_secs(1).await;
         let local = now_local_ns();
-        let (now, ppb, holdover, locked) = CLOCK.lock(|c| {
-            let c = c.borrow();
+        let (now, ppb, holdover, locked) = CLOCK.lock(|g| {
+            let g = g.borrow();
             // 連続クエリは Instant 系 (サブ秒は µs 精度)。エポックの絶対対応は Instant アンカー。
-            (c.now_from_query_ns(local), c.freq_ppb(), c.holdover_ns(local), c.is_locked())
+            (
+                g.now_from_query_ns(local),
+                g.freq_ppb(),
+                g.holdover_ns(local),
+                g.frequency_locked(),
+            )
         });
         if let Some(now) = now {
             info!(
@@ -220,12 +218,19 @@ async fn gen_capture_task(
         let c0 = C0_GPS.load(Ordering::Relaxed);
         let hwphase_ns = rp_pps::loopback_phase_ns(c0, x, k, clk);
         // 旧手法 (比較用 emit のみ): 出力エッジの UTC 時刻 (Instant 経由) → 秒境界からのズレ。
-        let (ppb, phase) = CLOCK.lock(|c| {
-            let c = c.borrow();
-            (c.freq_ppb(), c.now_from_query_ns(now_local_ns()).map(snap_to_second_ns))
+        let (ppb, phase) = CLOCK.lock(|g| {
+            let g = g.borrow();
+            (
+                g.freq_ppb(),
+                g.now_from_query_ns(now_local_ns()).map(snap_to_second_ns),
+            )
         });
         // 制御に使う位相: PIO ハード(stage②)。PHASE_USE_HW=false で旧 Instant 測定に切替 (比較計測用)。
-        let ctrl = if PHASE_USE_HW { hwphase_ns } else { phase.unwrap_or(0) };
+        let ctrl = if PHASE_USE_HW {
+            hwphase_ns
+        } else {
+            phase.unwrap_or(0)
+        };
         // 実験モード: 制御構成を ~130 エッジ毎に巡回し実機で比較 (0=P,1=PD,2=PI,3=PID,4=PID+Smith)。
         // 先頭を PID+Smith にしてコールドスタートをロックしてから P/PD/PI/PID を回す。本番は常に 4。
         let cfg: u32 = if PHASE_EXPERIMENT {
@@ -248,7 +253,15 @@ async fn gen_capture_task(
             // (互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残し、cfg/trim/p/d を追記)
             info!(
                 "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cfg={} p_ns={} d_ns={}",
-                count, iv, iv - 1_000_000_000, phase.unwrap_or(0), hwphase_ns, u.freq_trim_mppb / 1000, cfg, u.p_corr_ns, u.d_corr_ns
+                count,
+                iv,
+                iv - 1_000_000_000,
+                phase.unwrap_or(0),
+                hwphase_ns,
+                u.freq_trim_mppb / 1000,
+                cfg,
+                u.p_corr_ns,
+                u.d_corr_ns
             );
         }
         last_x = Some(x);
@@ -258,10 +271,19 @@ async fn gen_capture_task(
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    info!("pico-gnss: start (NMEA on UART0/GP1 @ {} baud, PPS on GP2 via PIO, GPSDO)", mt3333::GNSS_BAUD);
+    info!(
+        "pico-gnss: start (NMEA on UART0/GP1 @ {} baud, PPS on GP2 via PIO, GPSDO)",
+        mt3333::GNSS_BAUD
+    );
 
     // PPS on GP2 を PIO0 SM0 で rp-pps の PpsCapture でハードキャプチャ (~16ns 分解能)。
-    let Pio { mut common, sm0, sm1, mut sm2, .. } = Pio::new(p.PIO0, Irqs);
+    let Pio {
+        mut common,
+        sm0,
+        sm1,
+        mut sm2,
+        ..
+    } = Pio::new(p.PIO0, Irqs);
     let mut capture = PpsCapture::new(&mut common, sm0, p.PIN_2);
 
     // stage②: SM2 (ループバック位相計測。rp-pps 外の実験機能) は capture と GP2 を共有して生カウンタ差
@@ -312,8 +334,12 @@ async fn main(spawner: Spawner) {
 
     // SM1: 規律 PPS 生成を GP3 へ (rp-pps の PpsOutput)。初期周期 = ppb=0 の 1Hz。周期は
     // gen_capture_task が毎エッジ set_period で操舵する (servo は firmware 側に残す)。
-    let output =
-        PpsOutput::new(&mut common, sm1, p.PIN_3, rp_pps::output_period_cycles(clk_sys_freq()));
+    let output = PpsOutput::new(
+        &mut common,
+        sm1,
+        p.PIN_3,
+        rp_pps::output_period_cycles(clk_sys_freq()),
+    );
 
     // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
     interrupt::SWI_IRQ_0.set_priority(Priority::P0);
@@ -375,18 +401,24 @@ async fn main(spawner: Spawner) {
                 // 同じ秒に何度もペアして err が ±整数秒の偽値になるため、fresh==true を条件にする。
                 if let (Some((pio_ns, inst_ns)), true) = (pending, pending_fresh) {
                     pending_fresh = false; // このエッジは消費した
-                    let unix_s = civil_to_unix(y as i64, mo as i64, d as i64, h as i64, mi as i64, se as i64);
+                    let unix_s = civil_to_unix(
+                        y as i64, mo as i64, d as i64, h as i64, mi as i64, se as i64,
+                    );
                     let target = unix_s * 1_000_000_000;
-                    let (ppb, err_ns, fire_ns, hold_ms) = CLOCK.lock(|c| {
-                        let mut c = c.borrow_mut();
+                    let (ppb, err_ns, fire_ns, hold_ms) = CLOCK.lock(|g| {
+                        let mut g = g.borrow_mut();
                         // 補正後の時刻精度 (予測残差) と fire_at_utc の逆予測残差 = GPSDO 自己診断。
                         // どちらも更新前クロックで計算し、複数秒 holdover の整数秒ズレは snap で除く (gnssdo)。
-                        let err = c.prediction_residual_ns(pio_ns, target).unwrap_or(0);
-                        let fire = c.fire_residual_ns(pio_ns, target).unwrap_or(0);
+                        // 残差は fine 層 (DisciplinedClock) の API なので clock() で抜ける。
+                        let err = g
+                            .clock()
+                            .prediction_residual_ns(pio_ns, target)
+                            .unwrap_or(0);
+                        let fire = g.clock().fire_residual_ns(pio_ns, target).unwrap_or(0);
                         // この sync が前回 sync から何 ms 経っているか (= この err が何秒 holdover の誤差か)。
-                        let hold = (c.holdover_ns(inst_ns) / 1_000_000) as u32;
-                        c.update_epoch(pio_ns, inst_ns, target);
-                        (c.freq_ppb(), err, fire, hold)
+                        let hold = (g.holdover_ns(inst_ns) / 1_000_000) as u32;
+                        g.on_utc(pio_ns, inst_ns, target);
+                        (g.freq_ppb(), err, fire, hold)
                     });
                     // SYNC: err_ns=補正後の予測残差 (timestamp 側)、fire_ns=逆予測残差 (fire_at_utc 側)、holdover_ms=err の holdover 経過。
                     info!(
