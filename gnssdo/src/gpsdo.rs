@@ -94,6 +94,18 @@ pub enum FreqUpdate {
     Quarantined,
 }
 
+impl FreqUpdate {
+    /// Short tag for logging: `"ok"` / `"sane"` / `"gate"` / `"quar"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FreqUpdate::Applied => "ok",
+            FreqUpdate::GatedSane => "sane",
+            FreqUpdate::GatedQuality => "gate",
+            FreqUpdate::Quarantined => "quar",
+        }
+    }
+}
+
 /// The PPS-disciplined clock model.
 ///
 /// Works with two timebases (both from the device's same oscillator, passed as integer ns;

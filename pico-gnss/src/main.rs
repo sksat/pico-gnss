@@ -55,16 +55,6 @@ use gnssdo::{
 };
 use rp_pps::embassy::{PpsCapture, PpsOutput};
 
-/// `FreqUpdate` を defmt ログ用の短い文字列に。
-fn freq_update_str(fu: FreqUpdate) -> &'static str {
-    match fu {
-        FreqUpdate::Applied => "ok",
-        FreqUpdate::GatedSane => "sane",
-        FreqUpdate::GatedQuality => "gate",
-        FreqUpdate::Quarantined => "quar",
-    }
-}
-
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
@@ -162,10 +152,7 @@ fn now_local_ns() -> u64 {
 
 /// `$<payload>*<csum>\r\n` を組み立てて送る。
 async fn send_pmtk<W: Write>(tx: &mut W, payload: &str) {
-    let mut cs = 0u8;
-    for b in payload.as_bytes() {
-        cs ^= *b;
-    }
+    let cs = gnssdo::nmea_checksum(payload.as_bytes());
     // PMTK314 (NMEA 出力設定) は ~51 文字になるので余裕を持って 96。溢れると truncate されて
     // 不完全コマンドになり、モジュールに拒否される (実際にハマった)。
     let mut line: String<96> = String::new();
@@ -230,7 +217,7 @@ async fn pps_task(mut capture: PpsCapture<'static, PIO0, 0>) {
         };
         info!(
             "PPS count={} interval_us={} interval_ns={} state={=str} missed={} freq={}",
-            count, interval_us, interval_ns, state, missed, freq_update_str(fu)
+            count, interval_us, interval_ns, state, missed, fu.as_str()
         );
     }
 }

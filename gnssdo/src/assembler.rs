@@ -60,6 +60,33 @@ impl NmeaLineAssembler {
     }
 }
 
+/// NMEA 0183 checksum: the XOR of the payload bytes — everything between the leading `$` and the
+/// `*`. Pass just the payload (no `$`, no `*hh`), e.g. `b"GPRMC,..."`; the transmitted form is
+/// `${payload}*{checksum:02X}`.
+pub fn nmea_checksum(payload: &[u8]) -> u8 {
+    payload.iter().fold(0, |cs, &b| cs ^ b)
+}
+
+/// Validate a framed NMEA sentence's `*hh` checksum. Accepts `$<payload>*<HH>` (the form
+/// [`NmeaLineAssembler`] emits; a trailing CR/LF is tolerated). Returns `false` if there is no
+/// `*hh` suffix, the two hex digits are malformed, or the checksum mismatches.
+///
+/// The built-in [`parse_rmc_time_date`](crate::parse_rmc_time_date) does not check the checksum;
+/// call this first if you want that guarantee without the `external-nmea` feature.
+pub fn nmea_checksum_valid(sentence: &str) -> bool {
+    let body = sentence.strip_prefix('$').unwrap_or(sentence);
+    let Some((payload, sum)) = body.split_once('*') else {
+        return false;
+    };
+    let Some(hex) = sum.get(0..2) else {
+        return false;
+    };
+    let Ok(expected) = u8::from_str_radix(hex, 16) else {
+        return false;
+    };
+    nmea_checksum(payload.as_bytes()) == expected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +150,36 @@ mod tests {
     fn bare_dollar_then_terminator_emits_nothing() {
         let got = feed_all(b"$\r\n");
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn checksum_roundtrips() {
+        let payload = b"GPRMC,123519,A,4807.038,N";
+        let cs = nmea_checksum(payload);
+        let s = std::format!("${}*{:02X}", std::str::from_utf8(payload).unwrap(), cs);
+        assert!(nmea_checksum_valid(&s));
+        // any payload change flips the checksum.
+        assert!(!nmea_checksum_valid(&s.replace("GPRMC", "GPRMD")));
+    }
+
+    #[test]
+    fn checksum_known_example() {
+        // textbook RMC sentence (its documented checksum is 6A).
+        assert!(nmea_checksum_valid(
+            "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A"
+        ));
+        // a trailing CR/LF is tolerated.
+        assert!(nmea_checksum_valid(
+            "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A\r\n"
+        ));
+    }
+
+    #[test]
+    fn checksum_valid_rejects_bad_and_malformed() {
+        assert!(!nmea_checksum_valid(
+            "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6B"
+        ));
+        assert!(!nmea_checksum_valid("$GPGGA,no-star"));
+        assert!(!nmea_checksum_valid("$GPRMC,x*ZZ"));
     }
 }
