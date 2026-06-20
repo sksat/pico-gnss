@@ -8,15 +8,22 @@
 使い方 (uv で隔離環境を自動構築):
     uv run plot_compare.py <old.log> <new.log> [out.png]
 
-PPSGEN 行の phase_ns(旧=Instant 測定) と hwphase_ns(新=PIO ハード測定) を使う。
+図のラベルは PLOT_LANG=en で英語、既定は日本語。
 A: 出力 PPS の UTC 位相 (旧制御=±ms vs 新制御=±ns) — 制御結果。
 B: 位相の「測定」精度 (Instant vs PIO、同じ出力を両方で測った) — 改善の源泉。
 """
-import re, sys
+import os, re, sys
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+EN = os.environ.get("PLOT_LANG", "").lower() == "en"
+
+
+def L(ja, en):
+    return en if EN else ja
+
 
 for _f in ("Noto Sans CJK JP", "IPAGothic", "TakaoGothic"):
     try:
@@ -29,7 +36,6 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 old_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/old.log"
 new_path = sys.argv[2] if len(sys.argv) > 2 else "/tmp/new.log"
 out = sys.argv[3] if len(sys.argv) > 3 else "compare.png"
-import os
 _here = os.path.dirname(os.path.abspath(__file__))
 exp_path = sys.argv[4] if len(sys.argv) > 4 else os.path.join(_here, "../report/exp-capture.log")
 # PID(Smith 無し)=リミットサイクルの実機ログ。Instant→PID→PID+Smith の 3 段階を A に重ねる用。
@@ -61,7 +67,8 @@ ot, oph, ohw = parse(old_path)
 nt, nph, nhw = parse(new_path)
 
 fig, ax = plt.subplots(1, 2, figsize=(15, 5.5))
-fig.suptitle("stage②: 規律 PPS 出力の UTC 位相同期 — 制御方式・制御項(A) と 測定精度(B) の比較",
+fig.suptitle(L("stage②: 規律 PPS 出力の UTC 位相同期 — 制御方式・制御項(A) と 測定精度(B) の比較",
+               "stage 2: UTC phase sync of the disciplined PPS output — control (A) and measurement precision (B)"),
              fontsize=13, fontweight="bold")
 
 
@@ -121,24 +128,32 @@ def clip(t, hw):  # グリッチ (>3ms) を表示から除外
 a = ax[0]
 if len(ohw):
     ct, ch = clip(ot, ohw)
-    a.plot(ct, ch, ".-", color="#a78bfa", ms=2, lw=0.6, label=f"① Instant 測定で制御: ロック不能 σ≈{locked_sigma(ohw, GLITCH)/1000:.0f}µs")
+    a.plot(ct, ch, ".-", color="#a78bfa", ms=2, lw=0.6,
+           label=L(f"① Instant 測定で制御: ロック不能 σ≈{locked_sigma(ohw, GLITCH)/1000:.0f}µs",
+                   f"(1) control on Instant measurement: cannot lock, σ≈{locked_sigma(ohw, GLITCH)/1000:.0f}µs"))
 try:  # ② PID (PIO 測定, Smith 無し) = ループ遅れでリミットサイクル
     mt, _mph, mhw = parse(mid_path)
     if len(mhw):
         ct, ch = clip(mt, mhw)
         a.plot(ct, ch, ".-", color="#f59e0b", ms=1.8, lw=0.6, alpha=0.85,
-               label=f"② PID (PIO測定, Smith無し): σ≈{locked_sigma(mhw, 50_000):.0f}ns 振動")
+               label=L(f"② PID (PIO測定, Smith無し): σ≈{locked_sigma(mhw, 50_000):.0f}ns 振動",
+                       f"(2) PID (PIO measurement, no Smith): σ≈{locked_sigma(mhw, 50_000):.0f}ns, oscillates"))
 except Exception as ex:
     print(f"mid skip: {ex}")
 if len(nhw):
     ct, ch = clip(nt, nhw)
-    a.plot(ct, ch, ".-", color="#10b981", ms=2.5, lw=0.8, label=f"③ PID+Smith (遅延補償): σ≈{locked_sigma(nhw, 50_000):.0f}ns")
+    a.plot(ct, ch, ".-", color="#10b981", ms=2.5, lw=0.8,
+           label=L(f"③ PID+Smith (遅延補償): σ≈{locked_sigma(nhw, 50_000):.0f}ns",
+                   f"(3) PID+Smith (latency-compensated): σ≈{locked_sigma(nhw, 50_000):.0f}ns"))
 a.set_yscale("symlog", linthresh=1000)
 for v in (1e6, -1e6, 1e3, -1e3):
     a.axhline(v, color="#ccc", lw=0.5, ls="--")
 a.axhline(0, color="#888", lw=0.7)
-a.set_title("A. 出力位相 (symlog): ①Instant測定→②PIO+PID(振動)→③PID+Smith で詰める段階", fontsize=9.5)
-a.set_xlabel("各 run の経過時間 [s]"); a.set_ylabel("UTC 秒境界からのズレ [ns]")
+a.set_title(L("A. 出力位相 (symlog): ①Instant測定→②PIO+PID(振動)→③PID+Smith で詰める段階",
+              "A. Output phase (symlog): (1) Instant → (2) PIO+PID (oscillates) → (3) PID+Smith"),
+            fontsize=9.5)
+a.set_xlabel(L("各 run の経過時間 [s]", "Elapsed time per run [s]"))
+a.set_ylabel(L("UTC 秒境界からのズレ [ns]", "Deviation from UTC second boundary [ns]"))
 a.legend(fontsize=7.5, loc="upper right"); a.grid(True, which="both", alpha=0.15)
 
 # B: 測定精度. 旧 run で同じ出力を Instant と PIO で測った差 = Instant の測定ノイズ。
@@ -146,12 +161,18 @@ a = ax[1]
 if len(oph):
     diff = oph - ohw
     diff = diff[np.abs(diff) < 1_000_000]  # 秒境界跨ぎの偽値を除外
-    a.plot(diff, ".", color="#ef4444", ms=3, alpha=0.6, label=f"Instant 測定 − PIO 真値 (σ={np.std(diff)/1000:.0f}µs)")
-    a.axhline(0, color="#10b981", lw=1.4, label="PIO ハード測定 (真値=0基準, 16ns 刻み)")
+    a.plot(diff, ".", color="#ef4444", ms=3, alpha=0.6,
+           label=L(f"Instant 測定 − PIO 真値 (σ={np.std(diff)/1000:.0f}µs)",
+                   f"Instant measurement − PIO truth (σ={np.std(diff)/1000:.0f}µs)"))
+    a.axhline(0, color="#10b981", lw=1.4,
+              label=L("PIO ハード測定 (真値=0基準, 16ns 刻み)", "PIO hardware measurement (truth=0, 16ns steps)"))
     lim = max(2000, np.percentile(np.abs(diff), 98) * 1.3)
     a.set_ylim(-lim, lim)
-a.set_title("B. 位相の『測定』精度: Instant は ±数百µs ばらつく / PIO は 16ns", fontsize=10.5)
-a.set_xlabel("PPS パルス番号 (旧 run)"); a.set_ylabel("測定誤差 [ns] (PIO 真値との差)")
+a.set_title(L("B. 位相の『測定』精度: Instant は ±数百µs ばらつく / PIO は 16ns",
+              "B. Phase *measurement* precision: Instant scatters ±hundreds of µs / PIO is 16ns"),
+            fontsize=10.5)
+a.set_xlabel(L("PPS パルス番号 (旧 run)", "PPS pulse index (old run)"))
+a.set_ylabel(L("測定誤差 [ns] (PIO 真値との差)", "Measurement error [ns] (vs PIO truth)"))
 a.legend(fontsize=9); a.grid(True, alpha=0.2)
 
 

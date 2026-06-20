@@ -1,5 +1,9 @@
 # gnssdo
 
+[![crates.io](https://img.shields.io/crates/v/gnssdo.svg)](https://crates.io/crates/gnssdo)
+[![docs.rs](https://img.shields.io/docsrs/gnssdo)](https://docs.rs/gnssdo)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/sksat/pico-gnss-rs/blob/main/LICENSE)
+
 `no_std`, HAL-agnostic **GNSS PPS disciplined clock & holdover core** (a GPSDO /
 GNSSDO — GNSS-disciplined oscillator — building block). Integer-only,
 zero-dependency core.
@@ -72,9 +76,4 @@ made unrepresentable via `NonZero*` types.
 
 Pre-1.0; the API may change. This is the discipline core behind the RP2040
 `pico-gnss` firmware in the [same repository](https://github.com/sksat/pico-gnss-rs).
-Requires Rust 1.83+ (const `NonZero`).
-
-## License
-
-Licensed under the MIT license. See
-[LICENSE](https://github.com/sksat/pico-gnss-rs/blob/main/LICENSE).
+Requires Rust 1.83+ (const `NonZero`). Licensed under MIT.
