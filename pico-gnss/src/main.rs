@@ -50,8 +50,8 @@ use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
 use gnssdo::{
-    civil_to_unix, parse_rmc_time_date, snap_to_second_ns, DisciplinedClock, FreqUpdate,
-    NmeaLineAssembler, PpsEvent, PpsTracker,
+    civil_to_unix, parse_rmc_time_date, snap_to_second_ns, DisciplinedClock, FreqUpdate, LoopMode,
+    NmeaLineAssembler, PhaseLockLoop, PpsEvent, PpsTracker,
 };
 use rp_pps::embassy::{PpsCapture, PpsOutput};
 
@@ -124,25 +124,7 @@ static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<DisciplinedClock>> 
 
 /// 位相制御の測定源。true=PIO ハード位相 (stage②, 本番)。false=旧 Instant 測定 (比較計測用)。
 const PHASE_USE_HW: bool = true;
-/// 位相同期のデッドバンド (ns)。**0=P を常時効かせ全域で減衰**。Smith 予測子で遅延補償した上で
-/// Kp=1/8 (ζ≈0.71) にしたので、deadband 内で P が切れて無減衰になる事態を避ける。
-const PHASE_DEADBAND_NS: i64 = 0;
-/// ロック判定: 位相がこの内 (1µs) のエッジを LOCK_HOLD 回連続でロック成立。Smith でロックが ±80ns と
-/// 締まったので 1µs に下げた (旧 5µs)。
-const LOCK_NS: i64 = 1_000;
-const LOCK_HOLD: u32 = 5;
-/// 外れ値除去 (smart-friend 助言): ロック中にこの幅を超える位相は弱信号の不正 PPS/取りこぼし = 単発 garbage
-/// とみなし最大 OUTLIER_MAX 回まで棄却。ロックが ±80ns になったので **3µs に下げ**、弱信号スパイク (4-10µs,
-/// 旧 50µs 閾値の下) が trim を蹴るのを防ぐ。それ以上続けば本物の擾乱として再ロック。
-const OUTLIER_NS: i64 = 3_000;
-const OUTLIER_MAX: u32 = 12;
-/// 位相 I 項 (type-II PLL): ロック中、予測位相を周波数トリムに積分してドループ(定常オフセット)を 0 に。
-/// 固有周期 ≈ 2π√(PHASE_I_DEN) エッジ。減衰 ζ ≈ Kp/(2√Ki) = (1/8)/(2/√128) ≈ 0.71 (Smith 予測子で遅延
-/// 補償済なので公式が成立)。Kp=1/8 + Smith + deadband=0 + 外れ値3µs で **実測 σ~35ns, mean~0** (NOTES)。
-const PHASE_I_DEN: i64 = 128;
-const PPB_TRIM_MAX: i64 = 3_000;
-/// D 項 (微分) ゲイン分母。d_corr = (ctrl − last_ctrl)/PHASE_D_DEN [ns]。位相速度に比例し振動を減衰。
-const PHASE_D_DEN: i64 = 4;
+// 位相ループの gains は gnssdo の PhaseLockLoopConfig::DEFAULT に移動した (σ≈35ns 実測チューニング)。
 /// 制御項の実験モード: true で **P→PI→PID を ~120 エッジ毎に巡回**し各項の効果を観察 (cfg を PPSGEN に出力)。
 /// false で本番 = 常時 PID。
 const PHASE_EXPERIMENT: bool = false;
@@ -166,6 +148,17 @@ fn signed_mod(x: i64, m: i64) -> i64 {
         r + m
     } else {
         r
+    }
+}
+
+/// 実験 harness の cfg (0-4) を PhaseLockLoop の LoopMode へ。本番は 4=PidSmith。
+fn cfg_to_mode(cfg: u32) -> LoopMode {
+    match cfg {
+        0 => LoopMode::P,
+        1 => LoopMode::Pd,
+        2 => LoopMode::Pi,
+        3 => LoopMode::Pid,
+        _ => LoopMode::PidSmith,
     }
 }
 
@@ -312,13 +305,9 @@ async fn gen_capture_task(
     let mut last_x: Option<u32> = None;
     let mut count: u32 = 0;
     let mut last_gen: u32 = 0;
-    let mut lock_cnt: u32 = 0; // 連続で位相が小さかったエッジ数 (≥LOCK_HOLD でロック)
-    let mut reject_cnt: u32 = 0; // 連続で外れ値棄却したエッジ数
-    let mut ppb_trim: i64 = 0; // 位相 I 項 → 周波数トリム。**milli-ppb 単位** (高分解能。整数 ppb だと
-                               // ctrl/DEN の truncate で deadzone、周期も 8ppb 量子化でリミットサイクルした)。
-    let mut frac_acc: i64 = 0; // 周期の小数端数 (sigma-delta dither, ×1e12 スケール)。sub-cycle 周波数分解能。
-    let mut last_ctrl: i64 = 0; // 前エッジの予測位相 (D 項の微分用)
-    let mut last_pd: i64 = 0; // 前エッジの P+D 補正 (Smith 予測の在飛行分。d≈2 なので 1 エッジ分)
+    // 出力位相 PLL (制御=gnssdo) と sub-cycle period 生成 (I/O=rp-pps)。gains は PhaseLockLoopConfig。
+    let mut pll = PhaseLockLoop::new();
+    let mut dither = rp_pps::OutputPeriodDither::new();
     loop {
         let x = sm.rx().wait_pull().await; // x = 出力エッジの生カウンタ (C2_out)
         // GPS PPS の世代。前回の出力エッジから進んでいなければ GPS 欠落 → C0_GPS が古い → 補正に使わない
@@ -349,62 +338,21 @@ async fn gen_capture_task(
         } else {
             CTRL_SEL // 本番=4(PID+Smith)。0-3 で単一構成に固定キャプチャ (compare 用の公平比較)
         };
-        let use_i = matches!(cfg, 2 | 3 | 4);
-        let use_d = matches!(cfg, 1 | 3 | 4);
-        let use_smith = cfg == 4;
-        // **Smith 予測子**: 在飛行中(前エッジに出した、まだ位相に現れてない) P/D 補正を引いた予測位相 pred で
-        // 制御 → ループ遅れ d≈2 を補償し ζ 公式が成立。Smith 無しの構成では生の ctrl を使う。
-        let pred = if use_smith { ctrl - last_pd } else { ctrl };
-        // valid = この位相サンプルが信用できるか (GPS 新鮮 + 間隔健全)。
+        pll.set_mode(cfg_to_mode(cfg));
+        // valid = この位相サンプルが信用できるか (GPS 新鮮 + 間隔健全)。!valid は holdover ホールド。
         let valid = fresh && sane && c0 != 0;
-        let mut p_corr: i64 = 0; // 位相 P 項 (ns)。速い過渡を吸収。
-        let mut d_corr: i64 = 0; // 位相 D 項 (ns)。位相速度に比例し振動を減衰。
-        if valid {
-            let locked = lock_cnt >= LOCK_HOLD;
-            if locked && ctrl.abs() > OUTLIER_NS && reject_cnt < OUTLIER_MAX {
-                reject_cnt += 1; // ロック中の単発 garbage → 補正せずホールド (出力を飛ばさない)
-            } else {
-                reject_cnt = 0;
-                // I 項: ロック中、予測位相を周波数トリム(milli-ppb)に積分 → ドループを 0 に。P 実験は 0。
-                if use_i {
-                    if locked {
-                        ppb_trim = (ppb_trim - pred * 1000 / PHASE_I_DEN)
-                            .clamp(-PPB_TRIM_MAX * 1000, PPB_TRIM_MAX * 1000);
-                    }
-                } else {
-                    ppb_trim = 0;
-                }
-                // P 項: 予測位相に比例。**Smith あり=Kp 1/8 (ζ≈0.71, 遅延補償済なので公式成立)**、
-                // Smith 無し=1/16 (1/8 はループ遅れで不安定/発振)。= Smith が高ゲインを可能にしている。
-                let kp_inv = if use_smith { 8 } else { 16 };
-                if pred.abs() > PHASE_DEADBAND_NS {
-                    p_corr = (pred / kp_inv).clamp(-100_000_000, 100_000_000);
-                }
-                // D 項: 予測位相の速度に比例し振動を減衰。
-                if use_d && locked {
-                    d_corr = ((pred - last_ctrl) / PHASE_D_DEN).clamp(-100_000_000, 100_000_000);
-                }
-                lock_cnt = if ctrl.abs() < LOCK_NS { (lock_cnt + 1).min(LOCK_HOLD) } else { 0 };
-            }
-        } // !valid (GPS 欠落等) は freq+I のみで自走 (holdover ホールド)、lock 状態は据え置き
-        last_ctrl = pred;
-        last_pd = p_corr + d_corr;
-        // 周期 = clk − overhead + 周波数調整(整数 cycle) − P − D。**周波数調整を sigma-delta で小数 dither**:
-        // clk*(ppb + ppb_trim/1000)/1e9 を ×1e12 スケールで累積し整数 cycle を切り出す。これで周期が
-        // 1 clk cycle(=8ppb) 量子化に制約されず sub-8ppb 分解能になり、I 項が正確な周波数に整定=リミットサイクル消滅。
-        frac_acc += clk * (ppb * 1000 + ppb_trim);
-        let freq_cycles = frac_acc.div_euclid(1_000_000_000_000);
-        frac_acc = frac_acc.rem_euclid(1_000_000_000_000);
-        let period = clk - rp_pps::OUTPUT_OVERHEAD_CYCLES as i64 + freq_cycles
-            - (p_corr + d_corr) * clk / 1_000_000_000;
-        let _ = output.set_period(period as u32);
+        let u = pll.update(ctrl, valid);
+        // 周波数 = 水晶推定(ppb) + PLL の I トリム(milli-ppb)。位相補正は dither が cycle に変換して引く。
+        let freq_mppb = ppb * 1000 + u.freq_trim_mppb;
+        let period = dither.next_period(clk as u32, freq_mppb, u.phase_corr_ns);
+        let _ = output.set_period(period);
         if let Some(iv) = interval_ns {
             count += 1;
             // 制御信号を全部出力 → ホストでプラント同定 + ゲイン掃引シミュ + 項別比較ができる。
             // (互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残し、cfg/trim/p/d を追記)
             info!(
                 "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cfg={} p_ns={} d_ns={}",
-                count, iv, iv - 1_000_000_000, phase.unwrap_or(0), hwphase_ns, ppb_trim / 1000, cfg, p_corr, d_corr
+                count, iv, iv - 1_000_000_000, phase.unwrap_or(0), hwphase_ns, u.freq_trim_mppb / 1000, cfg, u.p_corr_ns, u.d_corr_ns
             );
         }
         last_x = Some(x);
