@@ -32,8 +32,16 @@ pub struct SyncReport {
     pub freq_ppb: i64,
 }
 
-/// PPS edge + NMEA time → disciplined UTC. The all-in-one easy tier over [`gnssdo::Gnssdo`] +
-/// [`PpsTimeSync`](crate::PpsTimeSync). See the [module docs](self).
+/// PPS edge + NMEA time → disciplined UTC: the all-in-one easy tier bundling [`gnssdo::Gnssdo`]
+/// (frequency discipline + holdover) with the PPS↔NMEA epoch pairing
+/// ([`PpsTimeSync`](crate::PpsTimeSync)) and the residual diagnostics, behind one object.
+///
+/// It does **not** own the capture/output I/O or any executor: the caller keeps the capture (e.g.
+/// `TimedPpsCapture`, so the raw counter stays available for a loopback phase measurement) and the
+/// timebases, and drives this from its own tasks — typically [`on_pps_edge`](Self::on_pps_edge) from
+/// a PPS task and [`feed_nmea`](Self::feed_nmea) from the UART task, behind a mutex. Logging,
+/// receiver config and pin/SM assignment stay the caller's. See the `gpsdo` (drive by hand) and
+/// `gpsdo_runner` (runner tasks) examples.
 #[derive(Debug, Default)]
 pub struct PpsGpsdo {
     clock: Gnssdo,

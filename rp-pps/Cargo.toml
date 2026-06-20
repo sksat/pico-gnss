@@ -6,11 +6,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
 keywords = ["pps", "pio", "rp2040", "gnss", "nmea"]
 categories = ["embedded", "no-std", "hardware-support"]
 
 [lib]
 name = "rp_pps"
+
+# docs.rs: build the embassy-rp backend (selecting the rp2040 chip) + the gnssdo bundle on the ARM
+# target, so the capture/output/runner/PpsGpsdo APIs are all documented. The rp2040-hal backend is
+# not built here (one backend per docs build); read its source for that variant.
+[package.metadata.docs.rs]
+features = ["embassy-rp", "embassy-rp/rp2040", "gnssdo", "external-nmea"]
+default-target = "thumbv6m-none-eabi"
 
 [features]
 default = []
@@ -43,8 +51,9 @@ rp2040-hal = { version = "0.12", optional = true, default-features = false }
 nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }
 # Used by `external-nmea` to read fields from the nmea crate's chrono date/time types.
 chrono = { version = "0.4", default-features = false, optional = true }
-# The discipline core, bundled by the `gnssdo` feature into `PpsGpsdo`.
-gnssdo = { path = "../gnssdo", optional = true }
+# The discipline core, bundled by the `gnssdo` feature into `PpsGpsdo`. `version` is required for
+# publishing (rp-pps resolves it from crates.io; publish gnssdo first).
+gnssdo = { path = "../gnssdo", version = "0.1.0", optional = true }
 # Used by the embassy-rp runner tasks (run_capture / run_nmea): the shared-state mutex and the
 # UART read trait. Versions pinned to embassy-rp 0.10's (so the firmware's types unify).
 embassy-sync = { version = "0.7.2", optional = true }
