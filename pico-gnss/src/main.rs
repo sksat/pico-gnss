@@ -73,9 +73,6 @@ bind_interrupts!(struct Irqs {
 /// AE-GNSS-EXTANT (GYSFFMANC) のデフォルトボーレート 9600。
 const GNSS_BAUD: u32 = 9600;
 
-/// PIO 自走カウンタの 1 tick = 2 サイクル。
-const PIO_CYCLES_PER_TICK: u64 = 2;
-
 /// 運用モード = 受信機の dynamic model (MT3333 PMTK886)。
 /// **この GPSDO は固定 timing 用途**なので既定は `FixedTiming` (stationary)。受信機に
 /// 「動いていない」という強い事前情報を渡すと、弱信号での位置/速度の暴れと PPS 選別への悪影響が
@@ -136,20 +133,6 @@ const CTRL_SEL: u32 = 4;
 static C0_GPS: AtomicU32 = AtomicU32::new(0);
 /// GPS PPS エッジの世代カウンタ。出力エッジ間に進んでいなければ GPS 欠落 = C0_GPS は古い → 補正に使わない。
 static C0_GEN: AtomicU32 = AtomicU32::new(0);
-/// 1 秒のPIO tick 数 (= clk_sys / PIO_CYCLES_PER_TICK)。位相を mod 1秒する用。
-const TICKS_PER_SEC: i64 = 62_500_000; // 125MHz / 2
-
-/// x を ±m/2 に正規化 (mod m で中心化)。位相を ±0.5秒に畳む用。
-fn signed_mod(x: i64, m: i64) -> i64 {
-    let r = x % m;
-    if r > m / 2 {
-        r - m
-    } else if r < -m / 2 {
-        r + m
-    } else {
-        r
-    }
-}
 
 /// 実験 harness の cfg (0-4) を PhaseLockLoop の LoopMode へ。本番は 4=PidSmith。
 fn cfg_to_mode(cfg: u32) -> LoopMode {
@@ -300,8 +283,7 @@ async fn gen_capture_task(
     mut sm: StateMachine<'static, PIO0, 2>,
     k: u32, // stage② 較正済みカウンタオフセット (C0−C2)
 ) {
-    let clk = clk_sys_freq() as i64;
-    let ns_per_tick: i64 = PIO_CYCLES_PER_TICK as i64 * 1_000_000_000 / clk;
+    let clk = clk_sys_freq();
     let mut last_x: Option<u32> = None;
     let mut count: u32 = 0;
     let mut last_gen: u32 = 0;
@@ -316,13 +298,12 @@ async fn gen_capture_task(
         let fresh = cur_gen != last_gen;
         last_gen = cur_gen;
         // 出力周期。PIO ~68s 周回グリッチの偽エッジは間隔が異常 → 位相補正に使わない。
-        let interval_ns = last_x.map(|lx| lx.wrapping_sub(x) as i64 * ns_per_tick);
+        let interval_ns = last_x.map(|lx| rp_pps::interval_ns(lx, x, clk) as i64);
         let sane = interval_ns.is_some_and(|iv| (iv - 1_000_000_000).abs() < 300_000_000);
         // stage② PIO ハード位相: 出力エッジ と 最新 GPS エッジ の生カウンタ差 (mod 1秒) を ns に。
         // Instant を介さないので executor のウェイクアップ遅延 (~ms) に汚されず 16ns 分解能。
         let c0 = C0_GPS.load(Ordering::Relaxed);
-        let elapsed = c0.wrapping_sub(x).wrapping_sub(k) as i32 as i64; // GPS→出力 の経過 tick
-        let hwphase_ns = signed_mod(elapsed, TICKS_PER_SEC) * ns_per_tick;
+        let hwphase_ns = rp_pps::loopback_phase_ns(c0, x, k, clk);
         // 旧手法 (比較用 emit のみ): 出力エッジの UTC 時刻 (Instant 経由) → 秒境界からのズレ。
         let (ppb, phase) = CLOCK.lock(|c| {
             let c = c.borrow();
@@ -344,7 +325,7 @@ async fn gen_capture_task(
         let u = pll.update(ctrl, valid);
         // 周波数 = 水晶推定(ppb) + PLL の I トリム(milli-ppb)。位相補正は dither が cycle に変換して引く。
         let freq_mppb = ppb * 1000 + u.freq_trim_mppb;
-        let period = dither.next_period(clk as u32, freq_mppb, u.phase_corr_ns);
+        let period = dither.next_period(clk, freq_mppb, u.phase_corr_ns);
         let _ = output.set_period(period);
         if let Some(iv) = interval_ns {
             count += 1;
@@ -379,33 +360,34 @@ async fn main(spawner: Spawner) {
     cfg_gp2.set_jmp_pin(capture.jmp_pin()); // SM0 と同じ GP2 を捕捉
     sm2.set_config(&cfg_gp2);
     sm2.set_enable(true);
-    let mut k: u32 = 0;
-    {
-        let (mut ksum, mut kn): (i64, i64) = (0, 0);
-        for i in 0..7u32 {
-            // PPS は fix 後のみ出る。各エッジ最大 30s 待ち、出なければ較正打ち切り (hw 位相無効)。
-            match with_timeout(Duration::from_secs(30), async {
-                let c0 = capture.wait_edge().await;
-                let c2 = sm2.rx().wait_pull().await;
-                (c0, c2)
-            })
-            .await
-            {
-                Ok((c0, c2)) if i >= 2 => {
-                    ksum += c0.wrapping_sub(c2) as i32 as i64;
-                    kn += 1;
-                }
-                Ok(_) => {}
-                Err(_) => break,
+    // SM0 と SM2 で同じ GP2 エッジを捕り、生カウンタ差 K=mean(C0−C2) を rp-pps で較正。
+    // 先頭 2 エッジは捨てる。PPS は fix 後のみ出るので各 30s 待ち、出なければ打ち切り。
+    let mut k_samples: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
+    for i in 0..7u32 {
+        match with_timeout(Duration::from_secs(30), async {
+            let c0 = capture.wait_edge().await;
+            let c2 = sm2.rx().wait_pull().await;
+            (c0, c2)
+        })
+        .await
+        {
+            Ok(pair) if i >= 2 => {
+                let _ = k_samples.push(pair);
             }
-        }
-        if kn > 0 {
-            k = (ksum / kn) as i32 as u32;
-            info!("PHASE_K calibrated k={} (n={})", k as i32, kn);
-        } else {
-            warn!("PHASE_K calibration failed (no PPS)");
+            Ok(_) => {}
+            Err(_) => break,
         }
     }
+    let k = match rp_pps::calibrate_loopback_offset(k_samples.iter().copied()) {
+        Some(k) => {
+            info!("PHASE_K calibrated k={} (n={})", k as i32, k_samples.len());
+            k
+        }
+        None => {
+            warn!("PHASE_K calibration failed (no PPS)");
+            0
+        }
+    };
 
     // SM2 を GP4 (ループバック) に切替。set_config は X を触らないので K は有効のまま。
     let mut cfg_gp4 = PioConfig::default();
