@@ -30,8 +30,7 @@ signal is lost.
 # Core library — runs on the host, no hardware needed:
 cargo test -p gnssdo
 
-# Firmware — needs a probe-rs-compatible probe + RP2040 and the embedded target:
-rustup target add thumbv6m-none-eabi
+# Firmware — needs a probe-rs-compatible probe + RP2040:
 cd pico-gnss && cargo run --release       # builds, flashes, streams defmt logs
 ```
 

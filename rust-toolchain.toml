@@ -1,0 +1,7 @@
+# Pinned everyday toolchain (reproducible builds). The MSRV floor is separate:
+# it lives in [workspace.package].rust-version (Cargo.toml) and is checked in CI.
+# Renovate bumps `channel` here via the customManager in .github/renovate.json.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["thumbv6m-none-eabi"]

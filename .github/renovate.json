@@ -1,4 +1,14 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>sksat/renovate-config"]
+  "extends": ["github>sksat/renovate-config"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)rust-toolchain\\.toml$/"],
+      "matchStrings": ["channel\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
+      "depNameTemplate": "rust",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "semver"
+    }
+  ]
 }

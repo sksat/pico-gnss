@@ -29,8 +29,7 @@ GNSS 受信機の 1Hz PPS 立ち上がりは UTC 秒境界を刻みます。本�
 # コアライブラリ — ハード不要で host 上で動く:
 cargo test -p gnssdo
 
-# firmware — probe-rs 対応プローブ + RP2040 と embedded ターゲットが必要:
-rustup target add thumbv6m-none-eabi
+# firmware — probe-rs 対応プローブ + RP2040 が必要:
 cd pico-gnss && cargo run --release       # build → flash → defmt ログを表示
 ```
 
