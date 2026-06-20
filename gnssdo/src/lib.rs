@@ -41,11 +41,13 @@
 
 mod assembler;
 mod gpsdo;
+mod pll;
 mod pps;
 mod timesync;
 
 pub use assembler::{MAX_SENTENCE_LEN, NmeaLineAssembler};
 pub use gpsdo::{DisciplinedClock, DisciplinedClockConfig, FreqUpdate, snap_to_second_ns};
+pub use pll::{LoopMode, PhaseLockLoop, PhaseLockLoopConfig, PhaseLockLoopUpdate};
 pub use pps::{NOMINAL_US, PpsEvent, PpsTracker, PpsTrackerConfig, TOLERANCE_US};
 pub use timesync::{
     PpsNmeaAssociation, PpsTimeSync, RmcTimeDate, SyncPoint, civil_to_unix, days_from_civil,
