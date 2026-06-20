@@ -25,6 +25,9 @@ rp2040-hal = ["dep:rp2040-hal"]
 # Negligible at 1 Hz. Behaviour also differs: the nmea crate validates the checksum and uses a
 # century pivot for the year (yy=94 -> 1994); the built-in parser skips the checksum and assumes 20xx.
 external-nmea = ["dep:nmea", "dep:chrono"]
+# Bundle the `gnssdo` discipline core into a turn-key `PpsGpsdo` (PPS edge + NMEA -> disciplined UTC).
+# Off by default so the I/O building blocks stay usable without pulling the discipline core.
+gnssdo = ["dep:gnssdo"]
 
 [dependencies]
 # The PIO program is built HAL-agnostically here (via `pio::pio_asm!`, NOT a HAL's
@@ -38,3 +41,5 @@ rp2040-hal = { version = "0.12", optional = true, default-features = false }
 nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }
 # Used by `external-nmea` to read fields from the nmea crate's chrono date/time types.
 chrono = { version = "0.4", default-features = false, optional = true }
+# The discipline core, bundled by the `gnssdo` feature into `PpsGpsdo`.
+gnssdo = { path = "../gnssdo", optional = true }

@@ -52,6 +52,12 @@ pub use timesync::{
     parse_ddmmyy, parse_hhmmss, parse_rmc_time_date,
 };
 
+/// Turn-key GPSDO state bundle (PPS edge + NMEA → disciplined UTC). Enable with the `gnssdo` feature.
+#[cfg(feature = "gnssdo")]
+mod gpsdo;
+#[cfg(feature = "gnssdo")]
+pub use gpsdo::{PpsGpsdo, SyncReport};
+
 /// One capture tick = 2 PIO clock cycles: [`pps_capture_program`] advances its free-running
 /// counter once per 2 cycles (`jmp x--` in a 2-cycle loop), so at 125 MHz one tick is 16 ns.
 /// This is a property of the program; the tests assert the program shape that guarantees it.

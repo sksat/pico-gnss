@@ -41,15 +41,14 @@ use embassy_rp::pio::{
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::Read;
 use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
-use gnssdo::{Gnssdo, LoopMode, PhaseLockLoop, PpsEvent, snap_to_second_ns};
+use gnssdo::{LoopMode, PhaseLockLoop, PpsEvent, snap_to_second_ns};
 use rp_pps::embassy::{SteeredPpsOutput, TimedPpsCapture};
-use rp_pps::{NmeaLineAssembler, PpsSteer, PpsTimeSync, parse_rmc_time_date};
+use rp_pps::{NmeaLineAssembler, PpsGpsdo, PpsSteer};
 
 /// 受信機固有レイヤ (MT3333/GYSFFMANC の PMTK 設定・ボーレート)。別受信機ならここだけ差し替え。
 mod mt3333;
@@ -59,14 +58,11 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
 });
 
-/// PPS エッジの (PIO ns 時刻, Instant ns 時刻) を pps_task → main へ渡す。
-/// PIO 時刻は ns 精度 (err/エポック計算用)、Instant は連続クエリ (ticker/holdover) のアンカー用。
-static PPS_TS: Signal<CriticalSectionRawMutex, (u64, u64)> = Signal::new();
-
-/// GPSDO の規律状態 (gnssdo の easy tier)。pps_task が周波数を、main が UTC エポックを更新し、
-/// time_task が読む。PPS 分類 + Locked のみ規律 + 復帰 quarantine の policy は Gnssdo::on_pps が内包。
-static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<Gnssdo>> =
-    BlockingMutex::new(RefCell::new(Gnssdo::new()));
+/// GPSDO 状態 (rp-pps の turn-key state bundle = gnssdo 規律 + PPS↔NMEA 対応付け)。pps_task が
+/// `on_pps_edge` で周波数規律 + エッジ記録、main が `feed_nmea` で UTC エポック確定、time_task が読む。
+/// 分類/Locked のみ規律/復帰 quarantine、NMEA ペアリングと fresh-once、残差診断は PpsGpsdo が内包する。
+static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<PpsGpsdo>> =
+    BlockingMutex::new(RefCell::new(PpsGpsdo::new()));
 
 /// 位相制御の測定源。true=PIO ハード位相 (stage②, 本番)。false=旧 Instant 測定 (比較計測用)。
 const PHASE_USE_HW: bool = true;
@@ -120,18 +116,12 @@ async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
         C0_GPS.store(edge.raw, Ordering::Relaxed); // stage②: 最新 GPS エッジの生カウンタを共有
         C0_GEN.fetch_add(1, Ordering::Relaxed); // 世代++ (gen_capture が欠落検出に使う)
         // エポックのアンカー用に Instant を読む (µs ジッタは絶対オフセットのみに効く)。
-        let inst_ns = now_local_ns();
+        let query_ns = now_local_ns();
 
-        // PIO の ns 精度時刻 (edge_ns) と Instant を main へ。err/エポックは edge_ns 基準で ns 精度。
-        PPS_TS.signal((edge.edge_ns, inst_ns));
-
-        // 品質判定 → Locked のみ周波数規律 → holdover/Irregular からの復帰時 quarantine、の policy は
-        // gnssdo easy tier (Gnssdo::on_pps) に集約済み。ここは I/O と log だけ (薄い)。
+        // 周波数規律 (Locked のみ・復帰 quarantine) + 次の RMC 用にエッジ記録を PpsGpsdo に委譲。
+        // PPS_TS signal は不要に: エッジは共有 state に記録され、main の feed_nmea が拾う。ここは log だけ。
         count += 1;
-        let step = CLOCK.lock(|g| {
-            g.borrow_mut()
-                .on_pps(edge.edge_ns / 1000, edge.interval_ns as i64)
-        });
+        let step = CLOCK.lock(|g| g.borrow_mut().on_pps_edge(edge, query_ns));
         let (state, missed): (&str, u32) = match step.event {
             PpsEvent::First => ("First", 0),
             PpsEvent::Locked { .. } => ("Locked", 0),
@@ -353,9 +343,6 @@ async fn main(spawner: Spawner) {
 
     let mut assembler = NmeaLineAssembler::new();
     let mut read_buf = [0u8; 64];
-    // RMC 時刻と直近 PPS エッジ (capture=PIO ns, query=Instant ns) を対応付けて epoch を作る (rp-pps)。
-    let mut timesync = PpsTimeSync::new();
-
     loop {
         let n = match rx.read(&mut read_buf).await {
             Ok(n) => n,
@@ -364,11 +351,6 @@ async fn main(spawner: Spawner) {
             // (assembler は次の '$' で再同期する)。
             Err(_) => continue,
         };
-
-        // PIO がラッチした最新 PPS エッジ (capture=PIO ns, query=Instant ns) を timesync に渡す。
-        if let Some((capture_ns, query_ns)) = PPS_TS.try_take() {
-            timesync.on_pps_edge(capture_ns, query_ns);
-        }
 
         for &b in &read_buf[..n] {
             let Some(sentence) = assembler.push(b) else {
@@ -384,42 +366,19 @@ async fn main(spawner: Spawner) {
                 info!("FW {=str}", s);
             }
 
-            // RMC (日付+時刻) と直近 PPS エッジを対応付けて UTC エポックを固定する (対応付けは rp-pps の
-            // PpsTimeSync)。on_time は fresh なエッジを 1 回だけ消費するので、PPS 欠落中に stale エッジを
-            // 同じ秒に何度もペアして err が ±整数秒の偽値になることはない。
-            if let Some(((h, mi, se), (d, mo, y))) = parse_rmc_time_date(s) {
-                timesync.set_date(y, mo, d);
-                if let Some(epoch) = timesync.on_time(h, mi, se) {
-                    let target = epoch.unix_ns;
-                    let (ppb, err_ns, fire_ns, hold_ms) = CLOCK.lock(|g| {
-                        let mut g = g.borrow_mut();
-                        // 補正後の時刻精度 (予測残差) と fire_at_utc の逆予測残差 = GPSDO 自己診断。
-                        // どちらも更新前クロックで計算し、複数秒 holdover の整数秒ズレは snap で除く (gnssdo)。
-                        // 残差は fine 層 (DisciplinedClock) の API なので clock() で抜ける。
-                        let err = g
-                            .clock()
-                            .prediction_residual_ns(epoch.capture_ns, target)
-                            .unwrap_or(0);
-                        let fire = g
-                            .clock()
-                            .fire_residual_ns(epoch.capture_ns, target)
-                            .unwrap_or(0);
-                        // この sync が前回 sync から何 ms 経っているか (= この err が何秒 holdover の誤差か)。
-                        let hold = (g.holdover_ns(epoch.query_ns) / 1_000_000) as u32;
-                        g.on_utc(epoch.capture_ns, epoch.query_ns, target);
-                        (g.freq_ppb(), err, fire, hold)
-                    });
-                    // SYNC: err_ns=補正後の予測残差 (timestamp 側)、fire_ns=逆予測残差 (fire_at_utc 側)、holdover_ms=err の holdover 経過。
-                    info!(
-                        "SYNC pps_local_us={} unix_s={} drift_us={} err_ns={} fire_ns={} holdover_ms={}",
-                        epoch.capture_ns / 1000,
-                        target / 1_000_000_000,
-                        ppb / 1000,
-                        err_ns,
-                        fire_ns,
-                        hold_ms
-                    );
-                }
+            // RMC を直近 PPS エッジ (pps_task が on_pps_edge で記録済み) と対応付けて UTC エポックを確定。
+            // パース・fresh-once・残差診断は PpsGpsdo::feed_nmea が内包 (None=非RMC/fresh エッジ無し)。
+            if let Some(r) = CLOCK.lock(|g| g.borrow_mut().feed_nmea(s)) {
+                // SYNC: err_ns=補正後の予測残差 (timestamp 側)、fire_ns=逆予測残差 (fire_at_utc 側)、holdover_ms=err の holdover 経過。
+                info!(
+                    "SYNC pps_local_us={} unix_s={} drift_us={} err_ns={} fire_ns={} holdover_ms={}",
+                    r.capture_ns / 1000,
+                    r.unix_ns / 1_000_000_000,
+                    r.freq_ppb / 1000,
+                    r.err_ns,
+                    r.fire_ns,
+                    (r.holdover_ns / 1_000_000) as u32
+                );
             }
         }
     }
