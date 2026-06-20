@@ -47,6 +47,12 @@ impl<'d, PIO: Instance, const SM: usize> PpsCapture<'d, PIO, SM> {
         self.sm.rx().wait_pull().await
     }
 
+    /// Non-blocking read of the raw down-counter value at the latest captured edge, if any (the
+    /// HAL-generic equivalent is [`crate::PpsCaptureRead::try_read`]).
+    pub fn try_read(&mut self) -> Option<u32> {
+        self.sm.rx().try_pull()
+    }
+
     /// The pin routed as this SM's `jmp` pin (the captured PPS input). Exposed so another state
     /// machine can watch the same physical pin — embassy-rp's `Config::set_jmp_pin` needs the
     /// `&Pin`, and a given pin can only be made once. (Used e.g. by a loopback measurement that
@@ -89,6 +95,18 @@ impl<'d, PIO: Instance, const SM: usize> PpsOutput<'d, PIO, SM> {
     /// Commit the next period word (the program holds the previous one until then). Returns `false`
     /// if the TX FIFO was full. Compute it with [`crate::output_period_cycles_ppb`].
     pub fn set_period(&mut self, period_word: u32) -> bool {
+        self.sm.tx().try_push(period_word)
+    }
+}
+
+impl<'d, PIO: Instance, const SM: usize> crate::PpsCaptureRead for PpsCapture<'d, PIO, SM> {
+    fn try_read(&mut self) -> Option<u32> {
+        self.sm.rx().try_pull()
+    }
+}
+
+impl<'d, PIO: Instance, const SM: usize> crate::PpsPeriodSet for PpsOutput<'d, PIO, SM> {
+    fn set_period(&mut self, period_word: u32) -> bool {
         self.sm.tx().try_push(period_word)
     }
 }

@@ -39,9 +39,10 @@ impl<P: PIOExt, SM: StateMachineIndex> PpsCapture<P, SM> {
         Self { sm: sm.start(), rx }
     }
 
-    /// Non-blocking read of the raw down-counter value at the latest captured edge, if any.
-    /// Feed consecutive values to [`crate::interval_ns`] / [`crate::interval_ticks`].
-    pub fn read(&mut self) -> Option<u32> {
+    /// Non-blocking read of the raw down-counter value at the latest captured edge, if any. Feed
+    /// consecutive values to [`crate::interval_ns`] / [`crate::interval_ticks`] (the HAL-generic
+    /// equivalent is [`crate::PpsCaptureRead::try_read`]).
+    pub fn try_read(&mut self) -> Option<u32> {
         self.rx.read()
     }
 }
@@ -80,6 +81,18 @@ impl<P: PIOExt, SM: StateMachineIndex> PpsOutput<P, SM> {
     /// Commit the next period word (the program holds the previous one until this is read).
     /// Returns `false` if the TX FIFO was full. Compute it with [`crate::output_period_cycles_ppb`].
     pub fn set_period(&mut self, period_word: u32) -> bool {
+        self.tx.write(period_word)
+    }
+}
+
+impl<P: PIOExt, SM: StateMachineIndex> crate::PpsCaptureRead for PpsCapture<P, SM> {
+    fn try_read(&mut self) -> Option<u32> {
+        self.rx.read()
+    }
+}
+
+impl<P: PIOExt, SM: StateMachineIndex> crate::PpsPeriodSet for PpsOutput<P, SM> {
+    fn set_period(&mut self, period_word: u32) -> bool {
         self.tx.write(period_word)
     }
 }

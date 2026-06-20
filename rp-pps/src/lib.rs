@@ -142,6 +142,23 @@ pub fn output_period_cycles_ppb(clk_hz: u32, ppb: i64) -> u32 {
     (clk - OUTPUT_OVERHEAD_CYCLES as i64 + adj) as u32
 }
 
+/// Non-blocking capture read, shared across backends (the PIO RX-FIFO contract) so a control loop
+/// can be written generic over the HAL. The `embassy` backend additionally offers an `async`
+/// `wait_edge()`, intentionally not part of this trait — async and blocking don't share one method
+/// cleanly, and forcing them into one would make the trait larger than it honestly is.
+pub trait PpsCaptureRead {
+    /// The raw down-counter value at the latest captured edge, or `None` if none since the last
+    /// read. Feed consecutive values to [`interval_ns`].
+    fn try_read(&mut self) -> Option<u32>;
+}
+
+/// Commit 1PPS output period words, shared across backends (the PIO TX-FIFO contract).
+pub trait PpsPeriodSet {
+    /// Push the next period word; returns `false` if the TX FIFO was full. Compute the word with
+    /// [`output_period_cycles`] / [`output_period_cycles_ppb`].
+    fn set_period(&mut self, period_word: u32) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
