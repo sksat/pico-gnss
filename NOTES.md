@@ -19,8 +19,8 @@ GYSFFMANC ──NMEA(UART0 RX=GP1)──┐
   - `PPS count=<n> interval_us=<us> state=<First|Locked|Irregular> missed=<m>`
   - `SYNC pps_local_us=<t> unix_s=<s> drift_us=<d>`
 - **host テスト可能なロジックを `gnssdo` コア crate に分離** (Cargo workspace。`gnssdo/` = 依存ゼロの
-  no_std lib、`firmware/` = embedded 専用)。コアは `cargo test -p gnssdo` で host 実行。firmware は
-  `cd firmware && cargo run`。GPSDO 規律=`gnssdo/src/gpsdo.rs`、PPS=`pps.rs`、時刻同期=`timesync.rs`、
+  no_std lib、`pico-gnss/` = embedded 専用)。コアは `cargo test -p gnssdo` で host 実行。firmware は
+  `cd pico-gnss && cargo run`。GPSDO 規律=`gnssdo/src/gpsdo.rs`、PPS=`pps.rs`、時刻同期=`timesync.rs`、
   NMEA フレーミング=`assembler.rs`。
 - webapp は **React 19 + Vite + TypeScript + react-leaflet**、Node ブリッジは依存ゼロ。
 

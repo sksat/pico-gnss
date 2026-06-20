@@ -23,8 +23,8 @@ jobs:
       - run: cargo test -p gnssdo
       - run: cargo test -p gnssdo --all-features
 
-  firmware:
-    name: firmware (thumbv6m-none-eabi)
+  pico-gnss:
+    name: pico-gnss (thumbv6m-none-eabi)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.0
@@ -34,9 +34,9 @@ jobs:
           target: thumbv6m-none-eabi
       # `check` (not build) so CI needs neither flip-link nor a probe.
       - run: cargo check
-        working-directory: firmware
+        working-directory: pico-gnss
       - run: cargo check --all-features
-        working-directory: firmware
+        working-directory: pico-gnss
 
   msrv:
     name: MSRV (gnssdo)

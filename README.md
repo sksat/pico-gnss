@@ -19,7 +19,7 @@ signal is lost.
 | Path | What |
 |---|---|
 | [`gnssdo/`](gnssdo/) | **Core library** ([crate `gnssdo`](gnssdo/README.md)). `no_std`, HAL-agnostic, integer-only, zero-dependency. Frequency (ppb) estimation, holdover, PPS tracking, NMEA/PPS time sync. Host-testable. |
-| [`firmware/`](firmware/) | RP2040 firmware (embassy-rp). PIO hardware PPS capture, clock discipline, disciplined PPS output. Embedded-only; uses `gnssdo`. |
+| [`pico-gnss/`](pico-gnss/) | RP2040 firmware (embassy-rp). PIO hardware PPS capture, clock discipline, disciplined PPS output. Embedded-only; uses `gnssdo`. |
 | [`webapp/`](webapp/) | Real-time dashboard (React 19 + Vite + TypeScript), fed from the firmware's defmt/RTT output via a zero-dependency Node bridge. |
 | [`report/`](report/) | On-hardware evaluation logs and figures. |
 | [`NOTES.md`](NOTES.md) | Design decisions and hard-won gotchas. |
@@ -32,12 +32,12 @@ cargo test -p gnssdo
 
 # Firmware — needs a probe-rs-compatible probe + RP2040 and the embedded target:
 rustup target add thumbv6m-none-eabi
-cd firmware && cargo run --release        # builds, flashes, streams defmt logs
+cd pico-gnss && cargo run --release       # builds, flashes, streams defmt logs
 ```
 
 The workspace's `default-members` is `gnssdo`, so a bare `cargo build`/`cargo test`
 from the root only touches the host-safe core. The firmware is embedded-only and is
-built from within `firmware/` (where its `.cargo/config.toml` selects the
+built from within `pico-gnss/` (where its `.cargo/config.toml` selects the
 `thumbv6m-none-eabi` target and the probe-rs runner).
 
 ## Hardware

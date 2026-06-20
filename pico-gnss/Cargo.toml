@@ -11,7 +11,7 @@ name = "pico-gnss"
 path = "src/main.rs"
 
 # On-target benchmark; not built by a normal build (requires the `bench` feature).
-# On hardware: cd firmware && cargo run --release --features bench --bin bench_nmea_parse
+# On hardware: cd pico-gnss && cargo run --release --features bench --bin bench_nmea_parse
 [[bin]]
 name = "bench_nmea_parse"
 path = "src/bin/bench_nmea_parse.rs"

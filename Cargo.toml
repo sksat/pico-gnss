@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["gnssdo", "firmware"]
+members = ["gnssdo", "pico-gnss"]
 # A bare `cargo build`/`cargo test` only targets the host-safe gnssdo.
-# Build the embedded-only firmware explicitly: cd firmware (or -p pico-gnss --target ...).
+# Build the embedded-only firmware explicitly: cd pico-gnss (or -p pico-gnss --target ...).
 default-members = ["gnssdo"]
 
 [workspace.package]

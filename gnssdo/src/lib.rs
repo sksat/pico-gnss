@@ -13,7 +13,7 @@
 //!
 //! The core does not require an NMEA parser itself ([`PpsTimeSync`] takes already-parsed values),
 //! so you may use any NMEA parser (e.g. the [`nmea`](https://docs.rs/nmea) crate) alongside it.
-//! The RP2040 firmware lives in the sibling `firmware/` crate (embassy-rp) in the same repo.
+//! The RP2040 firmware lives in the sibling `pico-gnss/` crate (embassy-rp) in the same repo.
 //!
 //! `std` is enabled only under test; otherwise `no_std`.
 //!

@@ -18,7 +18,7 @@ GNSS 受信機の 1Hz PPS 立ち上がりは UTC 秒境界を刻みます。本�
 | パス | 内容 |
 |---|---|
 | [`gnssdo/`](gnssdo/) | **コアライブラリ** ([crate `gnssdo`](gnssdo/README.md))。`no_std`・HAL 非依存・整数演算のみ・依存ゼロ。周波数 (ppb) 推定、holdover、PPS 追跡、NMEA/PPS 時刻同期。host テスト可能。 |
-| [`firmware/`](firmware/) | RP2040 firmware (embassy-rp)。PIO ハード PPS 捕捉、クロック規律、規律 PPS 出力。embedded 専用で `gnssdo` を使用。 |
+| [`pico-gnss/`](pico-gnss/) | RP2040 firmware (embassy-rp)。PIO ハード PPS 捕捉、クロック規律、規律 PPS 出力。embedded 専用で `gnssdo` を使用。 |
 | [`webapp/`](webapp/) | リアルタイムダッシュボード (React 19 + Vite + TypeScript)。firmware の defmt/RTT 出力を依存ゼロの Node ブリッジ経由で表示。 |
 | [`report/`](report/) | 実機評価のログと図。 |
 | [`NOTES.md`](NOTES.md) | 設計判断とハマった罠の記録。 |
@@ -31,12 +31,12 @@ cargo test -p gnssdo
 
 # firmware — probe-rs 対応プローブ + RP2040 と embedded ターゲットが必要:
 rustup target add thumbv6m-none-eabi
-cd firmware && cargo run --release        # build → flash → defmt ログを表示
+cd pico-gnss && cargo run --release       # build → flash → defmt ログを表示
 ```
 
 ワークスペースの `default-members` は `gnssdo` なので、ルートでの素の
 `cargo build`/`cargo test` は host 安全なコアだけを対象にします。firmware は
-embedded 専用で、`firmware/`(その `.cargo/config.toml` が `thumbv6m-none-eabi`
+embedded 専用で、`pico-gnss/`(その `.cargo/config.toml` が `thumbv6m-none-eabi`
 ターゲットと probe-rs runner を選ぶ)の中からビルドします。
 
 ## ハードウェア
