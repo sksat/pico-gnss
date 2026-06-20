@@ -205,3 +205,68 @@ impl<'d, PIO: Instance, const SM: usize> crate::PpsPeriodSet for PpsOutput<'d, P
         self.sm.tx().try_push(period_word)
     }
 }
+
+/// Easy-tier runner tasks (`gnssdo` feature): drive a shared [`PpsGpsdo`](crate::PpsGpsdo) from the
+/// capture and the receiver's NMEA, so the app only spawns these and reads disciplined UTC. See the
+/// `gpsdo_runner` example (vs the `gpsdo` example, which calls the `PpsGpsdo` methods by hand).
+#[cfg(feature = "gnssdo")]
+mod runner {
+    use super::{Instance, TimedPpsCapture};
+    use core::cell::RefCell;
+    use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+    use embassy_sync::blocking_mutex::raw::RawMutex;
+    use embedded_io_async::Read;
+
+    /// Run the PPS capture loop, feeding each timed edge (frequency discipline + epoch-pairing
+    /// record) into the shared `clock`. Never returns — spawn it from your own `#[task]`. `query_ns`
+    /// supplies the query-timebase value at each edge (e.g. `|| Instant::now().as_micros() * 1000`).
+    pub async fn run_capture<M, PIO, const SM: usize>(
+        mut capture: TimedPpsCapture<'_, PIO, SM>,
+        clock: &BlockingMutex<M, RefCell<crate::PpsGpsdo>>,
+        query_ns: impl Fn() -> u64,
+    ) -> !
+    where
+        M: RawMutex,
+        PIO: Instance,
+    {
+        loop {
+            let edge = capture.next_edge().await;
+            clock.lock(|g| {
+                g.borrow_mut().on_pps_edge(edge, query_ns());
+            });
+        }
+    }
+
+    /// Run the NMEA ingest loop: read framed sentences from `nmea_rx` and feed each to the shared
+    /// `clock` (an RMC paired with a fresh PPS edge establishes the UTC epoch). Never returns —
+    /// spawn it from your own `#[task]`. Framing is handled internally with
+    /// [`NmeaLineAssembler`](crate::NmeaLineAssembler).
+    pub async fn run_nmea<M, R>(
+        mut nmea_rx: R,
+        clock: &BlockingMutex<M, RefCell<crate::PpsGpsdo>>,
+    ) -> !
+    where
+        M: RawMutex,
+        R: Read,
+    {
+        let mut assembler = crate::NmeaLineAssembler::new();
+        let mut buf = [0u8; 64];
+        loop {
+            let Ok(n) = nmea_rx.read(&mut buf).await else {
+                continue; // framing/overrun is common at start-up; resync on the next '$'
+            };
+            for &b in &buf[..n] {
+                if let Some(sentence) = assembler.push(b) {
+                    if let Ok(s) = core::str::from_utf8(sentence) {
+                        clock.lock(|g| {
+                            g.borrow_mut().feed_nmea(s);
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gnssdo")]
+pub use runner::{run_capture, run_nmea};

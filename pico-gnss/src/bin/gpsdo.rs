@@ -1,12 +1,14 @@
 #![no_std]
 #![no_main]
 
-//! Minimal GPSDO example: **PPS capture + NMEA → disciplined UTC**, using rp-pps's turn-key
-//! [`PpsGpsdo`](rp_pps::PpsGpsdo) state bundle.
+//! Minimal GPSDO example: **PPS capture + NMEA → disciplined UTC**, driving rp-pps's
+//! [`PpsGpsdo`](rp_pps::PpsGpsdo) state bundle **by hand** (its methods, called from the app's own
+//! tasks). The sibling `gpsdo_runner` example does the same with the `run_capture` / `run_nmea`
+//! runner tasks instead; the full firmware [`main`](../pico-gnss) adds loopback phase + disciplined
+//! PPS output on top.
 //!
-//! This is the "easy path": no loopback phase measurement, no disciplined PPS *output*, no receiver
-//! configuration — just feed PPS edges and framed NMEA, then read frequency-disciplined,
-//! holdover-extrapolated UTC. (The full firmware [`main`](../pico-gnss) adds those on top.)
+//! No loopback phase measurement, no disciplined PPS *output*, no receiver configuration — just feed
+//! PPS edges and framed NMEA, then read frequency-disciplined, holdover-extrapolated UTC.
 //!
 //! Wiring: GNSS module NMEA TX → UART0 RX (GP1) @ 9600 baud; module 1PPS → GP2 (PIO capture).
 //!
@@ -86,7 +88,7 @@ async fn time_task() {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    info!("simple_gpsdo: NMEA on UART0/GP1 @ 9600, PPS on GP2 (PIO)");
+    info!("gpsdo: NMEA on UART0/GP1 @ 9600, PPS on GP2 (PIO)");
 
     // PPS capture on PIO0 SM0 (GP2), paired with a timeline → timed edges.
     let Pio {

@@ -58,7 +58,7 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
 });
 
-/// GPSDO 状態 (rp-pps の turn-key state bundle = gnssdo 規律 + PPS↔NMEA 対応付け)。pps_task が
+/// GPSDO 状態 (rp-pps の一体型 state bundle = gnssdo 規律 + PPS↔NMEA 対応付け)。pps_task が
 /// `on_pps_edge` で周波数規律 + エッジ記録、main が `feed_nmea` で UTC エポック確定、time_task が読む。
 /// 分類/Locked のみ規律/復帰 quarantine、NMEA ペアリングと fresh-once、残差診断は PpsGpsdo が内包する。
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<PpsGpsdo>> =

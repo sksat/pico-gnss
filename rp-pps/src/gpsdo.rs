@@ -1,4 +1,4 @@
-//! A turn-key GPSDO state bundle: PPS edge + NMEA time → disciplined UTC (`gnssdo` feature).
+//! An all-in-one GPSDO state bundle: PPS edge + NMEA time → disciplined UTC (`gnssdo` feature).
 //!
 //! [`PpsGpsdo`] bundles the discipline core ([`gnssdo::Gnssdo`]) with the PPS↔NMEA epoch pairing
 //! ([`PpsTimeSync`](crate::PpsTimeSync)) behind one object, so a caller feeds it timed PPS edges and
@@ -32,7 +32,7 @@ pub struct SyncReport {
     pub freq_ppb: i64,
 }
 
-/// PPS edge + NMEA time → disciplined UTC. The turn-key easy tier over [`gnssdo::Gnssdo`] +
+/// PPS edge + NMEA time → disciplined UTC. The all-in-one easy tier over [`gnssdo::Gnssdo`] +
 /// [`PpsTimeSync`](crate::PpsTimeSync). See the [module docs](self).
 #[derive(Debug, Default)]
 pub struct PpsGpsdo {
@@ -55,7 +55,8 @@ impl PpsGpsdo {
     /// [`feed_nmea`](Self::feed_nmea) pairing. Returns the [`GnssdoStep`] for logging.
     pub fn on_pps_edge(&mut self, edge: TimedEdge, query_ns: u64) -> GnssdoStep {
         self.sync.on_pps_edge(edge.edge_ns, query_ns);
-        self.clock.on_pps(edge.edge_ns / 1000, edge.interval_ns as i64)
+        self.clock
+            .on_pps(edge.edge_ns / 1000, edge.interval_ns as i64)
     }
 
     /// Feed a framed NMEA sentence. On an RMC paired with a fresh PPS edge, establishes/refreshes
@@ -144,7 +145,9 @@ mod tests {
     fn edge_then_rmc_establishes_utc() {
         let mut g = PpsGpsdo::new();
         g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);
-        let report = g.feed_nmea(RMC).expect("RMC + fresh edge establishes a sync");
+        let report = g
+            .feed_nmea(RMC)
+            .expect("RMC + fresh edge establishes a sync");
         let want = crate::civil_to_unix(2026, 6, 7, 17, 6, 58) * 1_000_000_000;
         assert_eq!(report.unix_ns, want);
         assert_eq!(report.capture_ns, 1_000_000_000);

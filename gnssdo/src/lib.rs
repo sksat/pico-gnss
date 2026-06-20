@@ -12,7 +12,7 @@
 //! - [`PpsTracker`]: classifies a PPS edge stream (lock / missed / non-monotonic).
 //! - [`PhaseLockLoop`]: a type-II output-phase servo (P/I/D + Smith predictor) for disciplining a
 //!   *generated* 1PPS edge to the reference.
-//! - [`Gnssdo`]: a turn-key easy tier bundling [`PpsTracker`] + [`DisciplinedClock`] under one good
+//! - [`Gnssdo`]: an all-in-one easy tier bundling [`PpsTracker`] + [`DisciplinedClock`] under one good
 //!   default discipline policy.
 //!
 //! # Scope
