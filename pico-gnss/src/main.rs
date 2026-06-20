@@ -23,7 +23,6 @@
 //! も推定周波数で外挿**して時刻を保つ。`time_task` が 1Hz で規律 UTC を `TIME` 行に出す。
 
 use core::cell::RefCell;
-use core::fmt::Write as _;
 
 use defmt::{info, warn};
 use defmt_rtt as _;
@@ -39,13 +38,12 @@ use embassy_rp::pio::{
     Config as PioConfig, Direction as PioDirection, InterruptHandler as PioInterruptHandler, Pio,
     StateMachine,
 };
-use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, BufferedUartTx, Config as UartConfig};
+use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration, Instant, Timer};
-use embedded_io_async::{Read, Write};
-use heapless::String;
+use embedded_io_async::Read;
 use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
@@ -55,51 +53,13 @@ use gnssdo::{
 };
 use rp_pps::embassy::{PpsCapture, PpsOutput};
 
+/// 受信機固有レイヤ (MT3333/GYSFFMANC の PMTK 設定・ボーレート)。別受信機ならここだけ差し替え。
+mod mt3333;
+
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
 });
-
-/// AE-GNSS-EXTANT (GYSFFMANC) のデフォルトボーレート 9600。
-const GNSS_BAUD: u32 = 9600;
-
-/// 運用モード = 受信機の dynamic model (MT3333 PMTK886)。
-/// **この GPSDO は固定 timing 用途**なので既定は `FixedTiming` (stationary)。受信機に
-/// 「動いていない」という強い事前情報を渡すと、弱信号での位置/速度の暴れと PPS 選別への悪影響が
-/// 減る (smart-friend GPT-5.5)。移動運用するときだけ `Mobile` にして stationary を無効化する。
-/// 自動切替はしない (弱信号の NMEA speed が嘘をつくとモード切替自体が新たな不安定要因になる)。
-#[derive(Clone, Copy)]
-enum OpMode {
-    FixedTiming, // PMTK886,4 = stationary。窓際固定・timing 専用。
-    #[allow(dead_code)]
-    Mobile, // PMTK886,0 = normal。移動運用時はこちら (将来 UI/設定口から切替)。
-}
-const OP_MODE: OpMode = OpMode::FixedTiming;
-
-impl OpMode {
-    /// dynamic model を設定する PMTK886 コマンド本体 (チェックサムは送信時に付く)。
-    const fn pmtk886(self) -> &'static str {
-        match self {
-            OpMode::FixedTiming => "PMTK886,4", // stationary
-            OpMode::Mobile => "PMTK886,0",      // normal
-        }
-    }
-}
-
-/// 起動時にモジュールへ送る PMTK 設定 (チェックサムは送信時に計算)。
-/// 実機で各コマンドに `$PMTK001,<cmd>,3`(成功) が返ることを確認済 (チップは MT3333 系)。
-/// 注: SBAS は地域依存。日本の MSAS は 2020 終了済なので fix quality は 1 のまま
-///     (WAAS/EGNOS 圏では有効)。GYSFFMANC は QZSS SLAS 非対応で sub-meter は不可。詳細は NOTES.md。
-const PMTK_INIT: &[&str] = &[
-    OP_MODE.pmtk886(), // dynamic model (既定 stationary。固定 timing 用途の事前情報)
-    "PMTK313,1",       // SBAS 探索を有効化 (WAAS/EGNOS 圏で有効)
-    "PMTK301,2",       // DGPS 補正源 = SBAS
-    "PMTK286,1",       // AIC (アクティブ干渉除去) 有効化
-    // NMEA 出力: GLL/RMC/VTG/GGA/GSA/GSV(各1) + GST(測位σ, field7) + ZDA(field17) を有効化。
-    // フィールド順: GLL,RMC,VTG,GGA,GSA,GSV,GRS,GST,(res×5),MALM,MEPH,MDGP,MDBG,ZDA,MCHN。
-    "PMTK314,1,1,1,1,1,1,0,1,0,0,0,0,0,0,0,0,0,1,0",
-    "PMTK605", // FW バージョン照会 → $PMTK705 で返る (ACK は無く応答が版情報)
-];
 
 /// PPS エッジの (PIO ns 時刻, Instant ns 時刻) を pps_task → main へ渡す。
 /// PIO 時刻は ns 精度 (err/エポック計算用)、Instant は連続クエリ (ticker/holdover) のアンカー用。
@@ -148,19 +108,6 @@ unsafe fn SWI_IRQ_0() {
 /// Instant を ns に (µs 分解能)。
 fn now_local_ns() -> u64 {
     Instant::now().as_micros() * 1000
-}
-
-/// `$<payload>*<csum>\r\n` を組み立てて送る。
-async fn send_pmtk<W: Write>(tx: &mut W, payload: &str) {
-    let cs = gnssdo::nmea_checksum(payload.as_bytes());
-    // PMTK314 (NMEA 出力設定) は ~51 文字になるので余裕を持って 96。溢れると truncate されて
-    // 不完全コマンドになり、モジュールに拒否される (実際にハマった)。
-    let mut line: String<96> = String::new();
-    if write!(line, "${}*{:02X}\r\n", payload, cs).is_ok() {
-        let _ = tx.write_all(line.as_bytes()).await;
-    } else {
-        warn!("send_pmtk: line too long: {=str}", payload);
-    }
 }
 
 /// PIO がラッチした PPS エッジを読み、間隔を ns で求めて出す + 周波数を規律するタスク。
@@ -220,20 +167,6 @@ async fn pps_task(mut capture: PpsCapture<'static, PIO0, 0>) {
             count, interval_us, interval_ns, state, missed, fu.as_str()
         );
     }
-}
-
-/// モジュール設定 (PMTK) を送るタスク。**RX 受信 (main) をブロックしないよう別タスクにする**
-/// — 同じループで送ると Timer/送信中に RX が読まれず、届く ACK が RX バッファ溢れで消える。
-#[embassy_executor::task]
-async fn config_task(mut tx: BufferedUartTx) {
-    // 起動直後はモジュールが PMTK を受け付けないので十分待ってから、間隔も空けて送る。
-    // 起動直後 (~1s) は UART が同期せず framing が多発しモジュールも未準備なので十分待つ。
-    Timer::after_millis(2000).await;
-    for cmd in PMTK_INIT {
-        send_pmtk(&mut tx, cmd).await;
-        Timer::after_millis(600).await;
-    }
-    info!("pico-gnss: PMTK config sent ({} cmds)", PMTK_INIT.len());
 }
 
 /// 1Hz タスク: GPSDO の規律 UTC を出す + 規律 PPS 生成 (SM1) の周期を ppb 補正で更新する。
@@ -330,7 +263,7 @@ async fn gen_capture_task(
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    info!("pico-gnss: start (NMEA on UART0/GP1 @ {} baud, PPS on GP2 via PIO, GPSDO)", GNSS_BAUD);
+    info!("pico-gnss: start (NMEA on UART0/GP1 @ {} baud, PPS on GP2 via PIO, GPSDO)", mt3333::GNSS_BAUD);
 
     // PPS on GP2 を PIO0 SM0 で rp-pps の PpsCapture でハードキャプチャ (~16ns 分解能)。
     let Pio { mut common, sm0, sm1, mut sm2, .. } = Pio::new(p.PIO0, Irqs);
@@ -400,12 +333,12 @@ async fn main(spawner: Spawner) {
     let tx_buf = TX_BUF.init([0; 64]);
     let rx_buf = RX_BUF.init([0; 256]);
     let mut config = UartConfig::default();
-    config.baudrate = GNSS_BAUD;
+    config.baudrate = mt3333::GNSS_BAUD;
     let uart = BufferedUart::new(p.UART0, p.PIN_0, p.PIN_1, Irqs, tx_buf, rx_buf, config);
     let (tx, mut rx) = uart.split();
 
     // モジュール設定は別タスクで送る (main は RX を読み続ける)。
-    spawner.spawn(config_task(tx).unwrap());
+    spawner.spawn(mt3333::config_task(tx).unwrap());
 
     let mut assembler = NmeaLineAssembler::new();
     let mut read_buf = [0u8; 64];
@@ -437,7 +370,7 @@ async fn main(spawner: Spawner) {
             info!("NMEA {=str}", s);
 
             // FW バージョン応答 ($PMTK705) は専用行で出す (talker が長く NMEA 抽出に乗らないため)。
-            if s.starts_with("$PMTK705") {
+            if mt3333::is_fw_version_response(s) {
                 info!("FW {=str}", s);
             }
 
