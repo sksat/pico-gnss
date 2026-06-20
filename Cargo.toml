@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["gnssdo", "pico-gnss"]
-# A bare `cargo build`/`cargo test` only targets the host-safe gnssdo.
-# Build the embedded-only firmware explicitly: cd pico-gnss (or -p pico-gnss --target ...).
-default-members = ["gnssdo"]
+members = ["gnssdo", "rp-pps", "pico-gnss"]
+# A bare `cargo build`/`cargo test` targets the host-safe cores (gnssdo + rp-pps's
+# HAL-agnostic core). Build the embedded-only firmware explicitly: cd pico-gnss
+# (or -p pico-gnss --target ...). The rp-pps HAL backends need a target too.
+default-members = ["gnssdo", "rp-pps"]
 
 [workspace.package]
 edition = "2024"

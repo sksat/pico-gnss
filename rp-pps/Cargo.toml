@@ -1,0 +1,29 @@
+[package]
+name = "rp-pps"
+version = "0.1.0"
+description = "RP2040/RP2350 PIO building blocks for a GNSS 1PPS timebase: hardware edge-timestamp capture and steerable 1PPS output. HAL-agnostic core (PIO program + tick/ns math, host-testable) with thin embassy-rp / rp2040-hal backends."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["pps", "pio", "rp2040", "gnss", "gpsdo"]
+categories = ["embedded", "no-std", "hardware-support"]
+
+[lib]
+name = "rp_pps"
+
+[features]
+default = []
+# Thin async backend over embassy-rp. The downstream binary selects the chip
+# (e.g. embassy-rp/rp2040); this crate stays chip-feature-agnostic.
+embassy-rp = ["dep:embassy-rp"]
+# Thin blocking/IRQ backend over rp2040-hal (RP2040 only).
+rp2040-hal = ["dep:rp2040-hal"]
+
+[dependencies]
+# The PIO program is built HAL-agnostically here (via `pio::pio_asm!`, NOT a HAL's
+# re-export), so both backends load the same `pio::Program<32>`. embassy-rp 0.10,
+# rp2040-hal 0.12 and this crate all pin `pio` 0.3 — the program type is shared.
+pio = "0.3"
+embassy-rp = { version = "0.10", optional = true, default-features = false }
+rp2040-hal = { version = "0.12", optional = true, default-features = false }
