@@ -14,6 +14,13 @@ captures that edge with nanosecond resolution, estimates the local crystal's
 frequency error, and keeps disciplined UTC — including **holdover** while the PPS
 signal is lost.
 
+![pico-gnss real-time dashboard](docs/dashboard.png)
+
+*Real-time web dashboard (`webapp/`): GPSDO-disciplined UTC, PPS jitter, frequency
+discipline & holdover, sky plot / C/N₀, and the position fix. (Location masked for
+privacy — the dashboard has a built-in privacy mode that hides coordinates, the map
+marker and the NMEA lat/lon.)*
+
 ## Workspace layout
 
 | Path | What |
