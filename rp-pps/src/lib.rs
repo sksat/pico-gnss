@@ -142,6 +142,44 @@ pub fn output_period_cycles_ppb(clk_hz: u32, ppb: i64) -> u32 {
     (clk - OUTPUT_OVERHEAD_CYCLES as i64 + adj) as u32
 }
 
+/// Sigma-delta period-word generator with sub-cycle frequency resolution.
+///
+/// [`output_period_cycles_ppb`] quantizes to whole PIO clock cycles (≈8 ppb at 125 MHz), which on
+/// a tight loop shows up as a frequency limit cycle. This carries the fractional cycle across edges
+/// (first-order sigma-delta) so the *average* output frequency resolves finer than one cycle. It is
+/// the generator-protocol counterpart to the control loop: feed it the total frequency offset in
+/// milli-ppb (the crystal estimate plus any servo trim) and the servo's immediate phase correction;
+/// it returns the next period word for the output state machine.
+///
+/// Frequency is in **milli-ppb** to match [`gnssdo`](https://docs.rs/gnssdo)'s
+/// `PhaseLockLoop` trim resolution; `freq_mppb = crystal_ppb * 1000 + freq_trim_mppb`.
+#[derive(Debug, Default)]
+pub struct OutputPeriodDither {
+    frac_acc: i64, // carried fractional cycles, scaled by 1e12
+}
+
+impl OutputPeriodDither {
+    /// Create a generator (fraction accumulator starts at 0).
+    pub const fn new() -> Self {
+        Self { frac_acc: 0 }
+    }
+
+    /// Next period word for one output edge. `freq_mppb` is the total frequency offset in milli-ppb
+    /// (lengthen the period to compensate a fast crystal); `phase_corr_ns` is the immediate phase
+    /// nudge to subtract this edge (e.g. [`gnssdo`](https://docs.rs/gnssdo)
+    /// `PhaseLockLoopUpdate::phase_corr_ns`).
+    pub fn next_period(&mut self, clk_hz: u32, freq_mppb: i64, phase_corr_ns: i64) -> u32 {
+        let clk = clk_hz as i64;
+        // Accumulate clk * freq at 1e12 scale (milli-ppb = ppb*1000, ppb = 1e-9), carry the fraction.
+        self.frac_acc += clk * freq_mppb;
+        let freq_cycles = self.frac_acc.div_euclid(1_000_000_000_000);
+        self.frac_acc = self.frac_acc.rem_euclid(1_000_000_000_000);
+        let period =
+            clk - OUTPUT_OVERHEAD_CYCLES as i64 + freq_cycles - phase_corr_ns * clk / 1_000_000_000;
+        period as u32
+    }
+}
+
 /// Non-blocking capture read, shared across backends (the PIO RX-FIFO contract) so a control loop
 /// can be written generic over the HAL. The `embassy` backend additionally offers an `async`
 /// `wait_edge()`, intentionally not part of this trait — async and blocking don't share one method
@@ -205,5 +243,34 @@ mod tests {
         // +8 ppb at 125 MHz = +1 cycle, -8 ppb = -1 cycle
         assert_eq!(output_period_cycles_ppb(125_000_000, 8), 124_999_991);
         assert_eq!(output_period_cycles_ppb(125_000_000, -8), 124_999_989);
+    }
+
+    #[test]
+    fn dither_matches_whole_cycle_steering() {
+        let mut d = OutputPeriodDither::new();
+        // 0 ppb -> nominal; +8 ppb (= 8000 mppb) -> +1 cycle, like output_period_cycles_ppb.
+        assert_eq!(d.next_period(125_000_000, 0, 0), 124_999_990);
+        assert_eq!(d.next_period(125_000_000, 8_000, 0), 124_999_991);
+    }
+
+    #[test]
+    fn dither_resolves_sub_cycle_on_average() {
+        let mut d = OutputPeriodDither::new();
+        // 4 ppb at 125 MHz = half a cycle/s: the fraction carries, so it alternates +0,+1,+0,+1...
+        let p0 = d.next_period(125_000_000, 4_000, 0);
+        let p1 = d.next_period(125_000_000, 4_000, 0);
+        assert_eq!(p0, 124_999_990);
+        assert_eq!(p1, 124_999_991);
+        // average = 124_999_990.5 = nominal + 0.5 cycle (sub-cycle resolution)
+    }
+
+    #[test]
+    fn dither_phase_corr_subtracts_cycles() {
+        let mut d = OutputPeriodDither::new();
+        // phase_corr 8 ns at 125 MHz = 1 cycle subtracted; freq 0.
+        assert_eq!(d.next_period(125_000_000, 0, 8), 124_999_989);
+        // negative phase_corr lengthens.
+        let mut d2 = OutputPeriodDither::new();
+        assert_eq!(d2.next_period(125_000_000, 0, -8), 124_999_991);
     }
 }
