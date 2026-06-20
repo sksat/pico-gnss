@@ -66,9 +66,41 @@ pub struct SyncPoint {
     pub drift_us: i64,
 }
 
+/// PPS 立ち上がりエッジと、その後に届く NMEA 時刻文 (RMC/ZDA 等) が指す秒の対応。
+///
+/// PPS のエッジは UTC 秒境界そのものを刻むが、その秒を表す NMEA 時刻文がエッジの
+/// **同じ秒 / 1 つ前 / 1 つ後** のどれを指すかは受信機依存。ずれても必ず **±1 秒以内**
+/// (エッジと NMEA 文の前後関係の問題で、2 秒以上ずれる正常動作は無い)。ここを誤ると確立する
+/// UTC エポックが丸ごと 1 秒ずれる — 本ライブラリ最大の事故要因なので、取りうる 3 値を列挙して
+/// 型で閉じている (任意秒オフセットは正常系に存在しないので受け付けない)。
+///
+/// (`Debug`/`Default` は親 [`PpsTimeSync`] の derive が要求する最小限。)
+#[derive(Debug, Default)]
+pub enum PpsNmeaAssociation {
+    /// NMEA 時刻文はエッジと同じ秒を指す (大半の受信機)。既定。
+    #[default]
+    SameSecond,
+    /// NMEA 時刻文はエッジの 1 つ前の秒を指す (エッジは NMEA より 1 秒後)。
+    NmeaIsPreviousSecond,
+    /// NMEA 時刻文はエッジの 1 つ次の秒を指す (エッジは NMEA より 1 秒前)。
+    NmeaIsNextSecond,
+}
+
+impl PpsNmeaAssociation {
+    /// エッジの UTC 秒 = (NMEA 秒) + この補正 (±1 or 0)。
+    const fn edge_offset_seconds(&self) -> i64 {
+        match self {
+            Self::SameSecond => 0,
+            Self::NmeaIsPreviousSecond => 1,
+            Self::NmeaIsNextSecond => -1,
+        }
+    }
+}
+
 /// PPS エッジと NMEA 時刻を対応付けてクロックを規律する state machine。
 #[derive(Debug, Default)]
 pub struct PpsTimeSync {
+    association: PpsNmeaAssociation,
     last_date: Option<(u16, u8, u8)>, // (year, month, day)
     pending_pps_us: Option<u64>,      // まだ UTC とペアにしていない直近 PPS エッジ
     last_pps_us: Option<u64>,         // drift 計算用の前回 PPS エッジ
@@ -78,8 +110,15 @@ pub struct PpsTimeSync {
 }
 
 impl PpsTimeSync {
+    /// 既定 ([`PpsNmeaAssociation::SameSecond`]) で生成する。
     pub const fn new() -> Self {
+        Self::with_association(PpsNmeaAssociation::SameSecond)
+    }
+
+    /// PPS↔NMEA の秒対応を指定して生成する。`static` 初期化で使えるよう `const fn`。
+    pub const fn with_association(association: PpsNmeaAssociation) -> Self {
         Self {
+            association,
             last_date: None,
             pending_pps_us: None,
             last_pps_us: None,
@@ -113,7 +152,9 @@ impl PpsTimeSync {
     pub fn on_time(&mut self, h: u8, mi: u8, s: u8) -> Option<SyncPoint> {
         let (y, mo, d) = self.last_date?;
         let pps = self.pending_pps_us?;
-        let unix_s = civil_to_unix(y as i64, mo as i64, d as i64, h as i64, mi as i64, s as i64);
+        // PPS エッジが指す UTC 秒 = NMEA 秒 + 受信機依存補正 (±1 秒ズレ吸収)。
+        let unix_s = civil_to_unix(y as i64, mo as i64, d as i64, h as i64, mi as i64, s as i64)
+            + self.association.edge_offset_seconds();
         self.epoch_local_us = Some(pps);
         self.epoch_unix_s = Some(unix_s);
         self.pending_pps_us = None;
@@ -212,6 +253,66 @@ mod tests {
         assert_eq!(ts.now_unix_micros(1_500_000), Some(base + 500_000));
         // エポック前 (PPS より前の local 値)
         assert_eq!(ts.now_unix_micros(999_000), Some(base - 1_000));
+    }
+
+    #[test]
+    fn association_nmea_next_second_shifts_epoch_back() {
+        // 受信機が「次の秒」を先に送る: エッジの UTC 秒は NMEA 秒 - 1。
+        let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsNextSecond);
+        ts.set_date(2026, 6, 7);
+        ts.on_pps(1_000_000);
+        let sp = ts.on_time(17, 6, 58).unwrap();
+        // 既定 (SameSecond) なら 17:06:58 だが、NmeaIsNextSecond で 17:06:57 に対応づく。
+        assert_eq!(sp.unix_s, civil_to_unix(2026, 6, 7, 17, 6, 57));
+        // now も同じエポックずれを反映する。
+        assert_eq!(
+            ts.now_unix_micros(1_000_000),
+            Some(civil_to_unix(2026, 6, 7, 17, 6, 57) * 1_000_000)
+        );
+    }
+
+    #[test]
+    fn association_nmea_previous_second_shifts_epoch_forward() {
+        // 受信機が「前の秒」を報告する: エッジの UTC 秒は NMEA 秒 + 1。
+        let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsPreviousSecond);
+        ts.set_date(2026, 6, 7);
+        ts.on_pps(1_000_000);
+        let sp = ts.on_time(17, 6, 58).unwrap();
+        assert_eq!(sp.unix_s, civil_to_unix(2026, 6, 7, 17, 6, 59));
+    }
+
+    #[test]
+    fn association_handles_day_rollover() {
+        // 00:00:00 で NmeaIsNextSecond(-1) → 前日 23:59:59 (unix 秒加算で日跨ぎも正しい)。
+        let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsNextSecond);
+        ts.set_date(2026, 6, 7);
+        ts.on_pps(5_000_000);
+        let sp = ts.on_time(0, 0, 0).unwrap();
+        assert_eq!(sp.unix_s, civil_to_unix(2026, 6, 6, 23, 59, 59));
+    }
+
+    #[test]
+    fn association_handles_year_rollover() {
+        // 2026-12-31 23:59:59 で NmeaIsPreviousSecond(+1) → 2027-01-01 00:00:00 (年跨ぎ)。
+        let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsPreviousSecond);
+        ts.set_date(2026, 12, 31);
+        ts.on_pps(1_000_000);
+        let sp = ts.on_time(23, 59, 59).unwrap();
+        assert_eq!(sp.unix_s, civil_to_unix(2027, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn association_offset_does_not_accumulate() {
+        // 連続同期で補正が累積しない (毎秒 +1 されず、両エポックに同じだけ効く)。
+        let mut ts = PpsTimeSync::with_association(PpsNmeaAssociation::NmeaIsNextSecond);
+        ts.set_date(2026, 6, 7);
+        ts.on_pps(1_000_000);
+        let s1 = ts.on_time(17, 6, 58).unwrap();
+        ts.on_pps(2_000_000);
+        let s2 = ts.on_time(17, 6, 59).unwrap();
+        assert_eq!(s2.unix_s - s1.unix_s, 1);
+        assert_eq!(s1.unix_s, civil_to_unix(2026, 6, 7, 17, 6, 57));
+        assert_eq!(s2.unix_s, civil_to_unix(2026, 6, 7, 17, 6, 58));
     }
 
     #[test]

@@ -19,5 +19,6 @@ pub use assembler::{NmeaLineAssembler, MAX_SENTENCE_LEN};
 pub use gpsdo::{snap_to_second_ns, DisciplinedClock, DisciplinedClockConfig, FreqUpdate};
 pub use pps::{PpsEvent, PpsTracker, PpsTrackerConfig, NOMINAL_US, TOLERANCE_US};
 pub use timesync::{
-    civil_to_unix, days_from_civil, parse_ddmmyy, parse_hhmmss, PpsTimeSync, SyncPoint,
+    civil_to_unix, days_from_civil, parse_ddmmyy, parse_hhmmss, PpsNmeaAssociation, PpsTimeSync,
+    SyncPoint,
 };
