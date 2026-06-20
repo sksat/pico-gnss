@@ -15,6 +15,8 @@
 
 use core::num::{NonZeroU32, NonZeroU64};
 
+use crate::pps::{PpsEvent, PpsTracker, PpsTrackerConfig};
+
 /// Tuning configuration for [`DisciplinedClock`].
 ///
 /// The right values depend on the receiver, antenna, TCXO/crystal, PPS capture resolution, and
@@ -347,6 +349,123 @@ impl DisciplinedClock {
     }
 }
 
+/// Result of [`Gnssdo::on_pps`].
+#[derive(Debug)]
+pub struct GnssdoStep {
+    /// How the tracker classified this edge.
+    pub event: PpsEvent,
+    /// The frequency-discipline outcome, or `None` if discipline was not attempted this edge (the
+    /// edge was not `Locked`, or there was no valid interval).
+    pub freq: Option<FreqUpdate>,
+    /// Whether this edge was a holdover recovery (a non-`Locked` → `Locked` transition).
+    pub recovered: bool,
+}
+
+/// Turn-key GNSS-disciplined clock — the **easy tier**: a [`PpsTracker`] + a [`DisciplinedClock`]
+/// wired with the recommended default policy (discipline the frequency **only on `Locked` edges**
+/// and quarantine the estimate for a few edges after recovering from a gap). For a different policy,
+/// drive [`PpsTracker`] and [`DisciplinedClock`] yourself (the fine tier) — this bundles one good
+/// default.
+///
+/// It owns no I/O: feed it PPS intervals via [`on_pps`](Self::on_pps) (from any capture source — the
+/// RP2040 PIO via [`rp-pps`](https://docs.rs/rp-pps), a timer input-capture, `/dev/pps`, …) and
+/// NMEA-derived UTC seconds via [`on_utc`](Self::on_utc); read back disciplined UTC, the frequency
+/// offset, and holdover.
+#[derive(Debug, Default)]
+pub struct Gnssdo {
+    tracker: PpsTracker,
+    clock: DisciplinedClock,
+    last_pps_locked: bool,
+}
+
+impl Gnssdo {
+    /// Create with the default tracker/clock tuning and the recommended policy.
+    pub const fn new() -> Self {
+        Self {
+            tracker: PpsTracker::new(),
+            clock: DisciplinedClock::new(),
+            last_pps_locked: false,
+        }
+    }
+
+    /// Create with given tracker / clock configurations. `const fn` so it can init a `static`.
+    pub const fn with_config(tracker: PpsTrackerConfig, clock: DisciplinedClockConfig) -> Self {
+        Self {
+            tracker: PpsTracker::with_config(tracker),
+            clock: DisciplinedClock::with_config(clock),
+            last_pps_locked: false,
+        }
+    }
+
+    /// Feed one PPS edge. `capture_time_us` is the edge's running capture-timebase time (µs; the
+    /// tracker uses it to spot missed/irregular edges) and `interval_ns` is the precise interval
+    /// since the previous edge (the frequency estimate's input). The edge is classified and, **only
+    /// when it is `Locked`**, the frequency is disciplined — quarantining the estimate on a recovery.
+    ///
+    /// `capture_time_us` and `interval_ns` are separate inputs from the same edge stream; pass
+    /// consistent values (e.g. both from `rp-pps`'s `PpsEdgeTimeline`).
+    pub fn on_pps(&mut self, capture_time_us: u64, interval_ns: i64) -> GnssdoStep {
+        let event = self.tracker.record(capture_time_us);
+        let locked = matches!(event, PpsEvent::Locked { .. });
+        let recovered = locked && !self.last_pps_locked;
+        self.last_pps_locked = locked;
+        let freq = if interval_ns > 0 && locked {
+            if recovered {
+                self.clock.start_quarantine();
+            }
+            Some(self.clock.update_freq(interval_ns))
+        } else {
+            None
+        };
+        GnssdoStep {
+            event,
+            freq,
+            recovered,
+        }
+    }
+
+    /// Establish/refresh the UTC epoch by pairing a PPS edge with its UTC second. A thin passthrough
+    /// to [`DisciplinedClock::update_epoch`]; NMEA parsing and the PPS↔NMEA pairing stay the caller's
+    /// ([`parse_rmc_time_date`](crate::parse_rmc_time_date) / [`PpsTimeSync`](crate::PpsTimeSync)).
+    pub fn on_utc(&mut self, capture_ns: u64, query_ns: u64, unix_ns: i64) {
+        self.clock.update_epoch(capture_ns, query_ns, unix_ns);
+    }
+
+    /// Disciplined UTC (ns) from a continuously-readable query-timebase local time.
+    pub fn now_from_query_ns(&self, query_ns: u64) -> Option<i64> {
+        self.clock.now_from_query_ns(query_ns)
+    }
+
+    /// Estimated crystal frequency offset (ppb).
+    pub fn freq_ppb(&self) -> i64 {
+        self.clock.freq_ppb()
+    }
+
+    /// Time since the last epoch update (ns) — the current holdover duration.
+    pub fn holdover_ns(&self, query_ns: u64) -> u64 {
+        self.clock.holdover_ns(query_ns)
+    }
+
+    /// Whether the **frequency estimate** has locked (enough samples seen). Distinct from
+    /// [`last_pps_locked`](Self::last_pps_locked) (which is about the most recent edge's class).
+    pub fn frequency_locked(&self) -> bool {
+        self.clock.is_locked()
+    }
+
+    /// Whether the most recent edge was classified `Locked` by the tracker.
+    pub fn last_pps_locked(&self) -> bool {
+        self.last_pps_locked
+    }
+
+    /// The inner [`DisciplinedClock`], for fine-tier queries — e.g.
+    /// [`prediction_residual_ns`](DisciplinedClock::prediction_residual_ns),
+    /// [`fire_residual_ns`](DisciplinedClock::fire_residual_ns),
+    /// [`capture_ns_for_unix_ns`](DisciplinedClock::capture_ns_for_unix_ns).
+    pub fn clock(&self) -> &DisciplinedClock {
+        &self.clock
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,5 +768,55 @@ mod tests {
         let c = DisciplinedClock::new();
         assert_eq!(c.prediction_residual_ns(123, 456), None);
         assert_eq!(c.fire_residual_ns(123, 456), None);
+    }
+
+    #[test]
+    fn gnssdo_disciplines_only_on_locked() {
+        let mut g = Gnssdo::new();
+        // First edge: classified First, no discipline.
+        let s0 = g.on_pps(0, 0);
+        assert_eq!(s0.event, PpsEvent::First);
+        assert!(s0.freq.is_none());
+        assert!(!g.frequency_locked() && !g.last_pps_locked());
+
+        // A locked 1 Hz edge with a precise interval → disciplined; first lock counts as recovery.
+        let s1 = g.on_pps(1_000_000, 1_000_000_000);
+        assert!(matches!(s1.event, PpsEvent::Locked { .. }));
+        assert_eq!(s1.freq, Some(FreqUpdate::Applied));
+        assert!(s1.recovered);
+        assert!(g.last_pps_locked());
+
+        // Steady locked edge: disciplined, not a recovery.
+        let s2 = g.on_pps(2_000_000, 1_000_000_000);
+        assert!(matches!(s2.event, PpsEvent::Locked { .. }));
+        assert!(!s2.recovered);
+        assert_eq!(s2.freq, Some(FreqUpdate::Applied));
+    }
+
+    #[test]
+    fn gnssdo_skips_discipline_on_irregular() {
+        let mut g = Gnssdo::new();
+        g.on_pps(0, 0);
+        g.on_pps(1_000_000, 1_000_000_000);
+        // A ~2 s gap → Irregular → no frequency discipline this edge.
+        let s = g.on_pps(3_000_000, 2_000_000_000);
+        assert!(matches!(s.event, PpsEvent::Irregular { .. }));
+        assert!(s.freq.is_none());
+    }
+
+    #[test]
+    fn gnssdo_epoch_and_fine_tier() {
+        let mut g = Gnssdo::new();
+        assert_eq!(g.now_from_query_ns(123), None); // no epoch yet
+        g.on_utc(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
+        assert_eq!(
+            g.now_from_query_ns(1_000_000_000 + 500),
+            Some(5_000_000_000_000 + 500)
+        );
+        // the fine tier is reachable via clock()
+        assert_eq!(
+            g.clock().capture_ns_for_unix_ns(5_000_000_000_000),
+            Some(1_000_000_000)
+        );
     }
 }

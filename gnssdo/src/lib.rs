@@ -46,7 +46,9 @@ mod pps;
 mod timesync;
 
 pub use assembler::{MAX_SENTENCE_LEN, NmeaLineAssembler, nmea_checksum, nmea_checksum_valid};
-pub use gpsdo::{DisciplinedClock, DisciplinedClockConfig, FreqUpdate, snap_to_second_ns};
+pub use gpsdo::{
+    DisciplinedClock, DisciplinedClockConfig, FreqUpdate, Gnssdo, GnssdoStep, snap_to_second_ns,
+};
 pub use pll::{LoopMode, PhaseLockLoop, PhaseLockLoopConfig, PhaseLockLoopUpdate};
 pub use pps::{NOMINAL_US, PpsEvent, PpsTracker, PpsTrackerConfig, TOLERANCE_US};
 pub use timesync::{
