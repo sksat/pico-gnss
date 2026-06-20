@@ -49,12 +49,10 @@ impl NmeaLineAssembler {
                 }
             }
             _ => {
-                if self.in_sentence {
-                    if self.buf.push(byte).is_err() {
-                        // Buffer overflow: drop this sentence and wait for the next '$'.
-                        self.buf.clear();
-                        self.in_sentence = false;
-                    }
+                if self.in_sentence && self.buf.push(byte).is_err() {
+                    // Buffer overflow: drop this sentence and wait for the next '$'.
+                    self.buf.clear();
+                    self.in_sentence = false;
                 }
                 None
             }

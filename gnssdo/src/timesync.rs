@@ -49,11 +49,14 @@ pub fn parse_ddmmyy(field: &str) -> Option<(u8, u8, u16)> {
     let d: u8 = field.get(0..2)?.parse().ok()?;
     let mo: u8 = field.get(2..4)?.parse().ok()?;
     let yy: u16 = field.get(4..6)?.parse().ok()?;
-    if d < 1 || d > 31 || mo < 1 || mo > 12 {
+    if !(1..=31).contains(&d) || !(1..=12).contains(&mo) {
         return None;
     }
     Some((d, mo, 2000 + yy))
 }
+
+/// `((hour, minute, second), (day, month, year))` — the value returned by [`parse_rmc_time_date`].
+pub type RmcTimeDate = ((u8, u8, u8), (u8, u8, u16));
 
 /// Extract `((hour, min, sec), (day, month, year))` from an RMC sentence. `None` for non-RMC or
 /// a parse failure.
@@ -70,7 +73,7 @@ pub fn parse_ddmmyy(field: &str) -> Option<(u8, u8, u16)> {
 /// - **speed/size**: nmea is ~**17x slower** on the RP2040 and adds ~**+52 KB** of `.text`
 ///   (negligible at 1 Hz).
 #[cfg(not(feature = "external-nmea"))]
-pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16))> {
+pub fn parse_rmc_time_date(sentence: &str) -> Option<RmcTimeDate> {
     if sentence.get(3..6) != Some("RMC") {
         return None;
     }
@@ -83,7 +86,7 @@ pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16
 /// version's docs. `nmea::parse_str` **validates the checksum** before extracting RMC
 /// (mismatch → `None`).
 #[cfg(feature = "external-nmea")]
-pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16))> {
+pub fn parse_rmc_time_date(sentence: &str) -> Option<RmcTimeDate> {
     use chrono::{Datelike, Timelike};
     use nmea::ParseResult;
     // parse_str parses the sentence including checksum validation and returns RMC as ParseResult::RMC.

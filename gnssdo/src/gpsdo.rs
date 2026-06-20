@@ -112,7 +112,7 @@ pub struct DisciplinedClock {
     samples: u32,
     quarantine: u32, // while >0 we are in the recovery quarantine (frequency-EMA updates held off)
     epoch_capture_ns: Option<u64>, // capture-timebase epoch (ns, for err/now_from_capture_ns)
-    epoch_query_ns: Option<u64>,   // query-timebase epoch (for continuous query/holdover)
+    epoch_query_ns: Option<u64>, // query-timebase epoch (for continuous query/holdover)
     epoch_unix_ns: Option<i64>,
     last_query_ns: Option<u64>, // last disciplined query-timebase time (for holdover measurement)
 }
@@ -189,7 +189,9 @@ impl DisciplinedClock {
         if self.is_locked() {
             // After lock: a single sample with a large residual from the EMA is multipath. Reject
             // far more tightly than ±1ms.
-            if (measured_mppb - self.freq_mppb).abs() > self.config.residual_gate_ns.get() as i64 * 1000 {
+            if (measured_mppb - self.freq_mppb).abs()
+                > self.config.residual_gate_ns.get() as i64 * 1000
+            {
                 return FreqUpdate::GatedQuality;
             }
         } else {
@@ -390,7 +392,10 @@ mod tests {
         let mut c = DisciplinedClock::new();
         c.update_freq(1_000_002_500); // first sample establishes the reference (+2500ppb)
         // While unlocked, medium multipath within ±1ms but beyond ±100µs is rejected.
-        assert_eq!(c.update_freq(1_000_000_000 + 200_000), FreqUpdate::GatedQuality);
+        assert_eq!(
+            c.update_freq(1_000_000_000 + 200_000),
+            FreqUpdate::GatedQuality
+        );
         assert_eq!(c.samples, 1);
         assert_eq!(c.freq_ppb(), 2500); // not contaminated
     }
@@ -403,7 +408,10 @@ mod tests {
         }
         assert!(c.is_locked());
         // After lock, a single sample +10µs off the EMA (multipath) is rejected by the residual gate.
-        assert_eq!(c.update_freq(1_000_000_000 + 2500 + 10_000), FreqUpdate::GatedQuality);
+        assert_eq!(
+            c.update_freq(1_000_000_000 + 2500 + 10_000),
+            FreqUpdate::GatedQuality
+        );
         assert_eq!(c.freq_ppb(), 2500); // the EMA does not move
         // Near the EMA (±tens of ns jitter) passes.
         assert_eq!(c.update_freq(1_000_002_500 + 16), FreqUpdate::Applied);
@@ -464,7 +472,10 @@ mod tests {
         let mut c = DisciplinedClock::new();
         c.update_epoch(1_000_000_000, 1_000_000_000, 5_000_000_000_000);
         // freq=0 → no correction. 0.5s later.
-        assert_eq!(c.now_from_capture_ns(1_500_000_000), Some(5_000_500_000_000));
+        assert_eq!(
+            c.now_from_capture_ns(1_500_000_000),
+            Some(5_000_500_000_000)
+        );
     }
 
     #[test]
@@ -477,7 +488,10 @@ mod tests {
         assert_eq!(c.freq_ppb(), 100_000);
         c.update_epoch(0, 0, 0);
         // local elapsed 1e9 ns. true elapsed = 1e9 - 1e9*1e5/1e12 = 1e9 - 1e5.
-        assert_eq!(c.now_from_capture_ns(1_000_000_000), Some(1_000_000_000 - 100_000));
+        assert_eq!(
+            c.now_from_capture_ns(1_000_000_000),
+            Some(1_000_000_000 - 100_000)
+        );
     }
 
     #[test]
@@ -532,7 +546,11 @@ mod tests {
         let target = 5_000_000_000_000 + 3_000_000_000;
         let local = c.query_ns_for_unix_ns(target).unwrap();
         let back = c.now_from_query_ns(local as u64).unwrap();
-        assert!((back - target).abs() <= 2, "roundtrip off by {}", back - target);
+        assert!(
+            (back - target).abs() <= 2,
+            "roundtrip off by {}",
+            back - target
+        );
         // If the correction works, local elapsed > true elapsed (the fast crystal runs ahead): +3ppm×3s ≈ +9µs.
         assert!(local > 1_000_000_000 + 3_000_000_000);
     }
@@ -548,7 +566,11 @@ mod tests {
         let target = 5_000_000_000_000 + 3_000_000_000; // UTC 3 seconds later
         let tick = c.capture_ns_for_unix_ns(target).unwrap(); // drive the pin at this capture tick for UTC=target
         let back = c.now_from_capture_ns(tick as u64).unwrap();
-        assert!((back - target).abs() <= 2, "roundtrip off by {}", back - target);
+        assert!(
+            (back - target).abs() <= 2,
+            "roundtrip off by {}",
+            back - target
+        );
         // The crystal is +3ppm fast, so for UTC 3s ahead the capture tick is ahead of the true elapsed (+9µs).
         assert!(tick > 1_000_000_000 + 3_000_000_000);
     }
