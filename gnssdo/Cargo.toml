@@ -1,0 +1,28 @@
+[package]
+name = "gnssdo"
+version = "0.1.0"
+edition = "2021"
+description = "no_std, HAL-agnostic GNSS PPS disciplined clock & holdover core (GPSDO): crystal frequency (ppb) estimation, PPS edge tracking, and NMEA/PPS time synchronization. Integer-only, zero-dependency core."
+keywords = ["gnssdo", "gpsdo", "gnss", "pps", "no_std"]
+categories = ["embedded", "no-std", "science"]
+license = "MIT"
+repository = "https://github.com/sksat/pico-gnss-rs"
+
+[lib]
+name = "gnssdo"
+
+[features]
+# NMEA の時刻/日付抽出を nmea crate に切り替える (default は依存ゼロの自前パーサ)。
+# 性能/サイズ (実機 RP2040 Cortex-M0+ @125MHz 実測):
+#   自前  ≈ 37 µs/RMC・パース実体 ≈ 0.8KB・依存 0
+#   nmea  ≈ 619 µs/RMC (≈ 17x 遅い)・firmware .text +約 52KB・nom/chrono 等 6 crate
+# 1Hz 用途では速度差は無視できる。挙動差: nmea は checksum 検証あり・年は世紀ピボット
+# (yy=94→1994)、自前は未検証・20xx 固定。
+external-nmea = ["dep:nmea", "dep:chrono"]
+
+[dependencies]
+heapless = "0.9.3"
+# nmea feature 用 (任意・no_std)。
+nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }
+# nmea feature 時に RMC の時刻/日付 (chrono 型) からフィールドを取り出すため。
+chrono = { version = "0.4", default-features = false, optional = true }

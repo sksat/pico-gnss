@@ -18,8 +18,10 @@ GYSFFMANC ──NMEA(UART0 RX=GP1)──┐
   - `NMEA $GxXXX,...*hh`
   - `PPS count=<n> interval_us=<us> state=<First|Locked|Irregular> missed=<m>`
   - `SYNC pps_local_us=<t> unix_s=<s> drift_us=<d>`
-- **host テスト可能なロジックを lib に分離** (`src/assembler.rs` フレーミング, `src/pps.rs` PPS 判定,
-  `src/timesync.rs` クロック規律)。embassy を target-gated dep にし `cargo test-host` で host 実行。
+- **host テスト可能なロジックを `gnssdo` コア crate に分離** (Cargo workspace。`gnssdo/` = 依存ゼロの
+  no_std lib、`firmware/` = embedded 専用)。コアは `cargo test -p gnssdo` で host 実行。firmware は
+  `cd firmware && cargo run`。GPSDO 規律=`gnssdo/src/gpsdo.rs`、PPS=`pps.rs`、時刻同期=`timesync.rs`、
+  NMEA フレーミング=`assembler.rs`。
 - webapp は **React 19 + Vite + TypeScript + react-leaflet**、Node ブリッジは依存ゼロ。
 
 ## 時刻同期の設計
@@ -254,7 +256,7 @@ stage② の位相ロックが sub-µs に収束した後、長尺 (~10分) で�
    初回捕捉 (samples==0) では検疫しない (起動時の捕捉を遅らせない)。
 4. **状態依存 alpha**: 未ロック収束中は速い `1/8`、ロック後は `1/32`。
 - ログ `PPS ... freq=<ok|gate|quar|sane>` で各エッジの採否が見える。実機: 固定窓際の clean 受信では全 `ok`、
-  欠落復帰時のみ `quar`×5。`FreqUpdate` enum + host テスト (`gpsdo::tests`) でゲート/検疫を網羅。
+  欠落復帰時のみ `quar`×5。`FreqUpdate` enum + host テスト (`gnssdo` の test) でゲート/検疫を網羅。
 
 ## 精度指標の意味 (webapp ヘッダ)
 

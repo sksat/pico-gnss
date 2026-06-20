@@ -1,0 +1,57 @@
+[package]
+name = "pico-gnss"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# firmware 本体 (embassy-rp, no_std/no_main)。embedded 専用クレート。
+[[bin]]
+name = "pico-gnss"
+path = "src/main.rs"
+
+# on-target ベンチ (src/bin/bench_nmea_parse.rs)。通常 build では作られない (bench feature 必須)。
+# 実機で: cd firmware && cargo run --release --features bench --bin bench_nmea_parse
+[[bin]]
+name = "bench_nmea_parse"
+path = "src/bin/bench_nmea_parse.rs"
+required-features = ["bench"]
+
+[features]
+# firmware の NMEA 抽出を nmea crate 版に切り替える (gnssdo の external-nmea feature を有効化)。
+external-nmea = ["gnssdo/external-nmea"]
+# on-target ベンチを有効化。bench bin は nmea crate を直接呼ぶため dep:nmea を引く。
+bench = ["dep:nmea"]
+
+[dependencies]
+gnssdo = { path = "../gnssdo" }
+heapless = "0.9.3"
+# bench bin が nmea crate を直接呼ぶため (firmware 本体は default で gnssdo の自前パーサ)。
+nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.3"
+# embassy-rp 0.10 は defmt 1.x を要求する。logger も同世代の defmt-rtt 1.x を使う。
+defmt = "1.0"
+defmt-rtt = "1.0"
+embassy-executor = { version = "0.10.0", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "executor-interrupt",
+    "defmt",
+] }
+embassy-rp = { version = "0.10.0", features = [
+    "defmt",
+    "unstable-pac",
+    "time-driver",
+    "critical-section-impl",
+    "rp2040",
+] }
+embassy-time = { version = "0.5.1", features = [
+    "defmt",
+    "defmt-timestamp-uptime",
+] }
+embassy-sync = { version = "0.7.2", features = ["defmt"] }
+embassy-futures = "0.1.1"
+static_cell = "2.1.1"
+embedded-io-async = "0.7.0"
+portable-atomic = { version = "1.13.1", features = ["critical-section"] }
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }

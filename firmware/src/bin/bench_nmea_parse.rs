@@ -34,8 +34,8 @@ async fn main(_spawner: Spawner) {
     let mut acc = 0u64;
     for _ in 0..N {
         let s = core::hint::black_box(RMC);
-        let time = s.split(',').nth(1).and_then(pico_gnss::parse_hhmmss);
-        let date = s.split(',').nth(9).and_then(pico_gnss::parse_ddmmyy);
+        let time = s.split(',').nth(1).and_then(gnssdo::parse_hhmmss);
+        let date = s.split(',').nth(9).and_then(gnssdo::parse_ddmmyy);
         if let (Some((h, mi, se)), Some((d, mo, y))) = (time, date) {
             acc += h as u64 + mi as u64 + se as u64 + d as u64 + mo as u64 + y as u64;
         }

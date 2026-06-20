@@ -50,7 +50,7 @@ use heapless::String;
 use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
-use pico_gnss::{
+use gnssdo::{
     civil_to_unix, parse_rmc_time_date, snap_to_second_ns, DisciplinedClock, FreqUpdate,
     NmeaLineAssembler, PpsEvent, PpsTracker,
 };

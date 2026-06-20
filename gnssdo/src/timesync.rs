@@ -59,13 +59,13 @@ pub fn parse_ddmmyy(field: &str) -> Option<(u8, u8, u16)> {
 ///
 /// 入力は assembler でフレーム済みの NMEA 1 文 (`$` + 2 文字 talker、例 `$GPRMC,...` `$GNRMC,...`) を想定。
 ///
-/// default は自前パーサ。feature `nmea` を有効にすると [`nmea`](https://docs.rs/nmea) crate に委譲する。
+/// default は自前パーサ。feature `external-nmea` を有効にすると [`nmea`](https://docs.rs/nmea) crate に委譲する。
 /// バックエンドで挙動が次のように異なる:
 /// - **checksum**: 自前=**非検証** / nmea=**検証** (不一致は `None`)。
 /// - **年**: 自前=**20xx 固定** (`2000+yy`) / nmea=**世紀ピボット** (`yy=94`→1994)。
 /// - **閏秒 `ss=60`**: 自前=**受理** (civil_to_unix が次分へ繰り上げ) / nmea=**拒否** (`None`)。
 /// - **速度/サイズ**: nmea は実機 RP2040 で約 **17x 遅く・firmware `.text` 約 +52KB** (1Hz では無視可)。
-#[cfg(not(feature = "nmea"))]
+#[cfg(not(feature = "external-nmea"))]
 pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16))> {
     if sentence.get(3..6) != Some("RMC") {
         return None;
@@ -77,7 +77,7 @@ pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16
 
 /// RMC から `((時,分,秒),(日,月,年))` を取り出す (nmea crate 版)。詳細は default 版の doc 参照。
 /// `nmea::parse_str` は **checksum を検証**してから RMC を取り出す (不一致は `None`)。
-#[cfg(feature = "nmea")]
+#[cfg(feature = "external-nmea")]
 pub fn parse_rmc_time_date(sentence: &str) -> Option<((u8, u8, u8), (u8, u8, u16))> {
     use chrono::{Datelike, Timelike};
     use nmea::ParseResult;
@@ -250,9 +250,9 @@ mod tests {
         let r = parse_rmc_time_date(s).unwrap();
         assert_eq!(r.0, (12, 35, 19)); // 時刻は両バックエンドで一致
         // 年解釈は異なる: 自前=20xx 固定 (2094)、nmea=世紀ピボット (1994)。
-        #[cfg(not(feature = "nmea"))]
+        #[cfg(not(feature = "external-nmea"))]
         assert_eq!(r.1, (23, 3, 2094));
-        #[cfg(feature = "nmea")]
+        #[cfg(feature = "external-nmea")]
         assert_eq!(r.1, (23, 3, 1994));
     }
 
@@ -267,9 +267,9 @@ mod tests {
         // checksum を改ざんした RMC (正は *6A、誤の *00)。
         let bad = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*00";
         // 自前は checksum 非検証なので通る。nmea は parse_str が検証して弾く。
-        #[cfg(not(feature = "nmea"))]
+        #[cfg(not(feature = "external-nmea"))]
         assert!(parse_rmc_time_date(bad).is_some());
-        #[cfg(feature = "nmea")]
+        #[cfg(feature = "external-nmea")]
         assert!(parse_rmc_time_date(bad).is_none());
     }
 
