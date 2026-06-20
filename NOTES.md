@@ -68,10 +68,10 @@ PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを�
   webapp はこれで device 規律クロックを表示し、PPS 断時は holdover カウンタを出す。
 - 補正式: 真の経過 = local 経過 − local経過 × ppb/1e9 (local が ppb 分速い/遅いぶんを補正)。
   ロック後 holdover に入ると、残差周波数誤差ぶんだけ時刻がドリフトする (フル ppm でなく)。
-- **時刻補正 API (PIO/Instant 二系統)**: クロックは 2 つの local 時刻でアンカーする。
-  - `now_ns(pio)` = **PIO timebase** (ns 精度)。PPS エッジでの `err_ns` 計測に使う。
-  - `now_from_instant_ns(inst)` = **Instant timebase** (連続クエリ/ticker 用、サブ秒は µs)。
-  - `local_instant_for_unix_ns(utc)` = 指定 UTC が来る Instant local 時刻 (スケジューリング/補正待ち)。
+- **時刻補正 API (capture/query 二系統)**: クロックは 2 つの local 時刻でアンカーする (RP2040 では capture=PIO, query=Instant)。
+  - `now_from_capture_ns(capture)` = **capture timebase** (RP2040 では PIO, ns 精度)。PPS エッジでの `err_ns` 計測に使う。
+  - `now_from_query_ns(query)` = **query timebase** (RP2040 では Instant, 連続クエリ/ticker 用、サブ秒は µs)。
+  - `query_ns_for_unix_ns(utc)` = 指定 UTC が来る query (Instant) local 時刻 (スケジューリング/補正待ち)。
 - 精度は `err_ns` (補正後の 1 秒先読み残差) で測れる。当初エポックを Instant (µs) で取っていたので
   **±数µs** が下限だったが、err はエッジ同士で測るので **エポックも予測も PIO の ns 時刻**にしたら
   **σ ≈ 11ns / peak-peak ~37ns** (16ns tick が下限) まで下がった。補正なしなら毎秒 ~2.8µs ずれる。
@@ -81,9 +81,9 @@ PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを�
   (実機ログで `pps_local_us` が複数秒重複して発覚)。② **`snap_to_second_ns`** — 復帰時の整数秒ズレを除いて
   sub 秒残差だけ残す。これで **N 秒 holdover の真の時刻誤差**が読める (実データ: 25s holdover → 360ns)。
 - **補正タイマ**: `true_to_local_ns(true_ns)` で「真の時間で N 待つ」のに必要なローカル ns を得る
-  (生の `Timer::after` は水晶公差 +2.7ppm 分ズレる)。これと `local_instant_for_unix_ns` が補正の素。
+  (生の `Timer::after` は水晶公差 +2.7ppm 分ズレる)。これと `query_ns_for_unix_ns` が補正の素。
 - **規律 PPS 出力 — 2 段階**:
-  - ソフト版 (旧 `pps_out_task`): `local_instant_for_unix_ns` で UTC 秒境界をスケジュールし GPIO トグル。
+  - ソフト版 (旧 `pps_out_task`): `query_ns_for_unix_ns` で UTC 秒境界をスケジュールし GPIO トグル。
     holdover 対応だが `late` は embassy executor ジッタが下限 (実機 mean ~1.4ms / σ ~244µs) → 廃止。
   - **PIO 版 (現行)**: SM1 が GP3 に規律パルスを**ハード生成** (周期 = clk×(1+ppb/1e9)-overhead を CPU が
     毎秒 push、`pull noblock` で保持)。エッジは executor 非依存。SM2 が GP4 で**ループバック捕捉** (GP3→GP4

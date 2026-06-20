@@ -71,6 +71,3 @@ made unrepresentable via `NonZero*` types.
   Backend differences: the `nmea` crate validates checksums, interprets the year with
   a century pivot (`yy=94`→1994), and rejects leap-second `ss=60`; the built-in parser
   skips checksums, assumes 20xx, and accepts `ss=60`.
-
-This is the discipline core behind the RP2040 `pico-gnss` firmware in the
-[same repository](https://github.com/sksat/pico-gnss-rs).
