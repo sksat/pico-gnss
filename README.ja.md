@@ -72,4 +72,8 @@ before/after — 位相の「測定」精度 (Instant ±ms → PIO 16 ns) と、
 
 ![before/after](report/compare.png)
 
+規律 1PPS をオシロで GPS 基準と独立検証 (GPS エッジを画面中央=0 に; 生成側はわずかに早く、量は操舵可能):
+
+![オシロ: 規律 1PPS vs GPS PPS](report/scope-pps-small.png)
+
 手法の詳細・全図は [`report/REPORT.md`](report/REPORT.md) を参照。

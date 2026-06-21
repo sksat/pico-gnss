@@ -75,4 +75,9 @@ output phase:
 
 ![before/after](report/compare-en.png)
 
+Independently cross-checked on an oscilloscope against the GPS reference (GPS edge at screen
+center = 0; the disciplined output leads it by a small, steerable offset):
+
+![oscilloscope: disciplined 1PPS vs GPS PPS](report/scope-pps-small.png)
+
 See [`report/REPORT.md`](report/REPORT.md) for the full methodology and figures (Japanese).
