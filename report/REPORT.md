@@ -223,6 +223,11 @@ K 較正の頑健化 (良 fix / 外れ値除去 / サンプル増) か一度き�
 `hwphase` は ±100ns 内に収束しスパイク消失。残る ~110ns の mean は loopback 経路 + ケーブル + 受信機 PPS 固有の
 物理オフセットで、絶対 UTC 整合が要るならここを一度ケーブル較正で焼けばよい (制御ではこれ以上は受信品質律速)。
 
+![GPS と整合した出力 1PPS](scope-pps-aligned.png)
+
+*3 修正後: CH1(黄)=GPS と CH2(青)=GP3 の立ち上がりが中央=0 で重なる (残差 ~110ns は 1µs/div では分解できない)。
+当初の ~2µs リード ([scope-pps-small.png](scope-pps-small.png) / [-large.png](scope-pps-large.png)) と対照的。*
+
 ### ループバック無しの構成では
 
 ループバック (GP3→GP4) は出力エッジ vs GPS を ns でハード測定して**位相を閉ループ化**する仕組み。外すと:
