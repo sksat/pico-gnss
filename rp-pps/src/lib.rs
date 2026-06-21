@@ -104,11 +104,20 @@ pub fn pps_capture_program() -> Program<32> {
 ///
 /// Once at start it pulls a *high-width word* and stashes it in `ISR` (the high pulse length in PIO
 /// clock cycles — set it once, e.g. via [`output_high_cycles`]). Then each iteration pulls a fresh
-/// *low-period word* from the TX FIFO (`pull noblock`, so if the FIFO is empty the previously latched
-/// period is reused — the output free-runs at the last commanded rate), emits the rising edge, holds
+/// *low-period word* from the TX FIFO via `pull noblock`, emits the rising edge, holds
 /// high for the stashed width (`jmp x-- high`), drops, and holds low for the rest of the second
 /// (`jmp y-- low`). The disciplined quantity is the *rising edge*; the high width is timing-neutral
 /// (it is accounted for in the low-period word, so widening the pulse does not move the edge).
+///
+/// **Empty-FIFO behaviour (important)**: a non-blocking `pull` on an *empty* TX FIFO does **not**
+/// hold the last period. Per the RP2040 datasheet (§3.4.7.2) it copies scratch `X` into the OSR
+/// (equivalent to `MOV OSR, X`); recycling the last word would require an explicit `MOV X, OSR`
+/// after the pull, which this program does not do — and cannot, since `X` = high-phase count and
+/// `Y` = low-phase count leave no spare register. At the `pull`, `X` is the *spent* high counter
+/// (`0xFFFFFFFF`, having wrapped past 0 in `jmp x-- high`), so an empty pull loads a ~2³²-cycle
+/// period (~34 s at 125 MHz): one dropped PPS, not a graceful free-run at the last rate. The caller
+/// must therefore push a fresh period on **every** edge; in practice the period is pushed ~1 s ahead
+/// of the pull (right after the loopback capture), so the FIFO is non-empty when the SM pulls.
 ///
 /// **Backend setup contract**: configure the output pin as the SM's `set` pin. Push the high-width
 /// word first, then an initial low-period word, before enabling (see [`output_high_cycles`] /
@@ -247,6 +256,14 @@ pub fn loopback_phase_ticks(
 /// Phase, in nanoseconds, of an output 1PPS edge relative to the reference edge:
 /// [`loopback_phase_ticks`] converted to ns (multiply-before-divide, exact at 125 MHz where one
 /// tick is 16 ns). Feed this to a phase servo (e.g. `gnssdo`'s `PhaseLockLoop`).
+///
+/// **Edge-definition note**: this phase is defined at the **PIO input switching threshold** of the
+/// two captured pins (the digital edge the state machines actually see), *not* at a scope mid-level
+/// crossing. An oscilloscope that triggers/measures at a different threshold (e.g. 1.65 V mid-level
+/// vs the RP2040 input V_IH) reads a *definitional* offset on top of the real one — and it grows if
+/// the two signals have different edge slopes (a fast logic output vs a slower receiver PPS). To
+/// cross-check this servo against a scope like-for-like, set the scope threshold to the RP2040 input
+/// threshold; otherwise a large part of the apparent absolute offset is just the threshold mismatch.
 pub fn loopback_phase_ns(
     reference_capture: u32,
     output_capture: u32,

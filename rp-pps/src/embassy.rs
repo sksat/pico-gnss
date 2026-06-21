@@ -140,8 +140,11 @@ impl<'d, PIO: Instance, const SM: usize> PpsOutput<'d, PIO, SM> {
         Self { sm, prog, pin }
     }
 
-    /// Commit the next period word (the program holds the previous one until then). Returns `false`
-    /// if the TX FIFO was full. Compute it with [`crate::output_period_cycles_ppb`].
+    /// Commit the next period word for the next output edge. Returns `false` if the TX FIFO was full
+    /// (the push was dropped). NOTE: the program does **not** hold the last period on an empty FIFO —
+    /// an empty `pull noblock` loads scratch `X` (a spent counter, garbage here), so a fresh period
+    /// must be pushed every edge or the output drops a pulse (see [`crate::pps_output_program`]).
+    /// Compute it with [`crate::output_period_cycles_ppb`].
     pub fn set_period(&mut self, period_word: u32) -> bool {
         self.sm.tx().try_push(period_word)
     }
