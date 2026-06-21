@@ -114,7 +114,7 @@ async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
         // wait_edge + timeline.observe は TimedPpsCapture に委譲。生カウンタは edge.raw で取れる。
         let edge = capture.next_edge().await;
         C0_GPS.store(edge.raw, Ordering::Relaxed); // stage②: 最新 GPS エッジの生カウンタを共有
-        C0_GEN.fetch_add(1, Ordering::Relaxed); // 世代++ (gen_capture が欠落検出に使う)
+        C0_GEN.fetch_add(1, Ordering::Release); // 世代++ (Release: gen 進行を見たら直前の C0_GPS store が見える)
         // エポックのアンカー用に Instant を読む (µs ジッタは絶対オフセットのみに効く)。
         let query_ns = now_local_ns();
 
@@ -190,9 +190,18 @@ async fn gen_capture_task(
     let mut pll = PhaseLockLoop::new();
     loop {
         let x = sm.rx().wait_pull().await; // x = 出力エッジの生カウンタ (C2_out)
+        // 出力は GPS より僅かに先行しうる。x[N] で起きた時点でまだ pps_task が GPS[N] を store して
+        // いないと C0_GPS は GPS[N-1] のまま → x[N] を GPS[N-1] と対にして +ppm×1s (≈3.3µs) のスパイクに
+        // なる。同秒の GPS エッジ (世代が進む) を短時間だけ協調待ち。pps_task と同 executor なので busy wait
+        // 不可: yield_now で必ず手を放す。timeout 時は GPS 先行/欠落とみなし既存の fresh gating が判定。
+        let start_gen = C0_GEN.load(Ordering::Acquire);
+        let wait_until = Instant::now() + Duration::from_micros(500);
+        while C0_GEN.load(Ordering::Acquire) == start_gen && Instant::now() < wait_until {
+            embassy_futures::yield_now().await;
+        }
         // GPS PPS の世代。前回の出力エッジから進んでいなければ GPS 欠落 → C0_GPS が古い → 補正に使わない
         // (弱信号で PPS が時々落ちると、古い基準で巨大補正が走り出力が ~100ms 飛ぶのを防ぐ。断中はホールド)。
-        let cur_gen = C0_GEN.load(Ordering::Relaxed);
+        let cur_gen = C0_GEN.load(Ordering::Acquire);
         let fresh = cur_gen != last_gen;
         last_gen = cur_gen;
         // 出力周期。PIO ~68s 周回グリッチの偽エッジは間隔が異常 → 位相補正に使わない。
