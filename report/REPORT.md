@@ -434,3 +434,35 @@ cd webapp && node dist/server.js --log /tmp/x.log
 uv run analyze.py /tmp/x.log
 uv run plot_report.py /tmp/x.log out.png
 ```
+
+## 受信機の製品比較（次の一手の候補）
+
+MT3333 の限界（qErr も survey-in も無く、コマンドでも詰められない）を踏まえ、乗り換え候補を複数の観点で並べる。
+調査時点（2026-06）の一次情報で、在庫と価格は変動する。
+アンテナは現用の一体型と違い、現用以外はすべて別途用意する。
+
+「RF 設計」列の意味：不要は既製ブレークアウトを digital（UART と 1PPS）で繋ぐかアンテナ一体、最小は自己バイアスで 50Ω 線路のみ、要は bias-tee を自作。
+「JLCPCB」列は自作基板に載せる場合の LCSC 部番と区分、在庫を示す。timing モジュールは Basic が無く在庫も薄い。
+
+| 製品（形態） | timing 機能 / 1PPS | RF 設計 | JLCPCB PCBA | 入手と在庫 | 価格(目安) | lifecycle |
+|---|---|---|---|---|---|---|
+| **MT3333**（AE-GNSS-EXTANT、現用、一体型） | 無 / 30ns RMS | 不要（一体） | 該当無（秋月モジュール） | 秋月 潤沢 | ¥2,980 | 旧世代だが流通 |
+| u-blox **NEO-M8T ブレークアウト** | qErr（UBX-TIM-TP）+ survey-in | **不要**（digital 接続） | 基板買いで該当無 | GNSS Store 100+ | ~¥11,000 | M8 **EOL**（流通あり） |
+| u-blox **ZED-F9T ブレークアウト** | qErr + survey-in / 5ns（補正 2.5ns） | **不要**（digital 接続） | 基板買いで該当無 | GNSS Store / Switch Science 取寄 | ¥31,000〜55,000 | Active（-20B） |
+| ST **Teseo-LIV4F**（bare, LCC-18） | qErr + 位置保持 / dual L1+L5 | **最小**（自己バイアス, 内蔵 LNA と SAW） | C6284698, Extended, 在庫 0 | DigiKey 単品 | $12（chip） | Active（〜2030） |
+| Quectel **L26-T**（bare, LCC-24） | qErr + ケーブル遅延補正 + 位置保持 / ±6.8ns | 要（bias-tee） | C5349112, Extended, 在庫 0 | DigiKey 276 | $24（chip） | Active |
+| ST Teseo-LIV3F（bare, LCC-18） | qErr + 位置保持 / L1 | 要（bias-tee） | C2649477, Extended, 在庫 9 | EVB $236/在庫 0 | $18（chip） | **NRND** |
+| 参考: ATGM336H 等 nav 系 | **無**（1PPS は出るが qErr 無） | 該当無 | C90770, Extended, 在庫 1 万+ | 潤沢 | 安 | Active |
+
+読み方を整理する。
+**JLCPCB ターンキーで timing は揃わない**。
+timing 系は全て Extended かつ在庫が薄く、JLC に潤沢な GNSS（ATGM336H 等）は qErr も survey-in も無いので乗り換えにならない。
+
+RF 設計を避けたいなら既製ブレークアウトを digital 接続する。
+最安は NEO-M8T（~¥11,000、qErr 出力、UART と 1PPS を Pico に繋ぐだけで自作基板も RF も要らない）だが、M8 は EOL なので一品もの向きである。
+Active が要るなら ZED-F9T ブレークアウト（高価）。
+
+自作基板に載せるなら RF が最小なのは Teseo-LIV4F で、自己バイアスのため 50Ω 線路だけで済み、$12 で dual-band、Active である。
+timing の公表スペックを取るなら L26-T（ただし bias-tee を自作）。
+
+いずれの候補でも gnssdo コアは流用でき、受信層を差し替えて qErr を PPS タイムスタンプから引く一段を足すだけで載る。
