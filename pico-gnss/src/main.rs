@@ -283,10 +283,15 @@ async fn main(spawner: Spawner) {
     cfg_gp2.set_jmp_pin(capture.capture().jmp_pin()); // SM0 と同じ GP2 を捕捉 (fine tier へ escape)
     sm2.set_config(&cfg_gp2);
     sm2.set_enable(true);
+    // K 較正前に両 SM の RX FIFO を drain → 次エッジから c0/c2 が同一 GP2 エッジになることを保証する。
+    // (古い値が残り c0/c2 が 1 エッジずれると、loopback の fold は公称秒 (62.5M tick) なので K に
+    //  「実秒ぶんの tick」が混じり、mean が 水晶 ppm × 1s ≈ 数µs だけ boot ごとにずれる。)
+    while capture.capture_mut().try_read().is_some() {}
+    while sm2.rx().try_pull().is_some() {}
     // SM0 と SM2 で同じ GP2 エッジを捕り、生カウンタ差 K=mean(C0−C2) を rp-pps で較正。
-    // 先頭 2 エッジは捨てる。PPS は fix 後のみ出るので各 30s 待ち、出なければ打ち切り。
+    // PPS は fix 後のみ出るので各 30s 待ち、出なければ打ち切り。
     let mut k_samples: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
-    for i in 0..7u32 {
+    for _ in 0..6u32 {
         match with_timeout(Duration::from_secs(30), async {
             let c0 = capture.capture_mut().wait_edge().await; // 較正は生カウンタ (fine tier へ escape)
             let c2 = sm2.rx().wait_pull().await;
@@ -294,12 +299,15 @@ async fn main(spawner: Spawner) {
         })
         .await
         {
-            Ok(pair) if i >= 2 => {
+            Ok(pair) => {
                 let _ = k_samples.push(pair);
             }
-            Ok(_) => {}
             Err(_) => break,
         }
+    }
+    // 同一エッジ較正の健全性: 各 c0−c2 はほぼ一定のはず (1 エッジずれなら ~±62.5M tick になる)。
+    for (c0, c2) in k_samples.iter() {
+        info!("PHASE_K diff={}", c0.wrapping_sub(*c2) as i32);
     }
     let k = match rp_pps::calibrate_loopback_offset(k_samples.iter().copied()) {
         Some(k) => {
@@ -311,6 +319,23 @@ async fn main(spawner: Spawner) {
             0
         }
     };
+    // K 検証: SM2 を GP2 のまま数エッジ、loopback_phase が ~0 を確認 (数µs 出るなら K 不良)。
+    while capture.capture_mut().try_read().is_some() {}
+    while sm2.rx().try_pull().is_some() {}
+    for _ in 0..3u32 {
+        if let Ok((c0, c2)) = with_timeout(Duration::from_secs(30), async {
+            let c0 = capture.capture_mut().wait_edge().await;
+            let c2 = sm2.rx().wait_pull().await;
+            (c0, c2)
+        })
+        .await
+        {
+            info!(
+                "PHASE_K verify phase_ns={}",
+                rp_pps::loopback_phase_ns(c0, c2, k, clk_sys_freq())
+            );
+        }
+    }
 
     // SM2 を GP4 (ループバック) に切替。set_config は X を触らないので K は有効のまま。
     let mut cfg_gp4 = PioConfig::default();
