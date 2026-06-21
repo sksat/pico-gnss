@@ -13,6 +13,12 @@ GNSS 受信機の 1Hz PPS 立ち上がりは UTC 秒境界を刻みます。本�
 ナノ秒分解能で捕捉し、ローカル水晶の周波数誤差を推定して、**PPS が切れている間
 (holdover) も含めて**規律された UTC を保ちます。
 
+![pico-gnss ハードウェア](docs/pico-gnss-hardware.jpg)
+
+*評価ハードウェア: Raspberry Pi Pico (RP2040) を breakout に載せ、秋月 [AE-GNSS-EXTANT](https://akizukidenshi.com/catalog/g/g113849/)
+(太陽誘電 GYSFFMANC, MediaTek MT3333) GNSS モジュールをリボンケーブルで接続。規律 1PPS
+出力 (GP3) と GPS PPS にオシロのプローブを当てて位相を測る。*
+
 ![pico-gnss リアルタイムダッシュボード](docs/dashboard.png)
 
 *リアルタイム Web ダッシュボード (`webapp/`): GPSDO 規律 UTC・PPS ジッタ・周波数規律と
@@ -48,7 +54,7 @@ embedded 専用で、`pico-gnss/`(その `.cargo/config.toml` が `thumbv6m-none
 ## ハードウェア
 
 - **MCU**: RP2040 (Raspberry Pi Pico, Seeed XIAO RP2040 など)。
-- **GNSS モジュール** (NMEA + 1PPS 出力)。例: 秋月 `AE-GNSS-EXTANT` /
+- **GNSS モジュール** (NMEA + 1PPS 出力)。例: 秋月 [`AE-GNSS-EXTANT`](https://akizukidenshi.com/catalog/g/g113849/) /
   GYSFFMANC (MediaTek MT3333)、9600 baud。
 - **配線**: UART0 RX = GP1 (モジュール TX)、UART0 TX = GP0 (モジュール RX)、PPS = GP2。
   共通 GND が必要。

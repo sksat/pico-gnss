@@ -14,6 +14,12 @@ captures that edge with nanosecond resolution, estimates the local crystal's
 frequency error, and keeps disciplined UTC — including **holdover** while the PPS
 signal is lost.
 
+![pico-gnss hardware](docs/pico-gnss-hardware.jpg)
+
+*The hardware: a Raspberry Pi Pico (RP2040) on a breakout, the Akizuki [AE-GNSS-EXTANT](https://akizukidenshi.com/catalog/g/g113849/)
+(Taiyo Yuden GYSFFMANC, MediaTek MT3333) GNSS module on the ribbon cable, and oscilloscope
+probes on the disciplined GP3 1PPS output and the GPS PPS for the phase measurements.*
+
 ![pico-gnss real-time dashboard](docs/dashboard.png)
 
 *Real-time web dashboard (`webapp/`): GPSDO-disciplined UTC, PPS jitter, frequency
@@ -50,7 +56,7 @@ built from within `pico-gnss/` (where its `.cargo/config.toml` selects the
 ## Hardware
 
 - **MCU**: RP2040 (Raspberry Pi Pico, Seeed XIAO RP2040, …).
-- **GNSS module** with NMEA + 1PPS output, e.g. Akizuki `AE-GNSS-EXTANT` /
+- **GNSS module** with NMEA + 1PPS output, e.g. Akizuki [`AE-GNSS-EXTANT`](https://akizukidenshi.com/catalog/g/g113849/) /
   GYSFFMANC (MediaTek MT3333), 9600 baud.
 - **Wiring**: UART0 RX = GP1 (module TX), UART0 TX = GP0 (module RX), PPS = GP2.
   Common ground is required.
