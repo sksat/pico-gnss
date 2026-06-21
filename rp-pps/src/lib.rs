@@ -260,10 +260,11 @@ pub fn loopback_phase_ticks(
 /// **Edge-definition note**: this phase is defined at the **PIO input switching threshold** of the
 /// two captured pins (the digital edge the state machines actually see), *not* at a scope mid-level
 /// crossing. An oscilloscope that triggers/measures at a different threshold (e.g. 1.65 V mid-level
-/// vs the RP2040 input V_IH) reads a *definitional* offset on top of the real one — and it grows if
-/// the two signals have different edge slopes (a fast logic output vs a slower receiver PPS). To
-/// cross-check this servo against a scope like-for-like, set the scope threshold to the RP2040 input
-/// threshold; otherwise a large part of the apparent absolute offset is just the threshold mismatch.
+/// vs the RP2040 input V_IH) reads a *definitional* offset on top of the real one, which grows when
+/// the two signals have different edge slopes. Measured on hardware (sweeping the scope threshold
+/// over the RP2040 0.8..2.0 V input band), this definitional term is only ~1.4 ns here: both edges
+/// are fast, so the threshold barely moves the crossing. The bulk of the relative GP3-vs-GPS offset
+/// is therefore elsewhere (path/pad delays, K residual, probe skew), not the edge definition.
 pub fn loopback_phase_ns(
     reference_capture: u32,
     output_capture: u32,
