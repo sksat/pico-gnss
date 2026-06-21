@@ -212,6 +212,77 @@ def cmd_capture(scope, out, timebase_s=None):
     print(f"wrote {out} ({scope.screenshot(out)} bytes)")
 
 
+def cmd_converge(scope, out, n=220, timebase_s=1e-6):
+    """Log the scope GPS->gen offset vs elapsed time during lock acquisition.
+
+    1 us/div (+-5 us, 10 ns resolution) captures the *detailed* final pull-in into the lock window;
+    while the edge is still far out it is off-window and logged as nan (the firmware self-report
+    covers that wide early part). Run this while the firmware is freshly booting (alongside
+    `cargo run`) to capture the convergence.
+    """
+    for c in (
+        ":CHANnel1:DISPlay 1", ":CHANnel2:DISPlay 1",
+        ":CHANnel1:PROBe 1", ":CHANnel2:PROBe 10",
+        ":TRIGger:EDGE:SOURce CHANnel1", ":TRIGger:EDGE:SLOPe POSitive", ":TRIGger:EDGE:LEVel 1.65",
+        ":TIMebase:MAIN:OFFSet 0", f":TIMebase:MAIN:SCALe {timebase_s}",
+    ):
+        scope.send(c)
+    xinc = float(scope.query(":WAVeform:XINCrement?"))
+    t0 = time.monotonic()
+    with open(out, "w") as f:
+        f.write("# elapsed_s offset_ns  (GPS->gen during lock acquisition; nan = out of window)\n")
+        for _ in range(n):
+            ok = scope.single()
+            el = time.monotonic() - t0
+            i1 = rising_edge(scope.waveform(1)) if ok else None
+            i2 = rising_edge(scope.waveform(2)) if ok else None
+            if i1 is None or i2 is None or not (15 < i2 < 985):
+                f.write(f"{el:.1f} nan\n")
+            else:
+                f.write(f"{el:.1f} {(i2 - i1) * xinc * 1e9:.0f}\n")
+            f.flush()
+    print(f"wrote {out}")
+
+
+def cmd_jitter(scope, out, timebase_s=20e-9, accumulate_s=6.0):
+    """Show the gen-edge jitter as an infinite-persistence band at a fine timebase.
+
+    Triggers on the GPS edge and centers a fine window on the gen edge (the GPS edge then sits
+    off-screen left; the scope's `D` delay readout = the offset). Infinite persistence smears the
+    gen rising edge over `accumulate_s` of free-run, so the *horizontal width of the gen-edge band
+    IS the jitter*. Short accumulation keeps the slow sub-µs wander from broadening it much.
+    """
+    for c in (
+        ":CHANnel1:DISPlay 1", ":CHANnel2:DISPlay 1",
+        ":CHANnel1:PROBe 1", ":CHANnel2:PROBe 10",
+        ":CHANnel1:SCALe 0.6", ":CHANnel2:SCALe 0.6",
+        ":CHANnel1:OFFSet -2.1", ":CHANnel2:OFFSet -2.1",
+        ":TRIGger:EDGE:SOURce CHANnel1", ":TRIGger:EDGE:SLOPe POSitive", ":TRIGger:EDGE:LEVel 1.65",
+        ":DISPlay:GRADing:TIME MIN", ":TIMebase:MAIN:SCALe 1e-6", ":TIMebase:MAIN:OFFSet 0",
+    ):
+        scope.send(c)
+    # find the current mean gen-vs-GPS offset, to center the fine window on the gen edge.
+    xinc = float(scope.query(":WAVeform:XINCrement?"))
+    offs = []
+    for _ in range(10):
+        if scope.single():
+            i1 = rising_edge(scope.waveform(1))
+            i2 = rising_edge(scope.waveform(2))
+            if i1 is not None and i2 is not None and 15 < i2 < 985:
+                offs.append((i2 - i1) * xinc)
+    center = sum(offs) / len(offs) if offs else 0.0
+    scope.send(f":TIMebase:MAIN:SCALe {timebase_s}")
+    scope.send(f":TIMebase:MAIN:OFFSet {center}")  # gen edge at screen center; GPS off-screen left
+    scope.send(":DISPlay:GRADing:TIME INFinite")
+    scope.send(":CLEar")
+    scope.send(":RUN")
+    time.sleep(accumulate_s)
+    scope.send(":STOP")
+    n = scope.screenshot(out)
+    scope.send(":DISPlay:GRADing:TIME MIN")  # restore non-persistent display
+    print(f"center(offset)={center * 1e9:.0f}ns  wrote {out} ({n} bytes)")
+
+
 def main():
     argv = sys.argv[1:]
     sub = argv[0] if argv else ""
@@ -228,8 +299,15 @@ def main():
                 argv[1] if len(argv) > 1 else "scope-pps.png",
                 float(argv[2]) if len(argv) > 2 else None,
             )
+        elif sub == "converge":
+            cmd_converge(scope, argv[1] if len(argv) > 1 else "converge.log")
+        elif sub == "jitter":
+            cmd_jitter(scope, argv[1] if len(argv) > 1 else "scope-jitter.png")
         else:
-            sys.exit("usage: scope_pps.py {phase [N] [log] | capture [out.png] [s/div]}")
+            sys.exit(
+                "usage: scope_pps.py "
+                "{phase [N] [log] | capture [out.png] [s/div] | converge [log] | jitter [out.png]}"
+            )
 
 
 if __name__ == "__main__":
