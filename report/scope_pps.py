@@ -199,11 +199,30 @@ CAPTURE_SETUP = [
 ]
 
 
-def cmd_capture(scope, out, timebase_s=None):
+def cmd_capture(scope, out, timebase_s=None, center=False):
     for c in CAPTURE_SETUP:
         scope.send(c)
+    mid = 0.0
+    if center:
+        # Measure the mean GPS->gen offset at a coarse timebase (gen reliably on-screen), then
+        # center the window on the midpoint of the two edges. At a fine timebase with GPS fixed
+        # at screen center the gen edge (offset + sub-µs wander) would slide off-screen; centering
+        # on the midpoint keeps both edges framed.
+        scope.send(":TIMebase:MAIN:SCALe 1e-6")
+        scope.send(":TIMebase:MAIN:OFFSet 0")
+        xinc = float(scope.query(":WAVeform:XINCrement?"))
+        offs = []
+        for _ in range(12):
+            if scope.single():
+                i1 = rising_edge(scope.waveform(1))
+                i2 = rising_edge(scope.waveform(2))
+                if i1 is not None and i2 is not None and 15 < i2 < 985:
+                    offs.append((i2 - i1) * xinc)
+        mid = (sum(offs) / len(offs) / 2) if offs else 0.0
     if timebase_s:  # override the default 1 us/div (tighten once the offset is sub-us)
         scope.send(f":TIMebase:MAIN:SCALe {timebase_s}")
+    if center:
+        scope.send(f":TIMebase:MAIN:OFFSet {mid}")  # midpoint of GPS & gen edges at screen center
     errs = scope.drain_errors()
     if errs:
         print("scope errors:", errs)
@@ -298,6 +317,7 @@ def main():
                 scope,
                 argv[1] if len(argv) > 1 else "scope-pps.png",
                 float(argv[2]) if len(argv) > 2 else None,
+                center=("center" in argv[3:]),
             )
         elif sub == "converge":
             cmd_converge(scope, argv[1] if len(argv) > 1 else "converge.log")
@@ -306,7 +326,7 @@ def main():
         else:
             sys.exit(
                 "usage: scope_pps.py "
-                "{phase [N] [log] | capture [out.png] [s/div] | converge [log] | jitter [out.png]}"
+                "{phase [N] [log] | capture [out.png] [s/div] [center] | converge [log] | jitter [out.png]}"
             )
 
 
