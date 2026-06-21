@@ -457,14 +457,14 @@ uv run plot_report.py /tmp/x.log out.png
 
 MT3333 の限界（qErr も survey-in も無く、コマンドでも詰められない）を踏まえ、乗り換え候補を複数の観点で並べる。
 数値は調査時点（2026-06）の一次情報で、在庫と価格は変動する。
-現用の AE-GNSS-EXTANT は外部アンテナ（U.FL、付属）を使う完成基板で、Pico へは UART で繋ぐ（Pico 基板側に RF は無い）。乗り換え先でもアンテナは要り、bare チップは自作基板に RF も要る。
+現用の AE-GNSS-EXTANT は外部アンテナ（U.FL、付属）を使う完成基板で、Pico へは UART で繋ぐ（Pico 基板側に RF は無い）。ただしこのモジュール自体も 2026-06 時点で秋月で終売（在庫 0）になった。乗り換え先でもアンテナは要り、bare チップは自作基板に RF も要る。
 
 「RF 設計」列の意味：不要は完成基板（現用や既製ブレークアウト）を UART と 1PPS で繋ぐ形（RF は基板側、アンテナは外付）、最小は自己バイアスで 50Ω 線路のみ、要は bias-tee を自作。
 「JLCPCB」列は自作基板に載せる場合の LCSC 部番と区分、在庫を示す。timing モジュールは Basic が無く在庫も薄い。
 
 | 製品（形態） | timing 機能 / 1PPS | RF 設計 | JLCPCB PCBA | 入手と在庫 | 価格(目安) | lifecycle |
 |---|---|---|---|---|---|---|
-| **MT3333**（AE-GNSS-EXTANT、現用、完成基板） | 無 / 30ns RMS | 不要（完成基板、外付アンテナ） | 該当無（秋月モジュール） | 秋月 潤沢 | ¥2,980 | 旧世代だが流通 |
+| **MT3333**（AE-GNSS-EXTANT、現用、完成基板） | 無 / 30ns RMS | 不要（完成基板、外付アンテナ） | 該当無（秋月モジュール） | 秋月 終売（在庫0） | ¥2,000（終売時） | 旧世代で **終売** |
 | u-blox **NEO-M8T ブレークアウト** | qErr（UBX-TIM-TP）+ survey-in | **不要**（digital 接続） | 基板買いで該当無 | GNSS Store 100+ | ~¥11,000 | M8 **EOL**（流通あり） |
 | u-blox **ZED-F9T ブレークアウト** | qErr + survey-in / 5ns（補正 2.5ns） | **不要**（digital 接続） | 基板買いで該当無 | GNSS Store / Switch Science 取寄 | ¥31,000〜55,000 | Active（-20B） |
 | ST **Teseo-LIV4F**（bare, LCC-18） | qErr + 位置保持 / dual L1+L5 | **最小**（自己バイアス, 内蔵 LNA と SAW） | C6284698, Extended, 在庫 0 | DigiKey 単品 | $12（chip） | Active（〜2030） |
