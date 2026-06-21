@@ -236,7 +236,7 @@ async fn gen_capture_task(
             // 制御信号を全部出力 → ホストでプラント同定 + ゲイン掃引シミュ + 項別比較ができる。
             // (互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残し、cfg/trim/p/d を追記)
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cfg={} p_ns={} d_ns={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cfg={} p_ns={} d_ns={} trim_mppb={} lk={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
@@ -245,7 +245,9 @@ async fn gen_capture_task(
                 u.freq_trim_mppb / 1000,
                 cfg,
                 u.p_corr_ns,
-                u.d_corr_ns
+                u.d_corr_ns,
+                u.freq_trim_mppb,
+                u.locked as u8
             );
         }
         last_x = Some(x);

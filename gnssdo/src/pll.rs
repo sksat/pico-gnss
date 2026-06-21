@@ -68,6 +68,12 @@ pub struct PhaseLockLoopConfig {
     pub lock_ns: i64,
     /// Consecutive in-window edges required to declare lock. Default 5.
     pub lock_hold: u32,
+    /// Integral-enable window (ns): the I term integrates while the phase is within this band, even
+    /// *before* full lock. It must be wider than `lock_ns`: P alone settles at a non-zero phase, so
+    /// if I only ran once locked (within `lock_ns`) but P can't get inside `lock_ns`, lock — and
+    /// hence I — would never engage. The wider band lets the integrator pull the offset into lock.
+    /// Default 5 µs.
+    pub i_enable_ns: i64,
     /// Post-lock outlier threshold (ns): a single edge beyond this while locked is treated as a
     /// weak-signal spike and held (no correction). Default 3 µs.
     pub outlier_ns: i64,
@@ -90,6 +96,7 @@ impl PhaseLockLoopConfig {
         deadband_ns: 0,
         lock_ns: 1_000,
         lock_hold: 5,
+        i_enable_ns: 5_000,
         outlier_ns: 3_000,
         outlier_max: 12,
         i_den: 128,
@@ -205,10 +212,12 @@ impl PhaseLockLoop {
             } else {
                 self.reject_cnt = 0;
                 applied = true;
-                // I term: integrate the predicted phase into the frequency trim (milli-ppb) while
-                // locked, driving the steady-state offset to zero. Reset when the I term is off.
+                // I term: integrate the predicted phase into the frequency trim (milli-ppb) while the
+                // phase is within the I-enable band — wider than the lock window, so the integrator can
+                // pull a steady-state offset that P alone leaves *outside* `lock_ns` into lock (and
+                // thus drive it to zero). Reset when the I term is off.
                 if self.config.mode.use_i() {
-                    if locked {
+                    if ctrl.abs() < self.config.i_enable_ns {
                         self.trim_mppb = (self.trim_mppb - pred * 1000 / self.config.i_den)
                             .clamp(-self.config.trim_max_mppb, self.config.trim_max_mppb);
                     }
@@ -267,16 +276,18 @@ mod tests {
         let p = PhaseLockLoop::new();
         assert_eq!(p.config().mode, LoopMode::PidSmith);
         assert_eq!(p.config().lock_ns, 1_000);
+        assert_eq!(p.config().i_enable_ns, 5_000);
         assert_eq!(p.config().i_den, 128);
     }
 
     #[test]
     fn p_term_first_edge_uses_kp_inv_8_and_no_smith_history() {
         let mut p = PhaseLockLoop::new();
-        // First edge: last_pd=0 so pred=ctrl; PidSmith kp_inv=8; not locked so no I/D.
-        let u = p.update(800, true);
-        assert_eq!(u.predicted_phase_ns, 800);
-        assert_eq!(u.p_corr_ns, 800 / 8);
+        // First edge beyond the I-enable band (8 µs > 5 µs): last_pd=0 so pred=ctrl; PidSmith
+        // kp_inv=8; not locked so no D; phase outside the band so no I yet.
+        let u = p.update(8_000, true);
+        assert_eq!(u.predicted_phase_ns, 8_000);
+        assert_eq!(u.p_corr_ns, 8_000 / 8);
         assert_eq!(u.d_corr_ns, 0);
         assert_eq!(u.freq_trim_mppb, 0);
         assert!(!u.locked && u.applied);
@@ -306,15 +317,17 @@ mod tests {
     }
 
     #[test]
-    fn i_term_integrates_only_once_locked() {
+    fn i_term_integrates_within_enable_band_before_lock() {
+        // A phase inside the I-enable band but outside the lock window (1 µs < 2 µs < 5 µs):
+        // not locked, yet the integrator engages and pulls toward zero. This is the fix for
+        // "P alone parks outside lock_ns so lock (hence I) never engages".
         let mut p = PhaseLockLoop::new();
-        run(&mut p, 100, 5); // reach lock
-        assert!(p.is_locked());
-        assert_eq!(p.freq_trim_mppb(), 0); // nothing integrated before lock
-        let u = p.update(100, true); // locked now → integrate
-        assert!(u.locked);
-        assert!(u.freq_trim_mppb < 0);
-        assert_eq!(u.freq_trim_mppb, p.freq_trim_mppb());
+        let u = p.update(2_000, true);
+        assert!(!u.locked); // 2 µs > lock_ns, so not locked...
+        assert!(u.freq_trim_mppb < 0); // ...but I still integrated (within i_enable_ns)
+        // A phase beyond the band does NOT integrate.
+        let mut q = PhaseLockLoop::new();
+        assert_eq!(q.update(8_000, true).freq_trim_mppb, 0);
     }
 
     #[test]
@@ -362,9 +375,10 @@ mod tests {
     fn trim_is_clamped() {
         let mut p = PhaseLockLoop::new();
         run(&mut p, 100, 5); // lock
-        // A large persistent phase would integrate without bound; ensure it clamps.
+        // A persistent in-band phase would integrate without bound; ensure it clamps. (Use a phase
+        // inside i_enable_ns so the integrator actually runs; >band would be gated out.)
         for _ in 0..10_000 {
-            p.update(100_000, true);
+            p.update(4_000, true);
         }
         assert!(p.freq_trim_mppb().abs() <= p.config().trim_max_mppb);
     }
