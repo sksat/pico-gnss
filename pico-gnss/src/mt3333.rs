@@ -47,11 +47,9 @@ const PMTK_INIT: &[&str] = &[
     "PMTK313,1",       // SBAS 探索を有効化 (WAAS/EGNOS 圏で有効)
     "PMTK301,2",       // DGPS 補正源 = SBAS
     "PMTK286,1",       // AIC (アクティブ干渉除去) 有効化
-    // --- timing 向上を狙ったコマンド。実機で ACK 確認済 ($PMTK001,319,3 / $PMTK001,386,3)。
-    // MT3333 NMEA Spec V1.00 本体には無く GlobalTop/Quectel 系の同 PMTK 由来だが GYSFFMANC は受け付ける。
-    // 効果は位置領域で限界的: 支配的な PPS sawtooth (MT3333 は qErr 非報告) には触れない。
-    "PMTK319,1",       // SBAS Integrity モード (不健全 SBAS 衛星を除外)
-    "PMTK386,0",       // static-nav 速度フリーズ無効 (位置を凍結せず実解を時刻計算へ渡す)
+    // 試したが不採用: PMTK319,1 (SBAS Integrity) / PMTK386,0 (static-nav freeze off) は実機で ACK
+    // する ($PMTK001,*,3) が timing に観測効果なし (319 は日本は SBAS 無で no-op、386 は 886,4
+    // stationary が位置を保持するため無効)。MT3333 は qErr/survey-in 非対応でコマンドで詰める余地は無い。
     // NMEA 出力: GLL/RMC/VTG/GGA/GSA/GSV(各1) + GST(測位σ, field7) + ZDA(field17) を有効化。
     // フィールド順: GLL,RMC,VTG,GGA,GSA,GSV,GRS,GST,(res×5),MALM,MEPH,MDGP,MDBG,ZDA,MCHN。
     "PMTK314,1,1,1,1,1,1,0,1,0,0,0,0,0,0,0,0,0,1,0",
