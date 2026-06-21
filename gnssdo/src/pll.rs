@@ -243,8 +243,13 @@ impl PhaseLockLoop {
         }
         // Invalid (reference lost, etc.): freq trim + lock state are held; no correction this edge.
 
-        self.last_pred = pred;
-        self.last_pd = p_corr + d_corr;
+        // Only carry the Smith/derivative history forward when a correction was actually applied. On
+        // a rejected outlier or an invalid (held) edge, keeping the last *applied* values avoids a
+        // spurious D kick of `(normal − spike) / d_den` on the next good edge.
+        if applied {
+            self.last_pred = pred;
+            self.last_pd = p_corr + d_corr;
+        }
         PhaseLockLoopUpdate {
             applied,
             locked,
@@ -357,6 +362,19 @@ mod tests {
         // The next one is accepted as a real disturbance.
         let u = p.update(50_000, true);
         assert!(!u.rejected_outlier && u.applied);
+    }
+
+    #[test]
+    fn outlier_reject_does_not_poison_smith_history() {
+        let mut p = PhaseLockLoop::new();
+        run(&mut p, 100, 6); // locked, history settled near phase 100
+        // A rejected spike must not update last_pred/last_pd, or the next good edge's D term would
+        // see (normal − spike) / d_den and kick hard.
+        let u_spike = p.update(50_000, true);
+        assert!(u_spike.rejected_outlier && !u_spike.applied);
+        let u_next = p.update(100, true);
+        assert!(u_next.applied);
+        assert!(u_next.d_corr_ns.abs() < 1_000); // no (100 − 50_000)/4 ≈ −12_475 kick
     }
 
     #[test]
