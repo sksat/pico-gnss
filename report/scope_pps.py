@@ -199,6 +199,22 @@ CAPTURE_SETUP = [
 ]
 
 
+# Timebases the DHO800 accepts (s/div), for auto-ranging a capture around the measured gap.
+CAPTURE_TIMEBASES = [1e-8, 2e-8, 4e-8, 5e-8, 1e-7, 2e-7, 4e-7, 5e-7, 1e-6]
+
+
+def _shot_offset(scope, xinc):
+    """One single-shot. Returns (GPS->gen offset [s], gen-edge fraction across screen 0..1) or None."""
+    if not scope.single():
+        return None
+    w2 = scope.waveform(2)
+    i1 = rising_edge(scope.waveform(1))
+    i2 = rising_edge(w2)
+    if i1 is None or i2 is None:
+        return None
+    return (i2 - i1) * xinc, i2 / len(w2)
+
+
 def cmd_capture(scope, out, timebase_s=None, center=False):
     for c in CAPTURE_SETUP:
         scope.send(c)
@@ -213,49 +229,80 @@ def cmd_capture(scope, out, timebase_s=None, center=False):
         print(f"wrote {out} ({scope.screenshot(out)} bytes)")
         return
 
-    # center mode: the GPS->gen offset wanders sub-µs over seconds, so at a fine timebase a single
-    # random shot is unrepresentative (often an excursion). Measure a robust target offset, frame the
-    # window on the edge midpoint, then post-select a single shot near the median before screenshotting.
-    scope.send(":TIMebase:MAIN:SCALe 1e-6")  # coarse: gen reliably on-screen for the offset survey
-    scope.send(":TIMebase:MAIN:OFFSet 0")
-    xinc = float(scope.query(":WAVeform:XINCrement?"))
-    offs = []
-    for _ in range(20):
-        if scope.single():
-            i1 = rising_edge(scope.waveform(1))
-            i2 = rising_edge(scope.waveform(2))
-            if i1 is not None and i2 is not None and 15 < i2 < 985:
-                offs.append((i2 - i1) * xinc)
-    offs.sort()
-    target = offs[len(offs) // 2] if offs else 0.0  # median offset = representative gap
-    if timebase_s:
-        scope.send(f":TIMebase:MAIN:SCALe {timebase_s}")
-    scope.send(f":TIMebase:MAIN:OFFSet {target / 2}")  # midpoint of GPS & gen edges at screen center
-    xinc = float(scope.query(":WAVeform:XINCrement?"))
-    errs = scope.drain_errors()
-    if errs:
-        print("scope errors:", errs)
-    band = 30e-9  # accept a shot whose gen-vs-GPS gap is within 30 ns of the median
-    frame_off = None
-    for _ in range(40):
-        if not scope.single():
-            continue
-        w2 = scope.waveform(2)
-        i1 = rising_edge(scope.waveform(1))
-        i2 = rising_edge(w2)
-        if i1 is None or i2 is None or not (15 < i2 < len(w2) - 15):
-            continue
-        off = (i2 - i1) * xinc
-        if abs(off - target) <= band:  # representative shot found; scope is stopped on it
-            frame_off = off
+    # center mode: auto-range + representative-frame capture, so one call yields a usable shot
+    # regardless of the current offset (no manual redo). The GPS->gen offset wanders sub-µs over
+    # seconds, so a single random shot is unrepresentative, and a fixed timebase either runs the gen
+    # edge off-screen (offset large) or squashes the gap into the GPS edge (offset small vs a coarse
+    # div). So: survey the median offset, pick a timebase that puts the gap at a readable ~2.5 div with
+    # the gen edge on-screen, post-select a shot near the median, and if the captured frame still has
+    # the gen edge off-screen (or the gap squashed), widen/zoom and re-shoot. CH1 (GPS) stays centered.
+    def survey():
+        scope.send(":TIMebase:MAIN:SCALe 1e-6")  # coarse: gen reliably on-screen
+        scope.send(":TIMebase:MAIN:OFFSet 0")
+        xinc = float(scope.query(":WAVeform:XINCrement?"))
+        offs = []
+        for _ in range(20):
+            r = _shot_offset(scope, xinc)
+            if r is not None and 0.05 < r[1] < 0.95:
+                offs.append(r[0])
+        offs.sort()
+        return offs[len(offs) // 2] if offs else None
+
+    def pick_tb(gap):
+        g = max(abs(gap), 1e-9)
+        ideal = g / 2.5  # gap spans ~2.5 div: clearly separated, both edges + ringing visible
+        floor = g / 4.0  # gen edge must stay within ~4 div of the centered GPS edge
+        cands = [t for t in CAPTURE_TIMEBASES if t >= floor] or [CAPTURE_TIMEBASES[-1]]
+        return min(cands, key=lambda t: abs(t - ideal))
+
+    median = survey()
+    if median is None:
+        print("warning: could not find both edges in survey; capturing coarse 1µs/div")
+        scope.send(":TIMebase:MAIN:SCALe 1e-6")
+        scope.send(":TIMebase:MAIN:OFFSet 0")
+        scope.single()
+        print(f"wrote {out} ({scope.screenshot(out)} bytes)")
+        return
+
+    tb = timebase_s or pick_tb(median)
+    band = 30e-9  # accept a shot whose gap is within 30 ns of the median
+    sdiv = tb
+    for _ in range(4):
+        scope.send(f":TIMebase:MAIN:SCALe {tb}")
+        scope.send(":TIMebase:MAIN:OFFSet 0")  # CH1 (GPS) rising edge at screen center
+        sdiv = float(scope.query(":TIMebase:MAIN:SCALe?"))  # what the scope actually set
+        xinc = float(scope.query(":WAVeform:XINCrement?"))
+        scope.drain_errors()
+        chosen = None
+        offscreen = False
+        for _ in range(40):
+            r = _shot_offset(scope, xinc)
+            if r is None:
+                continue
+            off, frac = r
+            if abs(off - median) > band:
+                continue
+            if frac < 0.08 or frac > 0.92:  # representative gap, but gen edge ran off-screen
+                offscreen = True
+                break
+            chosen = off  # representative and on-screen; scope is stopped on this frame
             break
-    if frame_off is None:
-        print(f"warning: no shot within {band * 1e9:.0f}ns of median {target * 1e9:.0f}ns; using last")
-    print(
-        f"median gap={target * 1e9:.0f}ns  this frame={frame_off * 1e9:.0f}ns"
-        if frame_off is not None
-        else f"median gap={target * 1e9:.0f}ns"
-    )
+        if chosen is not None:
+            gap_div = abs(chosen) / sdiv
+            print(f"sdiv={sdiv * 1e9:.0f}ns/div  median gap={median * 1e9:.0f}ns  "
+                  f"this frame={chosen * 1e9:.0f}ns ({gap_div:.1f} div)")
+            print(f"wrote {out} ({scope.screenshot(out)} bytes)")
+            return
+        # adjust and retry: widen if the gen edge overflowed, else re-survey (the offset moved)
+        if offscreen:
+            nxt = next((t for t in CAPTURE_TIMEBASES if t > sdiv), None)
+            if nxt is None:
+                break
+            tb = nxt
+        else:
+            median = survey() or median
+            tb = pick_tb(median)
+    print(f"warning: no clean representative frame after retries; best-effort at {sdiv * 1e9:.0f}ns/div")
     print(f"wrote {out} ({scope.screenshot(out)} bytes)")
 
 
@@ -341,11 +388,13 @@ def main():
                 argv[2] if len(argv) > 2 else None,
             )
         elif sub == "capture":
+            rest = argv[2:]
+            tb = next((float(a) for a in rest if a != "center"), None)  # optional explicit s/div
             cmd_capture(
                 scope,
                 argv[1] if len(argv) > 1 else "scope-pps.png",
-                float(argv[2]) if len(argv) > 2 else None,
-                center=("center" in argv[3:]),
+                tb,
+                center=("center" in rest),
             )
         elif sub == "converge":
             cmd_converge(scope, argv[1] if len(argv) > 1 else "converge.log")
