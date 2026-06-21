@@ -349,6 +349,7 @@ def cmd_jitter(scope, out, timebase_s=20e-9, accumulate_s=6.0):
         ":CHANnel1:SCALe 0.6", ":CHANnel2:SCALe 0.6",
         ":CHANnel1:OFFSet -2.1", ":CHANnel2:OFFSet -2.1",
         ":TRIGger:EDGE:SOURce CHANnel1", ":TRIGger:EDGE:SLOPe POSitive", ":TRIGger:EDGE:LEVel 1.65",
+        ":TRIGger:SWEep NORMal",  # only draw triggered sweeps; no free-run noise smeared by persistence
         ":DISPlay:GRADing:TIME MIN", ":TIMebase:MAIN:SCALe 1e-6", ":TIMebase:MAIN:OFFSet 0",
     ):
         scope.send(c)
@@ -371,6 +372,7 @@ def cmd_jitter(scope, out, timebase_s=20e-9, accumulate_s=6.0):
     scope.send(":STOP")
     n = scope.screenshot(out)
     scope.send(":DISPlay:GRADing:TIME MIN")  # restore non-persistent display
+    scope.send(":TRIGger:SWEep AUTO")        # restore free-run sweep
     print(f"center(offset)={center * 1e9:.0f}ns  wrote {out} ({n} bytes)")
 
 
@@ -396,11 +398,15 @@ def main():
         elif sub == "converge":
             cmd_converge(scope, argv[1] if len(argv) > 1 else "converge.log")
         elif sub == "jitter":
-            cmd_jitter(scope, argv[1] if len(argv) > 1 else "scope-jitter.png")
+            rest = argv[2:]
+            tb = float(rest[0]) if len(rest) > 0 else 20e-9
+            acc = float(rest[1]) if len(rest) > 1 else 6.0
+            cmd_jitter(scope, argv[1] if len(argv) > 1 else "scope-jitter.png", tb, acc)
         else:
             sys.exit(
                 "usage: scope_pps.py "
-                "{phase [N] [log] | capture [out.png] [s/div] [center] | converge [log] | jitter [out.png]}"
+                "{phase [N] [log] | capture [out.png] [s/div] [center] | converge [log] | "
+                "jitter [out.png] [s/div] [accumulate_s]}"
             )
 
 
