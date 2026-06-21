@@ -113,6 +113,7 @@ impl<P: PIOExt, SM: StateMachineIndex> PpsOutput<P, SM> {
         pio: &mut PIO<P>,
         sm: UninitStateMachine<(P, SM)>,
         out_gpio: u8,
+        high_cycles: u32,
         initial_period: u32,
     ) -> Self {
         let installed = pio
@@ -122,6 +123,7 @@ impl<P: PIOExt, SM: StateMachineIndex> PpsOutput<P, SM> {
             .set_pins(out_gpio, 1)
             .build(sm);
         sm.set_pindirs([(out_gpio, PinDir::Output)]);
+        tx.write(high_cycles); // init: program stashes this as the high width
         tx.write(initial_period);
         Self { sm: sm.start(), tx }
     }
@@ -142,11 +144,15 @@ pub struct SteeredPpsOutput<P: PIOExt, SM: StateMachineIndex> {
     output: PpsOutput<P, SM>,
     dither: crate::OutputPeriodDither,
     clk_hz: u32,
+    high_cycles: u32,
 }
 
 impl<P: PIOExt, SM: StateMachineIndex> SteeredPpsOutput<P, SM> {
-    /// Install the output program (see [`PpsOutput::new`]) starting at the nominal 1 Hz period for
-    /// `clk_hz` ([`crate::output_period_cycles`]), and pair it with a fresh dither.
+    /// Install the output program (see [`PpsOutput::new`]) with a `pulse_ns`-wide high pulse
+    /// ([`crate::output_high_cycles`]; ~100 ms is the common GPS-module/GPSDO convention, a few µs
+    /// suits counters/scopes), starting at the nominal 1 Hz period for `clk_hz`
+    /// ([`crate::output_period_cycles`]), and pair it with a fresh dither. The disciplined rising
+    /// edge is unaffected by the pulse width.
     ///
     /// # Panics
     /// If the program does not fit in the PIO's instruction memory.
@@ -155,11 +161,20 @@ impl<P: PIOExt, SM: StateMachineIndex> SteeredPpsOutput<P, SM> {
         sm: UninitStateMachine<(P, SM)>,
         out_gpio: u8,
         clk_hz: u32,
+        pulse_ns: u32,
     ) -> Self {
+        let high_cycles = crate::output_high_cycles(clk_hz, pulse_ns);
         Self {
-            output: PpsOutput::new(pio, sm, out_gpio, crate::output_period_cycles(clk_hz)),
+            output: PpsOutput::new(
+                pio,
+                sm,
+                out_gpio,
+                high_cycles,
+                crate::output_period_cycles(clk_hz, high_cycles),
+            ),
             dither: crate::OutputPeriodDither::new(),
             clk_hz,
+            high_cycles,
         }
     }
 
@@ -176,9 +191,9 @@ impl<P: PIOExt, SM: StateMachineIndex> SteeredPpsOutput<P, SM> {
 
 impl<P: PIOExt, SM: StateMachineIndex> crate::PpsSteer for SteeredPpsOutput<P, SM> {
     fn set_next_period(&mut self, freq_mppb: i64, phase_corr_ns: i64) -> u32 {
-        let period = self
-            .dither
-            .next_period(self.clk_hz, freq_mppb, phase_corr_ns);
+        let period =
+            self.dither
+                .next_period(self.clk_hz, freq_mppb, phase_corr_ns, self.high_cycles);
         let _ = self.output.set_period(period);
         period
     }

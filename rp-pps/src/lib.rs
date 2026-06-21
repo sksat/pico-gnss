@@ -64,10 +64,11 @@ pub use gpsdo::{PpsGpsdo, SyncReport};
 pub const CAPTURE_CYCLES_PER_TICK: u32 = 2;
 
 /// Fixed per-iteration overhead (PIO clock cycles) of [`pps_output_program`]: the instructions
-/// other than the `jmp y-- delay` countdown. The period word pushed to the SM is
-/// `clk_cycles_for_one_second - OUTPUT_OVERHEAD_CYCLES` (see [`output_period_cycles`]). It is tied
-/// to this exact program; the tests guard the program shape so a change can't silently desync it.
-pub const OUTPUT_OVERHEAD_CYCLES: u32 = 10;
+/// other than the two countdown loops (`jmp x-- high` and `jmp y-- low`). The low-phase period word
+/// pushed to the SM is `clk_cycles_for_one_second - OUTPUT_OVERHEAD_CYCLES - high_cycles` (see
+/// [`output_period_cycles`]). It is tied to this exact program; the tests guard the program shape so
+/// a change can't silently desync it.
+pub const OUTPUT_OVERHEAD_CYCLES: u32 = 7;
 
 /// PPS **input-capture** program for one state machine.
 ///
@@ -99,28 +100,38 @@ pub fn pps_capture_program() -> Program<32> {
     .program
 }
 
-/// Steerable **1PPS output** program for one state machine.
+/// Steerable **1PPS output** program for one state machine, with a configurable high-pulse width.
 ///
-/// Each iteration pulls a fresh *period word* from the TX FIFO (`pull noblock`, so if the FIFO is
-/// empty the previously latched period is reused — the output free-runs at the last commanded
-/// rate), emits a rising edge plus a short high pulse, then counts the period down.
+/// Once at start it pulls a *high-width word* and stashes it in `ISR` (the high pulse length in PIO
+/// clock cycles — set it once, e.g. via [`output_high_cycles`]). Then each iteration pulls a fresh
+/// *low-period word* from the TX FIFO (`pull noblock`, so if the FIFO is empty the previously latched
+/// period is reused — the output free-runs at the last commanded rate), emits the rising edge, holds
+/// high for the stashed width (`jmp x-- high`), drops, and holds low for the rest of the second
+/// (`jmp y-- low`). The disciplined quantity is the *rising edge*; the high width is timing-neutral
+/// (it is accounted for in the low-period word, so widening the pulse does not move the edge).
 ///
-/// **Backend setup contract**: configure the output pin as the SM's `set` pin. Push an initial
-/// period word before enabling (e.g. [`output_period_cycles`]).
+/// **Backend setup contract**: configure the output pin as the SM's `set` pin. Push the high-width
+/// word first, then an initial low-period word, before enabling (see [`output_high_cycles`] /
+/// [`output_period_cycles`]).
 ///
-/// **FIFO contract**: push a period word = the low-phase length in PIO clock cycles. Compute it
-/// with [`output_period_cycles`] (nominal 1 Hz) or [`output_period_cycles_ppb`] (frequency-corrected).
+/// **FIFO contract**: push **one** high-width word at init, then a low-period word per edge. Compute
+/// the period with [`output_period_cycles`] (nominal 1 Hz) or [`output_period_cycles_ppb`]
+/// (frequency-corrected); both subtract the high width so the rising edge stays on the second.
 pub fn pps_output_program() -> Program<32> {
     pio::pio_asm!(
+        "    pull block",     // OSR = high-width word (init; blocks until pushed)
+        "    mov isr, osr",   // ISR = high-width (persistent stash, never clobbered)
         "    set pindirs, 1", // drive the SET pin as output (once at start)
         ".wrap_target",
-        "    pull noblock", // OSR = new period, or the held period if the FIFO is empty
-        "    mov x, osr",   // X = period (kept; the countdown uses a copy)
-        "    mov y, osr",   // Y = countdown copy
-        "    set pins, 1 [10]", // rising edge + ~88 ns high
+        "    pull noblock", // OSR = new low period, or the held period if the FIFO is empty
+        "    mov y, osr",   // Y = low-phase countdown
+        "    mov x, isr",   // X = high-phase countdown (copy of the stashed width)
+        "    set pins, 1",  // rising edge
+        "high:",
+        "    jmp x-- high", // hold high for the stashed width
         "    set pins, 0",  // falling edge
-        "delay:",
-        "    jmp y-- delay", // hold low for the rest of the period
+        "low:",
+        "    jmp y-- low", // hold low for the rest of the period
         ".wrap",
     )
     .program
@@ -268,19 +279,30 @@ pub fn calibrate_loopback_offset<I: IntoIterator<Item = (u32, u32)>>(samples: I)
     }
 }
 
-/// Nominal output period word for exactly 1 Hz at a given system clock (no frequency correction).
-pub fn output_period_cycles(clk_hz: u32) -> u32 {
-    clk_hz - OUTPUT_OVERHEAD_CYCLES
+/// High-pulse width (`high_cycles` for [`pps_output_program`]) for a desired pulse width in
+/// nanoseconds at a given system clock. The 1PPS rising edge is what's disciplined; this only sets
+/// how long the pin stays high (e.g. ~100 ms is the common GPS-module / GPSDO convention, a few µs
+/// suits counters/scopes). Push the returned value once at init; the period helpers below subtract
+/// it so the edge timing is unchanged regardless of width.
+pub fn output_high_cycles(clk_hz: u32, width_ns: u32) -> u32 {
+    (width_ns as u64 * clk_hz as u64 / 1_000_000_000) as u32
 }
 
-/// Output period word corrected for a crystal frequency offset (`ppb`, as estimated by
-/// [`gnssdo`](https://docs.rs/gnssdo)). To emit a true one-second period, the count is stretched by
-/// `clk_hz * ppb / 1e9` cycles. Resolution is one cycle (≈ 8 ppb at 125 MHz); finer steering needs
-/// the caller's own sub-cycle dithering.
-pub fn output_period_cycles_ppb(clk_hz: u32, ppb: i64) -> u32 {
+/// Nominal low-period word for exactly 1 Hz at a given system clock (no frequency correction), for a
+/// high pulse of `high_cycles` ([`output_high_cycles`]).
+pub fn output_period_cycles(clk_hz: u32, high_cycles: u32) -> u32 {
+    clk_hz - OUTPUT_OVERHEAD_CYCLES - high_cycles
+}
+
+/// Low-period word corrected for a crystal frequency offset (`ppb`, as estimated by
+/// [`gnssdo`](https://docs.rs/gnssdo)), for a high pulse of `high_cycles` ([`output_high_cycles`]).
+/// To emit a true one-second period, the count is stretched by `clk_hz * ppb / 1e9` cycles.
+/// Resolution is one cycle (≈ 8 ppb at 125 MHz); finer steering needs the caller's own sub-cycle
+/// dithering.
+pub fn output_period_cycles_ppb(clk_hz: u32, ppb: i64, high_cycles: u32) -> u32 {
     let clk = clk_hz as i64;
     let adj = clk * ppb / 1_000_000_000;
-    (clk - OUTPUT_OVERHEAD_CYCLES as i64 + adj) as u32
+    (clk - OUTPUT_OVERHEAD_CYCLES as i64 - high_cycles as i64 + adj) as u32
 }
 
 /// Sigma-delta period-word generator with sub-cycle frequency resolution.
@@ -305,18 +327,24 @@ impl OutputPeriodDither {
         Self { frac_acc: 0 }
     }
 
-    /// Next period word for one output edge. `freq_mppb` is the total frequency offset in milli-ppb
-    /// (lengthen the period to compensate a fast crystal); `phase_corr_ns` is the immediate phase
-    /// nudge to subtract this edge (e.g. [`gnssdo`](https://docs.rs/gnssdo)
-    /// `PhaseLockLoopUpdate::phase_corr_ns`).
-    pub fn next_period(&mut self, clk_hz: u32, freq_mppb: i64, phase_corr_ns: i64) -> u32 {
+    /// Next low-period word for one output edge, for a high pulse of `high_cycles`
+    /// ([`output_high_cycles`]). `freq_mppb` is the total frequency offset in milli-ppb (lengthen the
+    /// period to compensate a fast crystal); `phase_corr_ns` is the immediate phase nudge to subtract
+    /// this edge (e.g. [`gnssdo`](https://docs.rs/gnssdo) `PhaseLockLoopUpdate::phase_corr_ns`).
+    pub fn next_period(
+        &mut self,
+        clk_hz: u32,
+        freq_mppb: i64,
+        phase_corr_ns: i64,
+        high_cycles: u32,
+    ) -> u32 {
         let clk = clk_hz as i64;
         // Accumulate clk * freq at 1e12 scale (milli-ppb = ppb*1000, ppb = 1e-9), carry the fraction.
         self.frac_acc += clk * freq_mppb;
         let freq_cycles = self.frac_acc.div_euclid(1_000_000_000_000);
         self.frac_acc = self.frac_acc.rem_euclid(1_000_000_000_000);
-        let period =
-            clk - OUTPUT_OVERHEAD_CYCLES as i64 + freq_cycles - phase_corr_ns * clk / 1_000_000_000;
+        let period = clk - OUTPUT_OVERHEAD_CYCLES as i64 - high_cycles as i64 + freq_cycles
+            - phase_corr_ns * clk / 1_000_000_000;
         period as u32
     }
 }
@@ -368,7 +396,7 @@ mod tests {
 
     #[test]
     fn output_program_shape() {
-        assert_eq!(pps_output_program().code.len(), 7);
+        assert_eq!(pps_output_program().code.len(), 10);
     }
 
     #[test]
@@ -391,35 +419,54 @@ mod tests {
     }
 
     #[test]
+    fn output_high_cycles_from_width() {
+        // 100 ms at 125 MHz = 12.5 M cycles; ~88 ns ~= 11 cycles.
+        assert_eq!(output_high_cycles(125_000_000, 100_000_000), 12_500_000);
+        assert_eq!(output_high_cycles(125_000_000, 88), 11);
+    }
+
+    #[test]
     fn output_period_nominal() {
-        assert_eq!(output_period_cycles(125_000_000), 124_999_990);
+        // No high pulse: clk - overhead.
+        assert_eq!(output_period_cycles(125_000_000, 0), 124_999_993);
+        // A 100 ms high pulse is subtracted from the low period so the edge stays on the second.
+        let high = output_high_cycles(125_000_000, 100_000_000);
+        assert_eq!(
+            output_period_cycles(125_000_000, high),
+            124_999_993 - 12_500_000
+        );
     }
 
     #[test]
     fn output_period_ppb_steers_by_clk_times_ppb() {
-        assert_eq!(output_period_cycles_ppb(125_000_000, 0), 124_999_990);
+        assert_eq!(output_period_cycles_ppb(125_000_000, 0, 0), 124_999_993);
         // +8 ppb at 125 MHz = +1 cycle, -8 ppb = -1 cycle
-        assert_eq!(output_period_cycles_ppb(125_000_000, 8), 124_999_991);
-        assert_eq!(output_period_cycles_ppb(125_000_000, -8), 124_999_989);
+        assert_eq!(output_period_cycles_ppb(125_000_000, 8, 0), 124_999_994);
+        assert_eq!(output_period_cycles_ppb(125_000_000, -8, 0), 124_999_992);
+        // high width shifts the low period but not the per-ppb steering.
+        assert_eq!(
+            output_period_cycles_ppb(125_000_000, 8, 12_500_000),
+            124_999_994 - 12_500_000
+        );
     }
 
     #[test]
     fn dither_matches_whole_cycle_steering() {
         let mut d = OutputPeriodDither::new();
         // 0 ppb -> nominal; +8 ppb (= 8000 mppb) -> +1 cycle, like output_period_cycles_ppb.
-        assert_eq!(d.next_period(125_000_000, 0, 0), 124_999_990);
-        assert_eq!(d.next_period(125_000_000, 8_000, 0), 124_999_991);
+        assert_eq!(d.next_period(125_000_000, 0, 0, 0), 124_999_993);
+        assert_eq!(d.next_period(125_000_000, 8_000, 0, 0), 124_999_994);
     }
 
     #[test]
     fn dither_resolves_sub_cycle_on_average() {
         let mut d = OutputPeriodDither::new();
         // 4 ppb at 125 MHz = half a cycle/s: the fraction carries, so it alternates +0,+1,+0,+1...
-        let p0 = d.next_period(125_000_000, 4_000, 0);
-        let p1 = d.next_period(125_000_000, 4_000, 0);
-        assert_eq!(p0, 124_999_990);
-        assert_eq!(p1, 124_999_991);
-        // average = 124_999_990.5 = nominal + 0.5 cycle (sub-cycle resolution)
+        let p0 = d.next_period(125_000_000, 4_000, 0, 0);
+        let p1 = d.next_period(125_000_000, 4_000, 0, 0);
+        assert_eq!(p0, 124_999_993);
+        assert_eq!(p1, 124_999_994);
+        // average = 124_999_993.5 = nominal + 0.5 cycle (sub-cycle resolution)
     }
 
     #[test]
@@ -473,11 +520,11 @@ mod tests {
     #[test]
     fn dither_phase_corr_subtracts_cycles() {
         let mut d = OutputPeriodDither::new();
-        // phase_corr 8 ns at 125 MHz = 1 cycle subtracted; freq 0.
-        assert_eq!(d.next_period(125_000_000, 0, 8), 124_999_989);
+        // phase_corr 8 ns at 125 MHz = 1 cycle subtracted; freq 0, no high pulse.
+        assert_eq!(d.next_period(125_000_000, 0, 8, 0), 124_999_992);
         // negative phase_corr lengthens.
         let mut d2 = OutputPeriodDither::new();
-        assert_eq!(d2.next_period(125_000_000, 0, -8), 124_999_991);
+        assert_eq!(d2.next_period(125_000_000, 0, -8, 0), 124_999_994);
     }
 
     #[test]

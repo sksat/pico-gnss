@@ -117,12 +117,14 @@ pub struct PpsOutput<'d, PIO: Instance, const SM: usize> {
 }
 
 impl<'d, PIO: Instance, const SM: usize> PpsOutput<'d, PIO, SM> {
-    /// Load the output program onto `sm`, route `out_pin` as its `set` pin, push `initial_period`,
-    /// and enable it. Compute the period word with [`crate::output_period_cycles`].
+    /// Load the output program onto `sm`, route `out_pin` as its `set` pin, push the `high_cycles`
+    /// init word ([`crate::output_high_cycles`]) followed by `initial_period`, and enable it. Compute
+    /// the period word with [`crate::output_period_cycles`].
     pub fn new(
         common: &mut Common<'d, PIO>,
         mut sm: StateMachine<'d, PIO, SM>,
         out_pin: Peri<'d, impl PioPin>,
+        high_cycles: u32,
         initial_period: u32,
     ) -> Self {
         let prog = common.load_program(&crate::pps_output_program());
@@ -132,6 +134,7 @@ impl<'d, PIO: Instance, const SM: usize> PpsOutput<'d, PIO, SM> {
         cfg.use_program(&prog, &[]);
         cfg.set_set_pins(&[&pin]);
         sm.set_config(&cfg);
+        let _ = sm.tx().try_push(high_cycles); // init: program stashes this as the high width
         let _ = sm.tx().try_push(initial_period);
         sm.set_enable(true);
         Self { sm, prog, pin }
@@ -155,21 +158,34 @@ pub struct SteeredPpsOutput<'d, PIO: Instance, const SM: usize> {
     output: PpsOutput<'d, PIO, SM>,
     dither: crate::OutputPeriodDither,
     clk_hz: u32,
+    high_cycles: u32,
 }
 
 impl<'d, PIO: Instance, const SM: usize> SteeredPpsOutput<'d, PIO, SM> {
-    /// Load the output program (see [`PpsOutput::new`]) starting at the nominal 1 Hz period for
-    /// `clk_hz` ([`crate::output_period_cycles`]), and pair it with a fresh dither.
+    /// Load the output program (see [`PpsOutput::new`]) with a `pulse_ns`-wide high pulse
+    /// ([`crate::output_high_cycles`]; ~100 ms is the common GPS-module/GPSDO convention, a few µs
+    /// suits counters/scopes), starting at the nominal 1 Hz period for `clk_hz`
+    /// ([`crate::output_period_cycles`]), and pair it with a fresh dither. The disciplined rising
+    /// edge is unaffected by the pulse width.
     pub fn new(
         common: &mut Common<'d, PIO>,
         sm: StateMachine<'d, PIO, SM>,
         out_pin: Peri<'d, impl PioPin>,
         clk_hz: u32,
+        pulse_ns: u32,
     ) -> Self {
+        let high_cycles = crate::output_high_cycles(clk_hz, pulse_ns);
         Self {
-            output: PpsOutput::new(common, sm, out_pin, crate::output_period_cycles(clk_hz)),
+            output: PpsOutput::new(
+                common,
+                sm,
+                out_pin,
+                high_cycles,
+                crate::output_period_cycles(clk_hz, high_cycles),
+            ),
             dither: crate::OutputPeriodDither::new(),
             clk_hz,
+            high_cycles,
         }
     }
 
@@ -186,9 +202,9 @@ impl<'d, PIO: Instance, const SM: usize> SteeredPpsOutput<'d, PIO, SM> {
 
 impl<'d, PIO: Instance, const SM: usize> crate::PpsSteer for SteeredPpsOutput<'d, PIO, SM> {
     fn set_next_period(&mut self, freq_mppb: i64, phase_corr_ns: i64) -> u32 {
-        let period = self
-            .dither
-            .next_period(self.clk_hz, freq_mppb, phase_corr_ns);
+        let period =
+            self.dither
+                .next_period(self.clk_hz, freq_mppb, phase_corr_ns, self.high_cycles);
         let _ = self.output.set_period(period);
         period
     }

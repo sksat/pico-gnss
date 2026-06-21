@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+# `cargo run` picks this without --bin (the src/bin/ examples gpsdo / gpsdo_runner are also bins).
+default-run = "pico-gnss"
 
 [[bin]]
 name = "pico-gnss"

@@ -318,8 +318,10 @@ async fn main(spawner: Spawner) {
 
     // SM1: 規律 PPS 生成を GP3 へ (rp-pps の SteeredPpsOutput)。初期周期 = ppb=0 の 1Hz (内部で
     // output_period_cycles)。周期は gen_capture_task が毎エッジ set_next_period で操舵する
-    // (dither+period word 計算は rp-pps、servo=PLL は firmware 側に残す)。
-    let output = SteeredPpsOutput::new(&mut common, sm1, p.PIN_3, clk_sys_freq());
+    // (dither+period word 計算は rp-pps、servo=PLL は firmware 側に残す)。high 幅 100ms = GPS
+    // モジュール/GPSDO の一般的な 1PPS 幅 (外部機器へ配れる; 規律対象は立ち上がりエッジで幅に不依存)。
+    const PPS_PULSE_NS: u32 = 100_000_000; // 100 ms
+    let output = SteeredPpsOutput::new(&mut common, sm1, p.PIN_3, clk_sys_freq(), PPS_PULSE_NS);
 
     // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
     interrupt::SWI_IRQ_0.set_priority(Priority::P0);
