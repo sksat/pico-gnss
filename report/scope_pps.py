@@ -199,9 +199,11 @@ CAPTURE_SETUP = [
 ]
 
 
-def cmd_capture(scope, out):
+def cmd_capture(scope, out, timebase_s=None):
     for c in CAPTURE_SETUP:
         scope.send(c)
+    if timebase_s:  # override the default 1 us/div (tighten once the offset is sub-us)
+        scope.send(f":TIMebase:MAIN:SCALe {timebase_s}")
     errs = scope.drain_errors()
     if errs:
         print("scope errors:", errs)
@@ -221,9 +223,13 @@ def main():
                 argv[2] if len(argv) > 2 else None,
             )
         elif sub == "capture":
-            cmd_capture(scope, argv[1] if len(argv) > 1 else "scope-pps.png")
+            cmd_capture(
+                scope,
+                argv[1] if len(argv) > 1 else "scope-pps.png",
+                float(argv[2]) if len(argv) > 2 else None,
+            )
         else:
-            sys.exit("usage: scope_pps.py {phase [N] | capture [out.png]}")
+            sys.exit("usage: scope_pps.py {phase [N] [log] | capture [out.png] [s/div]}")
 
 
 if __name__ == "__main__":

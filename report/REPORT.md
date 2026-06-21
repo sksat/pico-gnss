@@ -225,8 +225,9 @@ K 較正の頑健化 (良 fix / 外れ値除去 / サンプル増) か一度き�
 
 ![GPS と整合した出力 1PPS](scope-pps-aligned.png)
 
-*3 修正後: CH1(黄)=GPS と CH2(青)=GP3 の立ち上がりが中央=0 で重なる (残差 ~110ns は 1µs/div では分解できない)。
-当初の ~2µs リード ([scope-pps-small.png](scope-pps-small.png) / [-large.png](scope-pps-large.png)) と対照的。*
+*3 修正後 (**100ns/div** に拡大 — オフセットの桁が µs→sub-µs に変わったため)。CH1(黄)=GPS を中央=0、CH2(青)=GP3 は
+その **~0.1µs 後** (mean +0.11µs / σ35ns, N=40; sub-µs にゆっくり wander するので単発フレームは ~0.1–0.2µs)。当初の
+~2µs リード ([scope-pps-small.png](scope-pps-small.png) は 1µs/div) と桁が違う。*
 
 ### ループバック無しの構成では
 
