@@ -202,32 +202,60 @@ CAPTURE_SETUP = [
 def cmd_capture(scope, out, timebase_s=None, center=False):
     for c in CAPTURE_SETUP:
         scope.send(c)
-    mid = 0.0
-    if center:
-        # Measure the mean GPS->gen offset at a coarse timebase (gen reliably on-screen), then
-        # center the window on the midpoint of the two edges. At a fine timebase with GPS fixed
-        # at screen center the gen edge (offset + sub-µs wander) would slide off-screen; centering
-        # on the midpoint keeps both edges framed.
-        scope.send(":TIMebase:MAIN:SCALe 1e-6")
-        scope.send(":TIMebase:MAIN:OFFSet 0")
-        xinc = float(scope.query(":WAVeform:XINCrement?"))
-        offs = []
-        for _ in range(12):
-            if scope.single():
-                i1 = rising_edge(scope.waveform(1))
-                i2 = rising_edge(scope.waveform(2))
-                if i1 is not None and i2 is not None and 15 < i2 < 985:
-                    offs.append((i2 - i1) * xinc)
-        mid = (sum(offs) / len(offs) / 2) if offs else 0.0
-    if timebase_s:  # override the default 1 us/div (tighten once the offset is sub-us)
+    if not center:
+        if timebase_s:  # override the default 1 us/div (tighten once the offset is sub-us)
+            scope.send(f":TIMebase:MAIN:SCALe {timebase_s}")
+        errs = scope.drain_errors()
+        if errs:
+            print("scope errors:", errs)
+        if not scope.single():
+            print("warning: no trigger (is the GPS PPS present on CH1?)")
+        print(f"wrote {out} ({scope.screenshot(out)} bytes)")
+        return
+
+    # center mode: the GPS->gen offset wanders sub-µs over seconds, so at a fine timebase a single
+    # random shot is unrepresentative (often an excursion). Measure a robust target offset, frame the
+    # window on the edge midpoint, then post-select a single shot near the median before screenshotting.
+    scope.send(":TIMebase:MAIN:SCALe 1e-6")  # coarse: gen reliably on-screen for the offset survey
+    scope.send(":TIMebase:MAIN:OFFSet 0")
+    xinc = float(scope.query(":WAVeform:XINCrement?"))
+    offs = []
+    for _ in range(20):
+        if scope.single():
+            i1 = rising_edge(scope.waveform(1))
+            i2 = rising_edge(scope.waveform(2))
+            if i1 is not None and i2 is not None and 15 < i2 < 985:
+                offs.append((i2 - i1) * xinc)
+    offs.sort()
+    target = offs[len(offs) // 2] if offs else 0.0  # median offset = representative gap
+    if timebase_s:
         scope.send(f":TIMebase:MAIN:SCALe {timebase_s}")
-    if center:
-        scope.send(f":TIMebase:MAIN:OFFSet {mid}")  # midpoint of GPS & gen edges at screen center
+    scope.send(f":TIMebase:MAIN:OFFSet {target / 2}")  # midpoint of GPS & gen edges at screen center
+    xinc = float(scope.query(":WAVeform:XINCrement?"))
     errs = scope.drain_errors()
     if errs:
         print("scope errors:", errs)
-    if not scope.single():
-        print("warning: no trigger (is the GPS PPS present on CH1?)")
+    band = 30e-9  # accept a shot whose gen-vs-GPS gap is within 30 ns of the median
+    frame_off = None
+    for _ in range(40):
+        if not scope.single():
+            continue
+        w2 = scope.waveform(2)
+        i1 = rising_edge(scope.waveform(1))
+        i2 = rising_edge(w2)
+        if i1 is None or i2 is None or not (15 < i2 < len(w2) - 15):
+            continue
+        off = (i2 - i1) * xinc
+        if abs(off - target) <= band:  # representative shot found; scope is stopped on it
+            frame_off = off
+            break
+    if frame_off is None:
+        print(f"warning: no shot within {band * 1e9:.0f}ns of median {target * 1e9:.0f}ns; using last")
+    print(
+        f"median gap={target * 1e9:.0f}ns  this frame={frame_off * 1e9:.0f}ns"
+        if frame_off is not None
+        else f"median gap={target * 1e9:.0f}ns"
+    )
     print(f"wrote {out} ({scope.screenshot(out)} bytes)")
 
 

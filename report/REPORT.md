@@ -256,6 +256,12 @@ firmware `hwphase`（~0）とオシロ（~+0.1µs）が ~160ns まで一致す�
 
 *100ns/div。offset は当初 ~2µs リードから ~90ns へ。mean +90〜100ns、σ ~50ns（sub-µs を wander し、単発フレームは数十〜200ns とばらつく）。当初の ~2µs リード（[scope-pps-small.png](scope-pps-small.png), 1µs/div）とは桁が違う。*
 
+さらに 40ns/div へ拡大すると、立ち上がりの形と ~100ns の間隔が分離して見える。
+
+![40ns/div に拡大した GPS と GP3](scope-pps-zoom.png)
+
+*40ns/div。黄=GPS PPS、青=GP3 出力。offset は sub-µs で wander するので、両エッジの中点に窓を寄せ、中央値付近の代表フレームを選んで撮った（`scope_pps.py capture … center`。この回は中央値 101ns、表示フレーム 99ns）。100ns/div では潰れていた立ち上がりの形（数 ns の rise と軽いリンギング）と間隔が読める。間隔の絶対値は reception で動くので、分布は下の N=120 ヒストグラムで見る。*
+
 修正後のバラつきを N=120 で撮ると mean +70ns、σ 46ns でスパイクが無い。
 修正前の二峰、σ216ns の [scope-phase.png](scope-phase.png) と対照的である。
 
