@@ -189,7 +189,15 @@ async fn gen_capture_task(
     // SteeredPpsOutput (rp-pps) が内包するので、ここは freq_mppb と phase_corr を渡すだけ。
     let mut pll = PhaseLockLoop::new();
     loop {
-        let x = sm.rx().wait_pull().await; // x = 出力エッジの生カウンタ (C2_out)
+        let x0 = sm.rx().wait_pull().await; // 出力エッジの生カウンタ (C2_out)。wait_pull は FIFO 最古を返す。
+        // backlog があれば最新エッジまで drain する (K 較正の drain と同じ対策)。ループが holdover 復帰等で
+        // 遅れると stale な出力エッジが FIFO に溜まり、それを現 GPS と対にすると N 秒ずれる。loopback_phase の
+        // 公称秒 fold はその N 秒を消すが N×ppm×1s が残り、hwphase を ~0 と誤認させて誤った位相に再ロックする
+        // (オシロで実害 ~9.5µs=3×ppm×1s を確認)。最新エッジを使えば現 GPS と正しく対になる。
+        let (x, dropped) = rp_pps::latest_capture(x0, || sm.rx().try_pull());
+        if dropped > 0 {
+            warn!("PPSGEN drained {} stale output edge(s) (loop lagged)", dropped);
+        }
         // 出力は GPS より僅かに先行しうる。x[N] で起きた時点でまだ pps_task が GPS[N] を store して
         // いないと C0_GPS は GPS[N-1] のまま → x[N] を GPS[N-1] と対にして +ppm×1s (≈3.3µs) のスパイクに
         // なる。同秒の GPS エッジ (世代が進む) を短時間だけ協調待ち。pps_task と同 executor なので busy wait
@@ -206,7 +214,9 @@ async fn gen_capture_task(
         // GPS PPS の世代。前回の出力エッジから進んでいなければ GPS 欠落 → C0_GPS が古い → 補正に使わない
         // (弱信号で PPS が時々落ちると、古い基準で巨大補正が走り出力が ~100ms 飛ぶのを防ぐ。断中はホールド)。
         let cur_gen = C0_GEN.load(Ordering::Acquire);
-        let fresh = cur_gen != last_gen;
+        // GPS 世代が前回からちょうど +1 のときだけ信用する。>1 はループ遅延/holdover 復帰で複数 GPS
+        // エッジを跨いだ＝ペアリングが不確実なので invalid 扱い (1 サンプル捨てて次から正しく対にする)。
+        let fresh = cur_gen.wrapping_sub(last_gen) == 1;
         last_gen = cur_gen;
         // 出力周期。PIO ~68s 周回グリッチの偽エッジは間隔が異常 → 位相補正に使わない。
         let interval_ns = last_x.map(|lx| rp_pps::interval_ns(lx, x, clk) as i64);

@@ -297,6 +297,27 @@ pub fn calibrate_loopback_offset<I: IntoIterator<Item = (u32, u32)>>(samples: I)
     }
 }
 
+/// Drain a capture FIFO to its **most recent** value, returning `(latest, dropped)`.
+///
+/// The runtime phase loop reads one output-edge capture per second, but a `wait_pull` returns the
+/// *oldest* FIFO entry. If the consumer ever falls behind (e.g. a stall during holdover recovery),
+/// stale captures pile up and `wait_pull` keeps handing back an N-second-old edge — which, paired
+/// with the *current* reference and folded by [`loopback_phase_ticks`] (nominal-second fold),
+/// silently injects `N × ppm × 1 s` of phase error while reporting a near-zero residual. Pulling the
+/// blocking edge and then draining any backlog here keeps the loop on the current edge.
+///
+/// `first` is the value already obtained from a blocking `wait_pull`; `try_more` yields each
+/// remaining FIFO entry (a non-blocking `try_pull`) until empty. `dropped` (number discarded) is a
+/// useful health signal: a persistently non-zero count means the consumer is lagging.
+pub fn latest_capture(first: u32, mut try_more: impl FnMut() -> Option<u32>) -> (u32, u32) {
+    let (mut latest, mut dropped) = (first, 0u32);
+    while let Some(v) = try_more() {
+        latest = v;
+        dropped += 1;
+    }
+    (latest, dropped)
+}
+
 /// High-pulse width (`high_cycles` for [`pps_output_program`]) for a desired pulse width in
 /// nanoseconds at a given system clock. The 1PPS rising edge is what's disciplined; this only sets
 /// how long the pin stays high (e.g. ~100 ms is the common GPS-module / GPSDO convention, a few µs
@@ -533,6 +554,17 @@ mod tests {
         );
         let empty: [(u32, u32); 0] = [];
         assert_eq!(calibrate_loopback_offset(empty), None);
+    }
+
+    #[test]
+    fn latest_capture_drains_to_newest() {
+        // backlog of 3 → use the newest (13), report 3 dropped. This is the runtime fix:
+        // without draining, wait_pull would hand back the oldest (10) — an N-second-stale edge.
+        let mut it = [11u32, 12, 13].into_iter();
+        assert_eq!(latest_capture(10, || it.next()), (13, 3));
+        // empty FIFO → the blocking value is current, nothing dropped.
+        let mut none = core::iter::empty::<u32>();
+        assert_eq!(latest_capture(10, || none.next()), (10, 0));
     }
 
     #[test]
