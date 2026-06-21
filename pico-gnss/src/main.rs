@@ -195,9 +195,13 @@ async fn gen_capture_task(
         // なる。同秒の GPS エッジ (世代が進む) を短時間だけ協調待ち。pps_task と同 executor なので busy wait
         // 不可: yield_now で必ず手を放す。timeout 時は GPS 先行/欠落とみなし既存の fresh gating が判定。
         let start_gen = C0_GEN.load(Ordering::Acquire);
-        let wait_until = Instant::now() + Duration::from_micros(500);
-        while C0_GEN.load(Ordering::Acquire) == start_gen && Instant::now() < wait_until {
-            embassy_futures::yield_now().await;
+        // 既に今秒の GPS が来ていれば (前回反復から世代が進んでいれば) 待つ必要はない。出力が GPS を
+        // 先行していて GPS[N] 未到着のときだけ、同秒 GPS を短時間協調待ち (GPS 先行/欠落時は timeout)。
+        if start_gen == last_gen {
+            let wait_until = Instant::now() + Duration::from_micros(500);
+            while C0_GEN.load(Ordering::Acquire) == start_gen && Instant::now() < wait_until {
+                embassy_futures::yield_now().await;
+            }
         }
         // GPS PPS の世代。前回の出力エッジから進んでいなければ GPS 欠落 → C0_GPS が古い → 補正に使わない
         // (弱信号で PPS が時々落ちると、古い基準で巨大補正が走り出力が ~100ms 飛ぶのを防ぐ。断中はホールド)。
@@ -292,42 +296,71 @@ async fn main(spawner: Spawner) {
     cfg_gp2.set_jmp_pin(capture.capture().jmp_pin()); // SM0 と同じ GP2 を捕捉 (fine tier へ escape)
     sm2.set_config(&cfg_gp2);
     sm2.set_enable(true);
-    // K 較正前に両 SM の RX FIFO を drain → 次エッジから c0/c2 が同一 GP2 エッジになることを保証する。
+    // K 較正: 較正前に両 SM の RX FIFO を drain → 次エッジから c0/c2 が同一 GP2 エッジになることを保証。
     // (古い値が残り c0/c2 が 1 エッジずれると、loopback の fold は公称秒 (62.5M tick) なので K に
     //  「実秒ぶんの tick」が混じり、mean が 水晶 ppm × 1s ≈ 数µs だけ boot ごとにずれる。)
-    while capture.capture_mut().try_read().is_some() {}
-    while sm2.rx().try_pull().is_some() {}
-    // SM0 と SM2 で同じ GP2 エッジを捕り、生カウンタ差 K=mean(C0−C2) を rp-pps で較正。
+    // 健全性検査: 同一エッジなら全 diff(c0−c2) が ~一定 (spread ≤ 1 tick)。混入があれば再 drain/retry。
     // PPS は fix 後のみ出るので各 30s 待ち、出なければ打ち切り。
-    let mut k_samples: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
-    for _ in 0..6u32 {
-        match with_timeout(Duration::from_secs(30), async {
-            let c0 = capture.capture_mut().wait_edge().await; // 較正は生カウンタ (fine tier へ escape)
-            let c2 = sm2.rx().wait_pull().await;
-            (c0, c2)
-        })
-        .await
-        {
-            Ok(pair) => {
-                let _ = k_samples.push(pair);
+    let mut k: u32 = 0;
+    let mut k_n = 0usize;
+    let mut k_clean = false;
+    for attempt in 0..4u32 {
+        while capture.capture_mut().try_read().is_some() {}
+        while sm2.rx().try_pull().is_some() {}
+        let mut samples: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
+        for _ in 0..6u32 {
+            match with_timeout(Duration::from_secs(30), async {
+                let c0 = capture.capture_mut().wait_edge().await; // 較正は生カウンタ (fine tier へ escape)
+                let c2 = sm2.rx().wait_pull().await;
+                (c0, c2)
+            })
+            .await
+            {
+                Ok(pair) => {
+                    let _ = samples.push(pair);
+                }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
+        if samples.is_empty() {
+            break; // PPS が来ない (no fix) → 打ち切り
+        }
+        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        for (c0, c2) in samples.iter() {
+            let d = c0.wrapping_sub(*c2) as i32;
+            lo = lo.min(d);
+            hi = hi.max(d);
+        }
+        let spread = hi as i64 - lo as i64;
+        if let Some(kk) = rp_pps::calibrate_loopback_offset(samples.iter().copied()) {
+            k = kk; // 最良 (=最新) 候補。clean なら採用、不一致なら次 attempt で上書き。
+            k_n = samples.len();
+        }
+        info!(
+            "PHASE_K attempt={} n={} diff_lo={} diff_hi={} spread={} k={}",
+            attempt,
+            samples.len(),
+            lo,
+            hi,
+            spread,
+            k as i32
+        );
+        if samples.len() >= 3 && spread <= 1 {
+            k_clean = true;
+            break; // 同一エッジ確定
+        }
+        // 不一致 = 別エッジ混入 → 再 drain して取り直し
     }
-    // 同一エッジ較正の健全性: 各 c0−c2 はほぼ一定のはず (1 エッジずれなら ~±62.5M tick になる)。
-    for (c0, c2) in k_samples.iter() {
-        info!("PHASE_K diff={}", c0.wrapping_sub(*c2) as i32);
+    if k_clean {
+        info!("PHASE_K calibrated k={} (n={})", k as i32, k_n);
+    } else if k_n > 0 {
+        warn!(
+            "PHASE_K not clean (retries exhausted), using k={} (n={})",
+            k as i32, k_n
+        );
+    } else {
+        warn!("PHASE_K calibration failed (no PPS)");
     }
-    let k = match rp_pps::calibrate_loopback_offset(k_samples.iter().copied()) {
-        Some(k) => {
-            info!("PHASE_K calibrated k={} (n={})", k as i32, k_samples.len());
-            k
-        }
-        None => {
-            warn!("PHASE_K calibration failed (no PPS)");
-            0
-        }
-    };
     // K 検証: SM2 を GP2 のまま数エッジ、loopback_phase が ~0 を確認 (数µs 出るなら K 不良)。
     while capture.capture_mut().try_read().is_some() {}
     while sm2.rx().try_pull().is_some() {}
