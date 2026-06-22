@@ -120,8 +120,7 @@ async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
     loop {
         // wait_edge + timeline.observe は TimedPpsCapture に委譲。生カウンタは edge.raw で取れる。
         let edge = capture.next_edge().await;
-        C0_GPS.store(edge.raw, Ordering::Relaxed); // stage②: 最新 GPS エッジの生カウンタを共有
-        C0_GEN.fetch_add(1, Ordering::Release); // 世代++ (Release: gen 進行を見たら直前の C0_GPS store が見える)
+        let edge_raw = edge.raw;
         // エポックのアンカー用に Instant を読む (µs ジッタは絶対オフセットのみに効く)。
         let query_ns = now_local_ns();
 
@@ -129,6 +128,13 @@ async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
         // PPS_TS signal は不要に: エッジは共有 state に記録され、main の feed_nmea が拾う。ここは log だけ。
         count += 1;
         let step = CLOCK.lock(|g| g.borrow_mut().on_pps_edge(edge, query_ns));
+        // stage② 共有 C0 は **Locked エッジのみ** publish。spurious/Irregular な GP2 捕捉を loopback の
+        // 基準にすると、ループがそれと対にして出力が誤った点へ寄り、しかも capture SM の余分捕捉で SM0/SM2
+        // の実効 K が runtime ドリフトする (オシロで offset② が ~µs まで育ち boot でリセット、を実機確認)。
+        if matches!(step.event, PpsEvent::Locked { .. }) {
+            C0_GPS.store(edge_raw, Ordering::Relaxed);
+            C0_GEN.fetch_add(1, Ordering::Release); // gen++ (Release: gen 進行で直前の C0_GPS store が見える)
+        }
         let (state, missed): (&str, u32) = match step.event {
             PpsEvent::First => ("First", 0),
             PpsEvent::Locked { .. } => ("Locked", 0),
