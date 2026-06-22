@@ -81,6 +81,16 @@ const PHASE_EXPERIMENT: bool = false;
 /// 各構成をコールドスタートから個別キャプチャして compare 風に重ねる用。
 const CTRL_SEL: u32 = 4;
 
+/// 定期 K 再較正の cadence (locked 中の出力エッジ数 ≈ 秒)。実効 K の温度ドリフト (#5 後で ~5ns/min) を
+/// 追従する。5分なら最大 ~25ns 振れ → 2桁ns 維持。短くすると holdover 中断が増える tradeoff。
+const RECAL_EDGES: u32 = 300;
+/// 再較正で取る (c0,c2) 同一エッジ対の数。先頭 1 個は GP4→GP2 切替トランジェントとして捨て、残りで K を測る。
+const RECAL_SAMPLES: u32 = 6;
+/// 再較正で測った新 K は段差で適用せず、1 エッジあたり最大このtick数だけ slew して寄せる。実効 K は連続的に
+/// 這うので補正も連続が自然。段差適用だと累積ドリフト(~6tick=96ns)を loop が急補正し D 項が跳ねて
+/// offset② が ~30s 暴れる (実機確認)。slew で ramp 化すると loop は滑らかに追従する。dk≈6 なら ~3 エッジで適用。
+const RECAL_K_SLEW_TICKS: i32 = 2;
+
 /// 最新の GPS PPS エッジの生カウンタ値 (SM0)。stage② の PIO 位相計測で gen_capture が参照する。
 static C0_GPS: AtomicU32 = AtomicU32::new(0);
 /// GPS PPS エッジの世代カウンタ。出力エッジ間に進んでいなければ GPS 欠落 = C0_GPS は古い → 補正に使わない。
@@ -184,6 +194,99 @@ async fn time_task() {
     }
 }
 
+/// 定期 K 再較正。両捕捉 SM (SM0=GP2 GPS, SM2=GP4 出力ループバック) の生カウンタは runtime/温度で相対
+/// スリップし、boot 較正した K が古くなって offset② (出力 PPS vs GPS の絶対位相) がゆっくり這う (実機確認:
+/// C0 publish を Locked 限定にした後も ~5ns/min・温度相関)。SM2 を一時的に GP2 へ向け、SM0 と同一 GP2
+/// エッジで K=mean(c0-c2) を測り直して現在の相対関係に追従する。
+///
+/// SM2 が出力 (GP4) を見ない間も SM1 は毎秒 1 周期語を消費し、空 FIFO だとパルスを落とす (出力プログラムは
+/// 前周期を保持しない)。そこで直近の周期語 `last_period` を holdover として**生 push** し続ける (dither は
+/// 通常制御経路でのみ進め、ここでは前進させない)。出力と GPS は規律済みでほぼ同時刻なので、僅かな reserve を
+/// 保てば starvation を避けられる。clean (spread≤2 tick・≥3 サンプル) かつ |Δk|≤cap のときだけ新 k を採用。
+async fn recal_k(
+    sm: &mut StateMachine<'static, PIO0, 2>,
+    output: &mut SteeredPpsOutput<'static, PIO0, 1>,
+    cfg_gp2: &PioConfig<'static, PIO0>,
+    cfg_gp4: &PioConfig<'static, PIO0>,
+    k: u32,
+    last_period: u32,
+) -> u32 {
+    // SM2 を GP2 へ (jmp_pin だけ替わる同一 program。set_config は X を触らないので K の基準カウンタは不変)。
+    sm.set_config(cfg_gp2);
+    while sm.rx().try_pull().is_some() {} // 切替前後の stale/in-flight 捕捉を捨てる
+    // holdover バッファ: 直近周期語を生 push (dither 不前進)。通常ループが既に ~1 個 queue 済みとみなす。
+    let mut reserve: u32 = 1;
+    while reserve < 3 && output.output_mut().set_period(last_period) {
+        reserve += 1;
+    }
+    let mut samples: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
+    for i in 0..RECAL_SAMPLES {
+        // 同一エッジ対の鍵: c2 を待つ「前」に gen_before を確定する。pps_task は C0_GPS store 後に C0_GEN を
+        // Release++ するので、この順なら c2 と同じ GP2 エッジの publish を待てる (c2 後に待ち始めると既に
+        // publish 済みのとき次秒へずれ、1 秒ミスペアが安定しうる)。
+        let gen_before = C0_GEN.load(Ordering::Acquire);
+        let c2 = match with_timeout(Duration::from_secs(3), sm.rx().wait_pull()).await {
+            Ok(v) => v,
+            Err(_) => break, // GPS 欠落 → 中断 (旧 k 維持)
+        };
+        reserve = reserve.saturating_sub(1); // この ~1 秒で出力 1 パルス消費とみなす
+        while reserve < 2 && output.output_mut().set_period(last_period) {
+            reserve += 1;
+        }
+        // pps_task が同エッジを publish (gen 進行) するのを短時間待つ。進まなければこのサンプルは捨てる。
+        let deadline = Instant::now() + Duration::from_millis(150);
+        while C0_GEN.load(Ordering::Acquire) == gen_before && Instant::now() < deadline {
+            embassy_futures::yield_now().await;
+        }
+        if C0_GEN.load(Ordering::Acquire) != gen_before {
+            let c0 = C0_GPS.load(Ordering::Relaxed);
+            // 先頭 (i==0) は GP4→GP2 切替トランジェントとして捨てる。
+            if c0 != 0 && i > 0 {
+                let _ = samples.push((c0, c2));
+            }
+        }
+    }
+    // SM2 を GP4 へ戻す (X 保持)。drain して次の GP4 捕捉が新鮮な出力エッジになるように。
+    sm.set_config(cfg_gp4);
+    while sm.rx().try_pull().is_some() {}
+    // 評価: spread ゲート → mean → |Δk| cap。怪しければ旧 k 維持 (誤った K で出力を飛ばさない)。
+    if samples.len() < 3 {
+        warn!("PHASE_K recal abort: too few samples n={}", samples.len());
+        return k;
+    }
+    let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+    for (c0, c2) in samples.iter() {
+        let d = c0.wrapping_sub(*c2) as i32;
+        lo = lo.min(d);
+        hi = hi.max(d);
+    }
+    let spread = hi as i64 - lo as i64;
+    if spread > 2 {
+        warn!("PHASE_K recal reject: spread={} n={}", spread, samples.len());
+        return k;
+    }
+    let Some(nk) = rp_pps::calibrate_loopback_offset(samples.iter().copied()) else {
+        return k;
+    };
+    let dk = nk.wrapping_sub(k) as i32;
+    if dk.abs() > 500 {
+        warn!(
+            "PHASE_K recal reject: |dk|={} > 500 (k={} nk={})",
+            dk, k as i32, nk as i32
+        );
+        return k;
+    }
+    info!(
+        "PHASE_K recal OK k={} -> {} dk={} n={} spread={}",
+        k as i32,
+        nk as i32,
+        dk,
+        samples.len(),
+        spread
+    );
+    nk
+}
+
 /// 規律 PPS 出力の周期管理 + ループバック計測 (GP3 生成 / GP4 捕捉)。**エッジに同期して**
 /// 1 出力エッジにつき 1 回だけ次周期を更新する (= freq 規律 + 位相同期を 1 箇所で・1 サンプル遅れで)。
 /// time_task の 1Hz タイマと非同期に補正すると位相が発振したので、ここに集約した。
@@ -192,12 +295,19 @@ async fn time_task() {
 async fn gen_capture_task(
     mut output: SteeredPpsOutput<'static, PIO0, 1>,
     mut sm: StateMachine<'static, PIO0, 2>,
-    k: u32, // stage② 較正済みカウンタオフセット (C0−C2)
+    mut k: u32, // stage② 較正済みカウンタオフセット (C0−C2)。定期再較正で更新する。
+    cfg_gp2: PioConfig<'static, PIO0>, // SM2 を GPS(GP2) へ向ける config (再較正用)
+    cfg_gp4: PioConfig<'static, PIO0>, // SM2 を出力ループバック(GP4) へ向ける config (通常運用)
 ) {
     let clk = clk_sys_freq();
     let mut last_x: Option<u32> = None;
     let mut count: u32 = 0;
     let mut last_gen: u32 = 0;
+    let mut k_target: u32 = k; // 再較正が測った最新 K。毎エッジ k をここへ slew して寄せる (段差→ramp)。
+    // 直近の出力周期語。再較正中の holdover 生 push に再利用する。必ず set_next_period (下) で代入されてから
+    // recal_k に渡る (再較正はループ末尾＝周期語確定後にしか発火しない) ので、初期値は不要。
+    let mut last_period: u32;
+    let mut edges_since_recal: u32 = 0;
     // 出力位相 PLL (制御=gnssdo)。sub-cycle period 生成 (dither) + period word push は
     // SteeredPpsOutput (rp-pps) が内包するので、ここは freq_mppb と phase_corr を渡すだけ。
     let mut pll = PhaseLockLoop::with_config(PhaseLockLoopConfig {
@@ -239,6 +349,12 @@ async fn gen_capture_task(
         // 出力周期。PIO ~68s 周回グリッチの偽エッジは間隔が異常 → 位相補正に使わない。
         let interval_ns = last_x.map(|lx| rp_pps::interval_ns(lx, x, clk) as i64);
         let sane = interval_ns.is_some_and(|iv| (iv - 1_000_000_000).abs() < 300_000_000);
+        // 再較正で測った K (k_target) へ毎エッジ最大 RECAL_K_SLEW_TICKS だけ slew。段差で適用すると
+        // 累積ドリフトを loop が急補正し snap するので、ramp 化して滑らかに追従させる。
+        if k != k_target {
+            let diff = (k_target.wrapping_sub(k) as i32).clamp(-RECAL_K_SLEW_TICKS, RECAL_K_SLEW_TICKS);
+            k = k.wrapping_add(diff as u32);
+        }
         // stage② PIO ハード位相: 出力エッジ と 最新 GPS エッジ の生カウンタ差 (mod 1秒) を ns に。
         // Instant を介さないので executor のウェイクアップ遅延 (~ms) に汚されず 16ns 分解能。
         let c0 = C0_GPS.load(Ordering::Relaxed);
@@ -286,7 +402,8 @@ async fn gen_capture_task(
         // DisciplinedClock の α-β が傾きを先回りするので、出力周期にその予測周波数を入れて定常誤差を抑える。
         // 位相補正は dither が cycle に変換して引く。
         let freq_mppb = pred_mppb + u.freq_trim_mppb;
-        let _ = output.set_next_period(freq_mppb, u.phase_corr_ns);
+        // 周期語を保持: 再較正中の holdover 生 push に再利用 (dither はこの通常経路でのみ前進)。
+        last_period = output.set_next_period(freq_mppb, u.phase_corr_ns);
         if let Some(iv) = interval_ns {
             count += 1;
             // 制御信号を全部出力 → ホストでプラント同定 + ゲイン掃引シミュ + 項別比較ができる。
@@ -309,6 +426,20 @@ async fn gen_capture_task(
             );
         }
         last_x = Some(x);
+        // 定期 K 再較正: locked 中、RECAL_EDGES 出力エッジ毎に SM2 を GPS へ戻して実効 K を測り直す。
+        // 実効 K は温度で這う (#5 後も ~5ns/min) ので boot 一発較正では追えない。再較正中は holdover。
+        if u.locked {
+            edges_since_recal += 1;
+            if edges_since_recal >= RECAL_EDGES {
+                edges_since_recal = 0;
+                info!("PHASE_K recal start (after {} locked edges)", RECAL_EDGES);
+                // 測定値は k_target へ。実際の k は通常ループで毎エッジ slew して寄せる (段差回避)。
+                // dk cap は前回測定値 (k_target) 比で評価 (measured-to-measured の真ドリフト)。
+                k_target = recal_k(&mut sm, &mut output, &cfg_gp2, &cfg_gp4, k_target, last_period).await;
+                last_x = None; // GP4 捕捉が再較正の gap を跨ぐので次の interval は無効化
+                last_gen = C0_GEN.load(Ordering::Acquire); // 復帰直後の偽 fresh ジャンプを避ける
+            }
+        }
     }
 }
 
@@ -442,7 +573,7 @@ async fn main(spawner: Spawner) {
     let spawner_high = EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0);
     spawner_high.spawn(pps_task(capture).unwrap());
     spawner.spawn(time_task().unwrap());
-    spawner_high.spawn(gen_capture_task(output, sm2, k).unwrap());
+    spawner_high.spawn(gen_capture_task(output, sm2, k, cfg_gp2, cfg_gp4).unwrap());
 
     // UART0: TX=GP0 (モジュール設定送信), RX=GP1 (NMEA 受信)。
     static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
