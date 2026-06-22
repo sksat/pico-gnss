@@ -67,6 +67,19 @@ static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<PpsGpsdo>> =
 /// 位相制御の測定源。true=PIO ハード位相 (stage②, 本番)。false=旧 Instant 測定 (比較計測用)。
 const PHASE_USE_HW: bool = true;
 // 位相ループの gains は gnssdo の PhaseLockLoopConfig::DEFAULT に移動した (σ≈35ns 実測チューニング)。
+/// **2026-06 改修 (実験中)**: 出力位相 wander (±~600ns, 卓越周期 ~36s) は受信律速ではなく **i_den での
+/// type-II ループの underdamped 共振** と判明した。根拠 (5 系統で確認): 実ログ4本 + scope 実測が
+/// いずれも卓越周期 32-37s (= 2π√(i_den) edge、i_den=32 で 35.5edge=36s) かつ電力の 73-94% が 16-64s 帯、
+/// 受信品質(HDOP)・温度と無相関、実 PhaseLockLoop の step 応答が 35.0s で ~24 回リンギング、反証検証
+/// (aliasing/K再較正/量子化/適応スイッチ) を全て排除。受信機の位相ステップ/低周波擾乱がこの固有モードを
+/// 叩いてリンギング増幅される。**白色位相ノイズでは励起されず** (2 つの独立 host sim が 11ns→~5-8ns に
+/// 減衰、replay も 46ns) excitation はモデル外なので、**修正の振幅効果は実機が判定者**。
+/// 対策方針: i_den を 32→128 へ緩めモード周期を 36→71s へ動かしループのノイズ帯域を下げる。host sim で
+/// ±250ppb/25min 熱でも 100% ロック保持 (緩める方向は安全。FF が温度ドリフトを担う)。
+/// **sim で反証済みの罠**: kp_inv 8→4 (P 倍) も D 強化 (d_den 小) も連続時間 ζ 式に反して **不安定化**
+/// する (Smith の 1-edge 遅延 + 整数切り捨て。kp_inv=4 は sd 330ns へ発散・ロック 89%)。これらは触らない。
+/// 実機テスト: 周期が 36→71s へ動けばループモード確定。振幅の改善可否は前後比較 + holdover-endpoint で判定。
+/// (以下は適応ゲインの旧解説。適応は無効化。)
 /// 位相ループ積分の分母。**適応ゲイン**: 落ち着き時 (|pred| < CALM_NS) は I_DEN_CALM で緩い温度ドリフトを
 /// 締めて追従、外乱時 (ドライヤー級ショック) は I_DEN_CALM<<DISTURBED_SHIFT へ鈍化して windup/overshoot/
 /// lock喪失を回避。calm と disturbed を decouple できる。
@@ -82,9 +95,9 @@ const PHASE_USE_HW: bool = true;
 /// (host モデルはロック窓を持たないので高ゲインの不安定を過小評価する。gnssdo/tests/thermal_plant.rs の
 /// i_den_sweep_under_thermal_curvature 参照)。残る温度 wander は環境 (連続 ±250ppb 振動) 律速で、firmware
 /// ゲインでは安全に削れない。
-const I_DEN_CALM: i64 = 32;
+const I_DEN_CALM: i64 = 128; // 旧 32 (ζ≈0.35 共振) → 128 (ζ≈0.71)。名は CALM だが適応無効で常時この値。
 const CALM_NS: i64 = 1_000;
-const DISTURBED_SHIFT: u32 = 2; // 32 << 2 = 128
+const DISTURBED_SHIFT: u32 = 0; // 適応無効: 固定 i_den=128。旧 2 (32<<2=128) の calm/disturbed 切替を撤去
 /// 制御項の実験モード: true で **P→PI→PID を ~120 エッジ毎に巡回**し各項の効果を観察 (cfg を PPSGEN に出力)。
 /// false で本番 = 常時 PID。
 const PHASE_EXPERIMENT: bool = false;
