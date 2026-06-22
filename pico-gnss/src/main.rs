@@ -98,6 +98,14 @@ const PHASE_USE_HW: bool = true;
 const I_DEN_CALM: i64 = 128; // 旧 32 (ζ≈0.35 共振) → 128 (ζ≈0.71)。名は CALM だが適応無効で常時この値。
 const CALM_NS: i64 = 1_000;
 const DISTURBED_SHIFT: u32 = 0; // 適応無効: 固定 i_den=128。旧 2 (32<<2=128) の calm/disturbed 切替を撤去
+
+/// 実験 harness: i_den を**一定受信下で掃引**して、振幅 vs i_den の真の法則を測る。旧 i_den=32 ログは
+/// 適応スイッチ(shift=2)が同時に効いていて、しかも別セッション(受信が違う)なので、6× の振幅低下が i_den
+/// なのか適応スイッチ撤去なのか受信差なのか切り分けられない。これを 1 boot・固定 shift=0・同一受信で掃引し、
+/// 各 i_den セグメントの hwphase 振幅を比べて confound を潰す。本番は false (固定 I_DEN_CALM)。
+const I_DEN_SWEEP: bool = true;
+const I_DEN_LIST: [i64; 3] = [32, 128, 512];
+const I_DEN_SWEEP_EDGES: u32 = 240; // 各 i_den の locked エッジ数 (~4min)。recal=300 とずらして干渉を避ける。
 /// 制御項の実験モード: true で **P→PI→PID を ~120 エッジ毎に巡回**し各項の効果を観察 (cfg を PPSGEN に出力)。
 /// false で本番 = 常時 PID。
 const PHASE_EXPERIMENT: bool = false;
@@ -355,6 +363,12 @@ async fn gen_capture_task(
         i_den_disturbed_shift: DISTURBED_SHIFT,
         ..PhaseLockLoopConfig::DEFAULT
     });
+    // 実験: i_den 掃引の状態 (I_DEN_SWEEP=true で先頭値から開始し、locked エッジで順に切替)。
+    let mut sweep_idx: usize = 0;
+    let mut edges_since_sweep: u32 = 0;
+    if I_DEN_SWEEP {
+        pll.set_i_den(I_DEN_LIST[0]);
+    }
     loop {
         let x0 = sm.rx().wait_pull().await; // 出力エッジの生カウンタ (C2_out)。wait_pull は FIFO 最古を返す。
         // backlog があれば最新エッジまで drain する (K 較正の drain と同じ対策)。ループが holdover 復帰等で
@@ -448,7 +462,7 @@ async fn gen_capture_task(
             // 制御信号を全部出力 → ホストでプラント同定 + ゲイン掃引シミュ + 項別比較ができる。
             // (互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残し、cfg/trim/p/d を追記)
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cfg={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cfg={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} iden={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
@@ -461,13 +475,25 @@ async fn gen_capture_task(
                 u.freq_trim_mppb,
                 slope_mppb,
                 raw_lag,
-                u.locked as u8
+                u.locked as u8,
+                pll.config().i_den
             );
         }
         last_x = Some(x);
         // 定期 K 再較正: locked 中、RECAL_EDGES 出力エッジ毎に SM2 を GPS へ戻して実効 K を測り直す。
         // 実効 K は温度で這う (#5 後も ~5ns/min) ので boot 一発較正では追えない。再較正中は holdover。
         if u.locked {
+            // 実験: i_den 掃引。locked エッジを数え、I_DEN_SWEEP_EDGES 毎に次の i_den へ (短い unlock は
+            // カウントを進めないだけで segment を跨いで継続)。一定受信下で各 i_den の hwphase 振幅を比較する。
+            if I_DEN_SWEEP {
+                edges_since_sweep += 1;
+                if edges_since_sweep >= I_DEN_SWEEP_EDGES {
+                    edges_since_sweep = 0;
+                    sweep_idx = (sweep_idx + 1) % I_DEN_LIST.len();
+                    pll.set_i_den(I_DEN_LIST[sweep_idx]);
+                    info!("PLLSWEEP i_den={}", I_DEN_LIST[sweep_idx]);
+                }
+            }
             edges_since_recal += 1;
             if edges_since_recal >= RECAL_EDGES {
                 edges_since_recal = 0;

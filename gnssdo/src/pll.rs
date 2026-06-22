@@ -186,6 +186,15 @@ impl PhaseLockLoop {
         self.config.mode = mode;
     }
 
+    /// Set the integral denominator at runtime, preserving the integrated trim and lock state.
+    /// Larger `i_den` = slower integration = lower loop bandwidth = longer natural period
+    /// (≈ 2π√`i_den` edges). Used by the firmware's experiment harness to sweep `i_den` under
+    /// matched conditions (the closed-loop output-phase wander is the underdamped type-II mode at
+    /// that natural period, so sweeping `i_den` moves the mode without re-locking the loop).
+    pub fn set_i_den(&mut self, i_den: i64) {
+        self.config.i_den = i_den;
+    }
+
     /// Whether the loop is currently locked.
     pub fn is_locked(&self) -> bool {
         self.lock_cnt >= self.config.lock_hold
@@ -441,5 +450,24 @@ mod tests {
             p.update(4_000, true);
         }
         assert!(p.freq_trim_mppb().abs() <= p.config().trim_max_mppb);
+    }
+
+    #[test]
+    fn set_i_den_changes_integration_rate_live() {
+        // set_i_den retunes the integral denominator in place (firmware experiment harness sweeps it).
+        // Use a Pi loop (pred=ctrl, no Smith/D) so the trim increment is exactly -pred*1000/i_den.
+        let cfg = PhaseLockLoopConfig {
+            mode: LoopMode::Pi,
+            ..PhaseLockLoopConfig::DEFAULT
+        };
+        let mut p = PhaseLockLoop::with_config(cfg);
+        assert_eq!(p.config().i_den, 128);
+        assert_eq!(p.update(2_000, true).freq_trim_mppb, -2_000 * 1000 / 128);
+        // Loosen: the next in-band edge integrates at the new (slower) rate, trim preserved.
+        p.set_i_den(512);
+        assert_eq!(p.config().i_den, 512);
+        let before = p.freq_trim_mppb();
+        let u = p.update(2_000, true);
+        assert_eq!(u.freq_trim_mppb, before - 2_000 * 1000 / 512);
     }
 }
