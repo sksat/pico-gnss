@@ -13,5 +13,11 @@ repository.workspace = true
 [lib]
 name = "gnssdo"
 
-# No dependencies: the discipline core is pure integer logic. NMEA decoding and PPS↔time pairing
-# (which need heapless / the optional `nmea` crate) live in the sibling `rp-pps` crate.
+# No runtime dependencies: the discipline core is pure integer logic. NMEA decoding and PPS↔time
+# pairing (which need heapless / the optional `nmea` crate) live in the sibling `rp-pps` crate.
+
+# Dev-only: property-based testing of the discipline loop against a generic temperature-driven
+# crystal plant model (tests/thermal_plant.rs). Not part of the published dependency graph, so the
+# crate's "zero runtime dependencies" property is preserved.
+[dev-dependencies]
+proptest = "1"

@@ -87,6 +87,16 @@ pub struct PhaseLockLoopConfig {
     pub trim_max_mppb: i64,
     /// Derivative denominator: d_corr = (pred − last_pred) / `d_den` (ns). Default 4.
     pub d_den: i64,
+    /// Adaptive-gain "calm" band (ns). While `|predicted_phase|` is within this, the integral runs at
+    /// the aggressive `i_den` (tight tracking of slow/thermal drift); beyond it the disturbance is
+    /// large (a thermal shock), so the integral is slowed by `i_den_disturbed_shift` to avoid windup
+    /// and overshoot. Gentle warming keeps the phase small (the loop tracks it), so it stays in the
+    /// aggressive regime; a violent shock blows the phase up and drops to the conservative regime.
+    /// Default = `lock_ns`.
+    pub calm_ns: i64,
+    /// Integral slow-down outside the calm band: effective `i_den` becomes `i_den << shift`. 0 disables
+    /// adaptation (the integral always uses `i_den`), preserving the fixed-gain behaviour. Default 0.
+    pub i_den_disturbed_shift: u32,
 }
 
 impl PhaseLockLoopConfig {
@@ -102,6 +112,8 @@ impl PhaseLockLoopConfig {
         i_den: 128,
         trim_max_mppb: 3_000_000,
         d_den: 4,
+        calm_ns: 1_000,
+        i_den_disturbed_shift: 0,
     };
 }
 
@@ -218,7 +230,15 @@ impl PhaseLockLoop {
                 // thus drive it to zero). Reset when the I term is off.
                 if self.config.mode.use_i() {
                     if ctrl.abs() < self.config.i_enable_ns {
-                        self.trim_mppb = (self.trim_mppb - pred * 1000 / self.config.i_den)
+                        // Adaptive integral gain: aggressive (i_den) while calm, slowed when the phase
+                        // is disturbed (a shock), to track slow thermal drift tightly without winding
+                        // up/overshooting on a fast disturbance.
+                        let i_den_eff = if pred.abs() < self.config.calm_ns {
+                            self.config.i_den
+                        } else {
+                            self.config.i_den << self.config.i_den_disturbed_shift.min(20)
+                        };
+                        self.trim_mppb = (self.trim_mppb - pred * 1000 / i_den_eff)
                             .clamp(-self.config.trim_max_mppb, self.config.trim_max_mppb);
                     }
                 } else {
@@ -387,6 +407,28 @@ mod tests {
         assert_eq!(u.freq_trim_mppb, 0); // I disabled → trim forced to 0
         assert_eq!(u.d_corr_ns, 0); // D disabled
         assert_eq!(u.p_corr_ns, u.predicted_phase_ns / 16); // no Smith → kp_inv 16
+    }
+
+    #[test]
+    fn adaptive_gain_slows_integral_when_disturbed() {
+        // 適応積分: |pred| が calm_ns 内なら i_den (aggressive)、超えたら i_den<<shift (slow)。
+        // Smith/D を外した Pi で pred=ctrl にし、1 エッジの trim 増分で実効 i_den を確認。
+        let cfg = |shift| PhaseLockLoopConfig {
+            mode: LoopMode::Pi,
+            i_den: 32,
+            calm_ns: 1_000,
+            i_den_disturbed_shift: shift,
+            ..PhaseLockLoopConfig::DEFAULT
+        };
+        // calm (500 < 1000): shift によらず i_den=32。
+        let mut p = PhaseLockLoop::with_config(cfg(2));
+        assert_eq!(p.update(500, true).freq_trim_mppb, -500 * 1000 / 32);
+        // disturbed (2000 > 1000) + shift=2: i_den を <<2 = 128 に鈍化。
+        let mut q = PhaseLockLoop::with_config(cfg(2));
+        assert_eq!(q.update(2000, true).freq_trim_mppb, -2000 * 1000 / 128);
+        // 同じ disturbed phase でも shift=0 なら適応無効で i_den=32 のまま。
+        let mut r = PhaseLockLoop::with_config(cfg(0));
+        assert_eq!(r.update(2000, true).freq_trim_mppb, -2000 * 1000 / 32);
     }
 
     #[test]

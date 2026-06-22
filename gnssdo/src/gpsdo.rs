@@ -61,6 +61,38 @@ pub struct DisciplinedClockConfig {
     /// internal state, NMEA association, PPS phase not yet settled). 0 = no quarantine (a valid
     /// setting, so it is not `NonZero`).
     pub quarantine_samples: u32,
+    /// Slope-EMA shift for the α-β frequency tracker (default 9, much slower than `ema_shift`). The
+    /// level (`freq_mppb`) is a single EMA; on its own it lags a frequency *ramp* (temperature drift)
+    /// by ≈`2^ema_shift` samples, so the disciplined output runs at a stale frequency and accrues a
+    /// phase error proportional to the ramp rate (the measured µs-scale offset② temperature drift).
+    /// Estimating the slope `freq_slope_mppb` (per sample) and projecting it forward
+    /// ([`predicted_freq_mppb`](DisciplinedClock::predicted_freq_mppb)) cancels that lag to first
+    /// order. The slope must adapt far more slowly than the level or it becomes a jitter
+    /// differentiator, hence the larger shift. Frozen while converging/quarantined. 0..=63 (clamped).
+    pub slope_ema_shift: u32,
+    /// Clamp on the tracked frequency slope (milli-ppb per sample, default 5 000 = 5 ppb/s). This is
+    /// the **dominant safety bound on the feedforward**: a *sustained* crystal thermal drift is at
+    /// most a few ppb/s (≈0.5 ppm/°C × a slow °C/s), so 5 ppb/s covers real warming with margin. A
+    /// violent shock (a hair dryer ≈ tens of ppb/s) is faster than the once-per-second loop can track
+    /// anyway, and feeding its full slope forward overshoots; clamping the slope here caps that
+    /// feedforward (and bounds the stale slope left after the shock, which decays from the clamp).
+    pub slope_max_mppb: i64,
+    /// How many samples ahead [`predicted_freq_mppb`](DisciplinedClock::predicted_freq_mppb) projects
+    /// the slope (default 1). The output period set this edge governs roughly the next 1 s, so a lead
+    /// of one sample predicts the crystal's frequency over that interval. 0 = no feedforward (level
+    /// only).
+    pub pred_lead_samples: i64,
+    /// Widen the post-lock residual gate by `|slope| * this` (default 8). During a fast ramp the
+    /// honest measurement legitimately sits far from the level; without widening, the fixed
+    /// `residual_gate_ns` would reject good samples and stall the tracker mid-ramp.
+    pub residual_slope_widen: i64,
+    /// Freeze slope adaptation when the prediction residual `|measured − projected|` exceeds this
+    /// (milli-ppb, default 2 000 000 = 2 µs/s). A gentle thermal ramp leaves a small residual (the
+    /// α-β tracks it), so the slope keeps adapting; a violent thermal shock leaves a large residual,
+    /// where adapting the slope would spike it to tens of ppb/s and (because the slope is fed forward
+    /// and decays slowly) leave a stale, wrong feedforward after the shock. Freezing the slope there
+    /// keeps the feedforward sane through shocks. The *level* still updates; only the slope is held.
+    pub slope_freeze_resid_mppb: i64,
 }
 
 impl DisciplinedClockConfig {
@@ -74,6 +106,11 @@ impl DisciplinedClockConfig {
         converge_gate_ns: NonZeroU64::new(100_000).unwrap(),
         residual_gate_ns: NonZeroU64::new(5_000).unwrap(),
         quarantine_samples: 5,
+        slope_ema_shift: 9,
+        slope_max_mppb: 5_000,
+        pred_lead_samples: 1,
+        residual_slope_widen: 8,
+        slope_freeze_resid_mppb: 2_000_000,
     };
 }
 
@@ -122,7 +159,8 @@ impl FreqUpdate {
 #[derive(Debug, Default)]
 pub struct DisciplinedClock {
     config: DisciplinedClockConfig,
-    freq_mppb: i64, // frequency-offset EMA (milli-ppb = ppb*1000, kept for higher resolution)
+    freq_mppb: i64, // frequency-offset EMA level (milli-ppb = ppb*1000, kept for higher resolution)
+    freq_slope_mppb: i64, // α-β slope: estimated change in freq_mppb per sample (milli-ppb/sample)
     samples: u32,
     quarantine: u32, // while >0 we are in the recovery quarantine (frequency-EMA updates held off)
     epoch_capture_ns: Option<u64>, // capture-timebase epoch (ns, for err/now_from_capture_ns)
@@ -152,6 +190,7 @@ impl DisciplinedClock {
         Self {
             config,
             freq_mppb: 0,
+            freq_slope_mppb: 0,
             samples: 0,
             quarantine: 0,
             epoch_capture_ns: None,
@@ -201,11 +240,12 @@ impl DisciplinedClock {
         }
         // 3. Quality gate.
         if self.is_locked() {
-            // After lock: a single sample with a large residual from the EMA is multipath. Reject
-            // far more tightly than ±1ms.
-            if (measured_mppb - self.freq_mppb).abs()
-                > self.config.residual_gate_ns.get() as i64 * 1000
-            {
+            // After lock: a single sample with a large residual from the level is multipath. Reject
+            // far more tightly than ±1ms. Widen by |slope| so a fast (but real) ramp, whose honest
+            // measurement legitimately sits far from the level, is not rejected and stalled.
+            let gate = self.config.residual_gate_ns.get() as i64 * 1000
+                + self.freq_slope_mppb.abs() * self.config.residual_slope_widen;
+            if (measured_mppb - self.freq_mppb).abs() > gate {
                 return FreqUpdate::GatedQuality;
             }
         } else {
@@ -215,15 +255,30 @@ impl DisciplinedClock {
                 return FreqUpdate::GatedQuality;
             }
         }
-        // 4. EMA update: f += (x − f) / 2^SHIFT. While converging, capture with a fast alpha=1/8.
-        // Clamp the shift to 0..=63 to avoid i64 shift overflow (see the config docs).
-        let shift = if self.is_locked() {
+        // 4. α-β update. The level (`freq_mppb`) is a single EMA — fast alpha while converging, slow
+        // after lock — projected one sample forward with the slope before correcting by the residual,
+        // and the slope tracks the level's per-sample drift. A level-only EMA lags a frequency ramp
+        // (temperature drift) by ≈2^ema_shift samples; the slope projection cancels that lag so the
+        // disciplined output does not accrue a ramp-proportional phase error. Shifts clamped to
+        // 0..=63 (i64 shift overflow).
+        let level_shift = if self.is_locked() {
             self.config.ema_shift
         } else {
             self.config.ema_shift_fast
         }
         .min(63);
-        self.freq_mppb += (measured_mppb - self.freq_mppb) >> shift;
+        let projected = self.freq_mppb + self.freq_slope_mppb;
+        let resid = measured_mppb - projected;
+        self.freq_mppb = projected + (resid >> level_shift);
+        // Adapt the slope only once locked: while converging the level moves fast on its own, so a
+        // slope estimate would just chase the start-up transient. Its EMA is far slower than the
+        // level's (slope_ema_shift > ema_shift) to avoid differentiating PPS jitter, and clamped to a
+        // physically plausible crystal ramp.
+        if self.is_locked() && resid.abs() < self.config.slope_freeze_resid_mppb {
+            let slope_shift = self.config.slope_ema_shift.min(63);
+            self.freq_slope_mppb = (self.freq_slope_mppb + (resid >> slope_shift))
+                .clamp(-self.config.slope_max_mppb, self.config.slope_max_mppb);
+        }
         self.samples += 1;
         FreqUpdate::Applied
     }
@@ -265,9 +320,27 @@ impl DisciplinedClock {
         (self.freq_mppb + half) / 1000
     }
 
-    /// Estimated frequency offset (milli-ppb). For displaying ppm in the webapp.
+    /// Estimated frequency offset (milli-ppb) — the α-β *level*. For displaying ppm in the webapp
+    /// and as the frequency for time-reading (`now_from_*`). Use [`predicted_freq_mppb`] for the
+    /// output period.
     pub fn freq_mppb(&self) -> i64 {
         self.freq_mppb
+    }
+
+    /// Tracked frequency *slope* (milli-ppb per sample): how fast the crystal's offset is drifting,
+    /// e.g. under a temperature ramp. 0 in steady state. Exposed for logging and tests.
+    pub fn freq_slope_mppb(&self) -> i64 {
+        self.freq_slope_mppb
+    }
+
+    /// Frequency estimate (milli-ppb) projected `pred_lead_samples` ahead — the value to feed the
+    /// **output period**. A level-only estimate lags a temperature-driven frequency ramp, so the
+    /// generated PPS runs at a stale frequency and its phase drifts proportionally to the ramp rate;
+    /// projecting the tracked slope forward cancels that lag to first order (see the config docs and
+    /// `freq_slope_mppb`). Reduces to `freq_mppb()` when the slope is 0 (steady state) or
+    /// `pred_lead_samples` is 0.
+    pub fn predicted_freq_mppb(&self) -> i64 {
+        self.freq_mppb + self.freq_slope_mppb * self.config.pred_lead_samples
     }
 
     /// Whether enough samples have been seen to lock the frequency.
@@ -517,6 +590,136 @@ mod tests {
             c.update_freq(1_000_000_000 + 2500 + j);
         }
         assert!((c.freq_ppb() - 2500).abs() <= 20, "freq={}", c.freq_ppb());
+    }
+
+    #[test]
+    fn predicted_freq_leads_a_frequency_ramp() {
+        // 温度ドリフト = 水晶周波数のランプ。単一 EMA はランプを時定数分だけ遅れて追うので、
+        // その値を出力周期に使うと位相がランプ速度に比例してずれる (実機 offset② の正体)。
+        // α-β は傾き (slope) を推定して 1 サンプル先を予測 → ランプに対し定常遅れ ~0。
+        let mut c = DisciplinedClock::new();
+        let f0 = 3_000_000i64; // 始点 3000 ppb (mppb)
+        let r = 2_000i64; // +2000 mppb/sample = +2 ppb/s のランプ (1000 の倍数で test 丸めを回避)
+        let mut n = 0i64;
+        for _ in 0..80 {
+            let measured_mppb = f0 + r * n;
+            c.update_freq(1_000_000_000 + measured_mppb / 1000);
+            n += 1;
+        }
+        // 次サンプル (n=80) の真の周波数
+        let true_next = f0 + r * n;
+        // α-β の 1 サンプル先予測がランプを追えている (定常遅れ ~0)。
+        // 単一 EMA だと ~31*r=62000 mppb 遅れて落ちる。
+        let pred = c.predicted_freq_mppb();
+        assert!(
+            (pred - true_next).abs() < 10_000,
+            "pred={} true_next={} lag={}",
+            pred,
+            true_next,
+            pred - true_next
+        );
+        // 傾き推定がランプ速度に収束。
+        assert!(
+            (c.freq_slope_mppb() - r).abs() < r / 2,
+            "slope={} expected~{}",
+            c.freq_slope_mppb(),
+            r
+        );
+    }
+
+    #[test]
+    fn alpha_beta_cuts_ramp_phase_error_vs_single_ema() {
+        // offset② の核心: 周波数ランプ(温度ドリフト)に対し、出力周期に入れる周波数が真値からずれた分は
+        // 位相として積算される(PLL が吸収すべき量)。単一 EMA は ramp を時定数分遅れて追うので大きく積算し、
+        // α-β は slope を先回りするので桁で小さい。両者で「累積位相のピーク」を比べ、α-β が 1/5 未満を保証。
+        let f0 = 3_000_000i64;
+        let r = 2_000i64; // 2 ppb/s ランプを 200s, その後一定 200s
+        let truef = |n: i64| if n < 200 { f0 + r * n } else { f0 + r * 199 };
+        let peak_phase = |slope_max: i64| -> i64 {
+            let cfg = DisciplinedClockConfig {
+                slope_max_mppb: slope_max, // 0 = slope 凍結 = 真の単一 EMA ベースライン
+                ..DisciplinedClockConfig::DEFAULT
+            };
+            let mut c = DisciplinedClock::with_config(cfg);
+            let (mut phase_ns, mut peak) = (0i64, 0i64);
+            for n in 0..400i64 {
+                c.update_freq(1_000_000_000 + truef(n) / 1000);
+                let avg_true = (truef(n) + truef(n + 1)) / 2;
+                phase_ns += (c.predicted_freq_mppb() - avg_true) / 1000;
+                if phase_ns.abs() > peak.abs() {
+                    peak = phase_ns;
+                }
+            }
+            peak.abs()
+        };
+        let ema = peak_phase(0);
+        let ab = peak_phase(DisciplinedClockConfig::DEFAULT.slope_max_mppb);
+        // 単一 EMA は ~12µs、α-β は ~1.3µs。少なくとも 5 倍の改善を回帰として固定。
+        assert!(ema > 8_000, "single-EMA ramp phase should be large, got {ema}ns");
+        assert!(
+            ab * 5 < ema,
+            "α-β should cut ramp phase error >5x: ema={ema}ns ab={ab}ns"
+        );
+    }
+
+    #[test]
+    fn slope_freezes_on_large_residual_shock() {
+        // 緩いランプ (dev = 3000 + 2n ns = +2 ppb/sample) で slope を立ててロック。
+        let mut c = DisciplinedClock::new();
+        for n in 0..40i64 {
+            c.update_freq(1_000_000_000 + 3000 + 2 * n);
+        }
+        let slope = c.freq_slope_mppb();
+        assert!(slope != 0, "ramp should establish a nonzero slope");
+        // 残差 ~3µs のサンプル (ショック相当)。±5µs ゲートは通る (level 更新) が、slope_freeze_resid(2µs)
+        // を超えるので slope は凍結される (spike も stale FF も防ぐ)。
+        let level_ppb = c.freq_ppb();
+        c.update_freq(1_000_000_000 + level_ppb + 3000);
+        assert_eq!(
+            c.freq_slope_mppb(),
+            slope,
+            "slope must freeze on a large (shock) residual"
+        );
+    }
+
+    #[test]
+    fn quarantine_freezes_slope() {
+        // 復帰直後の検疫中は level だけでなく slope 更新も止める(復帰直後の怪しい PPS で傾きを学習しない)。
+        let mut c = DisciplinedClock::new();
+        // ランプ (dev = 3000 + 2n ns) で slope を立ててロックさせる。
+        for n in 0..40i64 {
+            c.update_freq(1_000_000_000 + 3000 + 2 * n);
+        }
+        let slope_before = c.freq_slope_mppb();
+        c.start_quarantine();
+        for _ in 0..c.config().quarantine_samples {
+            assert_eq!(c.update_freq(1_000_010_000), FreqUpdate::Quarantined);
+        }
+        assert_eq!(c.freq_slope_mppb(), slope_before, "slope must not move in quarantine");
+    }
+
+    #[test]
+    fn slope_is_zero_for_constant_offset_so_pred_equals_level() {
+        // 定数オフセットでは傾き 0 → 予測 = level = freq_mppb (単一 EMA と等価)。
+        let mut c = DisciplinedClock::new();
+        for _ in 0..60 {
+            c.update_freq(1_000_002_500); // +2500 ppb 一定
+        }
+        assert_eq!(c.freq_ppb(), 2500);
+        assert_eq!(c.freq_slope_mppb(), 0);
+        assert_eq!(c.predicted_freq_mppb(), c.freq_mppb());
+    }
+
+    #[test]
+    fn single_outlier_does_not_move_slope() {
+        // 単発の外れ値は残差ゲートで弾かれ、傾き推定を汚さない (微分器化の防止)。
+        let mut c = DisciplinedClock::new();
+        for _ in 0..20 {
+            c.update_freq(1_000_002_500); // lock, slope=0
+        }
+        let slope_before = c.freq_slope_mppb();
+        c.update_freq(1_000_000_000 + 2500 + 10_000); // +10µs マルチパススパイク → gate
+        assert_eq!(c.freq_slope_mppb(), slope_before);
     }
 
     #[test]
