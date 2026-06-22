@@ -1,0 +1,78 @@
+{
+  "skill_name": "oscilloscope-timing",
+  "evals": [
+    {
+      "id": 0,
+      "name": "script-gen-2ch-phase",
+      "prompt": "Rigol のオシロを LAN 経由で使って、CH1 を基準に CH2 との 1PPS 立ち上がりの位相差を測る Python スクリプトを書いて。スコープの IP は環境変数で渡したい。実行例も教えて。",
+      "expected_output": "RIGOL_HOST env から host を取り(IP 直書きしない)、CH1 でトリガ→単発取込→両ch波形を吸い出し→立ち上がり交差点の差を N shot 取って mean/sigma を出すスクリプト。XINCrement で ns/sample 換算。内蔵 delay 測定に頼らない。",
+      "files": [],
+      "expectations": [
+        "host from env var, no hardcoded IP literal",
+        "edge-trigger on the reference channel + single-shot acquisition per shot",
+        "computes offset by dumping both channel waveforms + finding crossings (NOT the built-in delay/RDELay, which fails on a wide ~100ms 1PPS pulse showing one edge)",
+        "takes N shots and reports a distribution (mean/sigma), not a single value",
+        "uses :WAVeform:XINCrement (sample->time) for resolution"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "single-shot-judgment",
+      "prompt": "オシロで2つの1PPSのずれを1回測ったら2.1µsだった。これがこの出力の本当のオフセット?",
+      "expected_output": "単発スナップショットでは判断できない(ドリフトする量なので1点はランダムな draw)。密な多shot+統計(mean/sigma)で見るべき、と説明。固定スキュー(プローブ/ケーブル)の可能性にも触れる。2.1µs を鵜呑みにしない。",
+      "files": [],
+      "expectations": [
+        "does not accept the single 2.1us reading as the true offset",
+        "recommends dense multi-shot + statistics (mean/sigma), ideally a time series",
+        "flags fixed skew (probe/cable/channel) or systematic error as a separate caveat"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "fixed-offset-probe-skew",
+      "prompt": "オシロでCH1とCH2の立ち上がりの時間差を測ったら、毎回ほぼ一定で40nsくらいずれてる。2つの信号は同じ基板上で配線は1cmもない。この40nsは何?",
+      "expected_output": "1cm 配線の伝搬遅延は sub-ns なので物理経路ではない。プローブ減衰差(×1/×10)による伝搬遅延差+チャネルスキューが固定オフセットとして出ている可能性が高い。両プローブを同一点に当てて skew を実測する/プローブを揃える、と提案。",
+      "files": [],
+      "expectations": [
+        "argues 40ns cannot be physical for a ~1cm trace (sub-ns / ps-scale propagation)",
+        "identifies probe/channel skew (e.g. x1/x10 attenuation delay difference) as the likely cause",
+        "prescribes measuring/removing the skew (same-point probing, deskew, matched probes)"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "builtin-delay-wide-pulse",
+      "prompt": "Rigol DHO800 で、GPS 受信機の 1PPS(立ち上がりを基準に使う。パルス幅は約100ms)と、RP2040 が出すもう一つの 1PPS の、立ち上がりの時間差を測りたい。スコープの内蔵遅延測定(:MEASure の delay / RDELay 系)で2つの立ち上がりの差を読めばいい?他に注意点があれば。",
+      "expected_output": "内蔵 delay/RDELay は不可: 100ms 幅のパルスは µs 窓に立ち上がりが1本しか映らず、内蔵のエッジペアリングが対にできない。両ch波形を吸い出して立ち上がり交差点を自分で求める。加えて単発でなく密多shot(ドリフトする量)、XINCrement で換算。",
+      "files": [],
+      "expectations": [
+        "built-in delay/RDELay measurement is rejected for this case (a ~100ms pulse shows only one edge in a us window, nothing to pair)",
+        "recommends dumping both channel waveforms and finding the rising crossing yourself",
+        "mentions taking multiple shots / a distribution (the offset drifts), not one reading"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "no-trigger-probe-setting",
+      "prompt": "Rigol DHO800 で 3.3V の 1PPS を ×10 パッシブプローブで CH1 に入れて、エッジトリガを立ち上がり・レベル 1.65V で張ったのに、:SINGle しても STOP にならない(トリガしない)。原因と直し方は?",
+      "expected_output": "チャネルの :CHANnel1:PROBe がおそらく ×1 のままで、scope が減衰を戻さず 3.3V を 0.33V と表示し、1.65V を跨がない → トリガしない。:CHANnel1:PROBe 10 に合わせる。トリガレベルは画面に出る電圧で決める。",
+      "files": [],
+      "expectations": [
+        "identifies the channel :CHANnel:PROBe attenuation setting (likely still x1) as the cause: a 3.3V signal shows as 0.33V so the 1.65V level is never crossed",
+        "fix: set :CHANnel1:PROBe to match the physical x10 probe (and/or set the trigger level to the on-screen voltage)"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "deskew-physical-offset",
+      "prompt": "Rigol で CH1 と CH2 のエッジ時間差を測ると毎回ほぼ一定の差が出る。これを「プローブやケーブルのスキュー」と「信号本来の物理オフセット」に分けて、物理オフセットだけ出したい。具体的な手順は?",
+      "expected_output": "固定スキューを直接測る: 両プローブを同一点に当てて差を測る(理想0、出た値がスキュー)、または scope の deskew(:CHANnel:TCAL 等)で打ち消す。その後 本来の2点で測れば残りが物理オフセット。プローブ減衰/ケーブルを揃える。mean=物理+スキュー。",
+      "files": [],
+      "expectations": [
+        "measures the fixed skew by probing BOTH channels at the SAME point (ideal 0; the reading is the skew) and/or uses the scope deskew (e.g. :CHANnel:TCAL)",
+        "after nulling/subtracting the skew, the remaining offset at the two real points is the physical one (mean = physical + skew)",
+        "matches probe attenuation / cable so the skew is minimized / repeatable"
+      ]
+    }
+  ]
+}
