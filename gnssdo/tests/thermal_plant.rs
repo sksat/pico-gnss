@@ -178,6 +178,73 @@ proptest! {
     }
 }
 
+/// PLL 積分ゲイン (calm 側 i_den) の掃引: 温度 curvature (slope が反転する過渡) 下で閉ループ位相の sd/peak が
+/// i_den でどう動くかを見る。実機で「offset② の瞬時 wander が温度ランプで増大、ループは発振せず低速 wander
+/// (autocorr~0.97)」と診断 → ゲイン headroom 仮説の host 検証。**特定 HW 値ではなく一般物理レンジ** (±2.5 ppb/s
+/// を 30s 毎に反転) を使い、再較正イベントを含む実ログ replay (corr 崩壊) を避けて閉ループで清潔に比較する。
+/// `cargo test -p gnssdo --test thermal_plant -- --ignored i_den_sweep --nocapture`
+///
+/// **注意 (モデルの限界, 実機で確認)**: このモデルは i_den を下げるほど位相 sd が単調に下がり autocorr も発振
+/// しないと予測する (例 32→20 で 114→72ns) が、**実機ではロック保持が悪化して却下された** (同一温度 rate で
+/// lk 83%→48%)。モデルにはロック判定窓・GNSS 異常値・周期量子化が無いので、高ゲインがランプ中にオーバー
+/// シュートして unlock する不安定を過小評価する。このテストは「ゲインを下げる方向の感度」を見る道具であって、
+/// **採用可否の判定には使えない (実機のロック保持が真の判定者)**。
+#[test]
+#[ignore = "PLL calm i_den sweep under thermal curvature; run manually with --nocapture"]
+fn i_den_sweep_under_thermal_curvature() {
+    let ramps = [2500i64, 2500, -2500, -2500, 2500, 2500, -2500, -2500];
+    let prof = build_profile(5_000_000, &ramps, 30, 25);
+    let n_total = prof.f.len();
+    for iden in [32i64, 24, 20, 16, 12] {
+        // デプロイ同等の adaptive 構成 (calm=iden, |pred|>calm_ns で iden<<2 へ鈍化)。
+        let pll_cfg = PhaseLockLoopConfig {
+            i_den: iden,
+            calm_ns: 1_000,
+            i_den_disturbed_shift: 2,
+            ..PhaseLockLoopConfig::DEFAULT
+        };
+        let mut clock = DisciplinedClock::with_config(DisciplinedClockConfig::DEFAULT);
+        let mut pll = PhaseLockLoop::with_config(pll_cfg);
+        let mut phase_ns: i64 = 0;
+        let mut samples: Vec<i64> = Vec::new();
+        for n in 0..n_total {
+            let true_f = prof.f[n];
+            let interval_ns = 1_000_000_000 + true_f / 1000 + jitter(n, 16);
+            clock.update_freq(interval_ns);
+            let measured = phase_ns + jitter(n + 7, 16);
+            let u = pll.update(measured, true);
+            let commanded = clock.predicted_freq_mppb() + u.freq_trim_mppb;
+            let true_avg = if n + 1 < n_total {
+                (true_f + prof.f[n + 1]) / 2
+            } else {
+                true_f
+            };
+            phase_ns += (commanded - true_avg) / 1000 - u.phase_corr_ns;
+            if n >= 25 {
+                samples.push(phase_ns);
+            }
+        }
+        let mean = samples.iter().sum::<i64>() as f64 / samples.len() as f64;
+        let sd = (samples.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>()
+            / samples.len() as f64)
+            .sqrt();
+        // 低速 wander の符号反転 (リンギング) 検出: 1-lag 自己相関。0.99 へ寄れば過減衰、負なら発振気味。
+        let (mut num, mut den) = (0f64, 0f64);
+        for w in samples.windows(2) {
+            num += (w[0] as f64 - mean) * (w[1] as f64 - mean);
+        }
+        for &x in &samples {
+            den += (x as f64 - mean).powi(2);
+        }
+        let ac1 = if den > 0.0 { num / den } else { 0.0 };
+        let peak = samples.iter().map(|&x| x.abs()).max().unwrap_or(0);
+        eprintln!(
+            "IDEN_SWEEP iden={iden:3} phase_sd={sd:5.0}ns peak={peak:5}ns autocorr1={ac1:+.3} locked_end={}",
+            pll.is_locked()
+        );
+    }
+}
+
 // --- モデル検証 (常時は走らせない。`cargo test -p gnssdo --test thermal_plant -- --ignored`) ---
 // プラント+単一EMA モデルが、この基板の実機観測を桁で再現するかを確認する。観測値は HW 固有なので
 // 一般性質の proptest とは分離し #[ignore] にする (モデルの妥当性が取れて初めて proptest の結論を信じられる)。

@@ -67,10 +67,21 @@ static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<PpsGpsdo>> =
 /// 位相制御の測定源。true=PIO ハード位相 (stage②, 本番)。false=旧 Instant 測定 (比較計測用)。
 const PHASE_USE_HW: bool = true;
 // 位相ループの gains は gnssdo の PhaseLockLoopConfig::DEFAULT に移動した (σ≈35ns 実測チューニング)。
-/// 位相ループ積分の分母。**適応ゲイン**: 落ち着き時 (|pred| < CALM_NS) は I_DEN_CALM=32 で緩い温度ドリフトを
-/// 締めて追従、外乱時 (ドライヤー級ショック) は I_DEN_CALM<<DISTURBED_SHIFT=128 へ鈍化して windup/overshoot/
-/// lock喪失を回避。実機検証: 固定32 は steady ns で良いがショックで ~7.6µs+lock喪失、固定16 はさらに messy。
-/// 適応で「緩い=32 / ショック=128」の両取りを狙う (ショックの恩恵は実機が判定者、モデルは高ゲイン不信)。
+/// 位相ループ積分の分母。**適応ゲイン**: 落ち着き時 (|pred| < CALM_NS) は I_DEN_CALM で緩い温度ドリフトを
+/// 締めて追従、外乱時 (ドライヤー級ショック) は I_DEN_CALM<<DISTURBED_SHIFT へ鈍化して windup/overshoot/
+/// lock喪失を回避。calm と disturbed を decouple できる。
+///
+/// 実機チューニング: 固定32 は steady ns で良いがショックで ~7.6µs+lock喪失、固定16 はさらに messy。適応で
+/// 「緩い=32 / ショック=128」の両取りを狙う (ショックの恩恵は実機が判定者、モデルは高ゲイン不信)。
+///
+/// 温度ランプ下の offset② 瞬時 wander を下げようと calm を 32→20 に締める案を試したが **HW で却下**: host
+/// 閉ループ sweep (thermal curvature) は i_den=32→20 で位相 sd 114→72ns・発振なしを予測し、実機 calm でも
+/// hwphase は ±50-80ns に締まった。しかし同一 |dppb/dt| で揃えると **ロック保持が悪化** (ランプ 0.5-1ppb/s で
+/// lk 83%→48%)。高い積分ゲインがランプ中にオーバーシュートして unlock 窓を超えるため。GPSDO はロック保持が
+/// 最優先なので 32 を維持する。sim の予測した headroom は実機のロック判定/外乱性質で実現しなかった
+/// (host モデルはロック窓を持たないので高ゲインの不安定を過小評価する。gnssdo/tests/thermal_plant.rs の
+/// i_den_sweep_under_thermal_curvature 参照)。残る温度 wander は環境 (連続 ±250ppb 振動) 律速で、firmware
+/// ゲインでは安全に削れない。
 const I_DEN_CALM: i64 = 32;
 const CALM_NS: i64 = 1_000;
 const DISTURBED_SHIFT: u32 = 2; // 32 << 2 = 128
