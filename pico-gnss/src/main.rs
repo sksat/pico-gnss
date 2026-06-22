@@ -46,7 +46,7 @@ use embedded_io_async::Read;
 use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
-use gnssdo::{LoopMode, PhaseLockLoop, PpsEvent, snap_to_second_ns};
+use gnssdo::{LoopMode, PhaseLockLoop, PhaseLockLoopConfig, PpsEvent, snap_to_second_ns};
 use rp_pps::embassy::{SteeredPpsOutput, TimedPpsCapture};
 use rp_pps::{NmeaLineAssembler, PpsGpsdo, PpsSteer};
 
@@ -67,6 +67,13 @@ static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<PpsGpsdo>> =
 /// 位相制御の測定源。true=PIO ハード位相 (stage②, 本番)。false=旧 Instant 測定 (比較計測用)。
 const PHASE_USE_HW: bool = true;
 // 位相ループの gains は gnssdo の PhaseLockLoopConfig::DEFAULT に移動した (σ≈35ns 実測チューニング)。
+/// 位相ループ積分の分母。**適応ゲイン**: 落ち着き時 (|pred| < CALM_NS) は I_DEN_CALM=32 で緩い温度ドリフトを
+/// 締めて追従、外乱時 (ドライヤー級ショック) は I_DEN_CALM<<DISTURBED_SHIFT=128 へ鈍化して windup/overshoot/
+/// lock喪失を回避。実機検証: 固定32 は steady ns で良いがショックで ~7.6µs+lock喪失、固定16 はさらに messy。
+/// 適応で「緩い=32 / ショック=128」の両取りを狙う (ショックの恩恵は実機が判定者、モデルは高ゲイン不信)。
+const I_DEN_CALM: i64 = 32;
+const CALM_NS: i64 = 1_000;
+const DISTURBED_SHIFT: u32 = 2; // 32 << 2 = 128
 /// 制御項の実験モード: true で **P→PI→PID を ~120 エッジ毎に巡回**し各項の効果を観察 (cfg を PPSGEN に出力)。
 /// false で本番 = 常時 PID。
 const PHASE_EXPERIMENT: bool = false;
@@ -187,7 +194,12 @@ async fn gen_capture_task(
     let mut last_gen: u32 = 0;
     // 出力位相 PLL (制御=gnssdo)。sub-cycle period 生成 (dither) + period word push は
     // SteeredPpsOutput (rp-pps) が内包するので、ここは freq_mppb と phase_corr を渡すだけ。
-    let mut pll = PhaseLockLoop::new();
+    let mut pll = PhaseLockLoop::with_config(PhaseLockLoopConfig {
+        i_den: I_DEN_CALM,
+        calm_ns: CALM_NS,
+        i_den_disturbed_shift: DISTURBED_SHIFT,
+        ..PhaseLockLoopConfig::DEFAULT
+    });
     loop {
         let x0 = sm.rx().wait_pull().await; // 出力エッジの生カウンタ (C2_out)。wait_pull は FIFO 最古を返す。
         // backlog があれば最新エッジまで drain する (K 較正の drain と同じ対策)。ループが holdover 復帰等で
@@ -225,11 +237,19 @@ async fn gen_capture_task(
         // Instant を介さないので executor のウェイクアップ遅延 (~ms) に汚されず 16ns 分解能。
         let c0 = C0_GPS.load(Ordering::Relaxed);
         let hwphase_ns = rp_pps::loopback_phase_ns(c0, x, k, clk);
+        // ペアリング診断: fold 前の生 tick 差。正しい隣接エッジ対なら小さい(=真の位相)、ミスペア(欠落/
+        // drain/再ロック後に非隣接エッジと対)だと ≈±1秒。fold がそれを隠し ppm×1s 残差にループがロック
+        // する (9.5µs バグ族)。|raw_lag| が ~10ms 超なら gross ミスペアとして invalid 化し、loop に渡さない。
+        // hwphase=0 ⟺ GP3=GPS を loopback 自身で(scope に頼らず)保つ。raw_lag はログして機構を観測。
+        let raw_lag = rp_pps::loopback_raw_lag_ticks(c0, x, k);
+        let max_lag = (clk / 200) as i32; // capture tick ≈ clk/2 なので clk/200 ≈ 10ms
+        let paired = raw_lag.unsigned_abs() <= max_lag as u32;
         // 旧手法 (比較用 emit のみ): 出力エッジの UTC 時刻 (Instant 経由) → 秒境界からのズレ。
-        let (ppb, phase) = CLOCK.lock(|g| {
+        let (pred_mppb, slope_mppb, phase) = CLOCK.lock(|g| {
             let g = g.borrow();
             (
-                g.freq_ppb(),
+                g.predicted_freq_mppb(),
+                g.freq_slope_mppb(),
                 g.now_from_query_ns(now_local_ns()).map(snap_to_second_ns),
             )
         });
@@ -248,18 +268,25 @@ async fn gen_capture_task(
             CTRL_SEL // 本番=4(PID+Smith)。0-3 で単一構成に固定キャプチャ (compare 用の公平比較)
         };
         pll.set_mode(cfg_to_mode(cfg));
-        // valid = この位相サンプルが信用できるか (GPS 新鮮 + 間隔健全)。!valid は holdover ホールド。
-        let valid = fresh && sane && c0 != 0;
+        // valid = この位相サンプルが信用できるか (GPS 新鮮 + 間隔健全 + 隣接エッジ対)。!valid は holdover
+        // ホールド。paired=false (gross ミスペア) は fold が隠す ppm×1s 残差を避けるため捨てる。
+        if !paired {
+            warn!("PPSGEN mispair raw_lag={} ticks (>~10ms) -> drop", raw_lag);
+        }
+        let valid = fresh && sane && c0 != 0 && paired;
         let u = pll.update(ctrl, valid);
-        // 周波数 = 水晶推定(ppb) + PLL の I トリム(milli-ppb)。位相補正は dither が cycle に変換して引く。
-        let freq_mppb = ppb * 1000 + u.freq_trim_mppb;
+        // 周波数 = 水晶推定の 1 サンプル先予測 (mppb, ppb 丸めなし) + PLL の I トリム(milli-ppb)。
+        // 温度ランプ中、単一 EMA だと推定が遅れて出力位相が ramp 速度に比例してずれる (offset② のドリフト)。
+        // DisciplinedClock の α-β が傾きを先回りするので、出力周期にその予測周波数を入れて定常誤差を抑える。
+        // 位相補正は dither が cycle に変換して引く。
+        let freq_mppb = pred_mppb + u.freq_trim_mppb;
         let _ = output.set_next_period(freq_mppb, u.phase_corr_ns);
         if let Some(iv) = interval_ns {
             count += 1;
             // 制御信号を全部出力 → ホストでプラント同定 + ゲイン掃引シミュ + 項別比較ができる。
             // (互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残し、cfg/trim/p/d を追記)
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cfg={} p_ns={} d_ns={} trim_mppb={} lk={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cfg={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
@@ -270,6 +297,8 @@ async fn gen_capture_task(
                 u.p_corr_ns,
                 u.d_corr_ns,
                 u.freq_trim_mppb,
+                slope_mppb,
+                raw_lag,
                 u.locked as u8
             );
         }
