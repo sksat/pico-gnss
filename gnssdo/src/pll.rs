@@ -186,6 +186,15 @@ impl PhaseLockLoop {
         self.config.mode = mode;
     }
 
+    /// Set the integral denominator at runtime, preserving the integrated trim and lock state.
+    /// Larger `i_den` = slower integration = lower loop bandwidth = longer natural period
+    /// (≈ 2π√`i_den` edges). Used by the firmware's experiment harness to sweep `i_den` under
+    /// matched conditions (the closed-loop output-phase wander is the underdamped type-II mode at
+    /// that natural period, so sweeping `i_den` moves the mode without re-locking the loop).
+    pub fn set_i_den(&mut self, i_den: i64) {
+        self.config.i_den = i_den;
+    }
+
     /// Whether the loop is currently locked.
     pub fn is_locked(&self) -> bool {
         self.lock_cnt >= self.config.lock_hold
@@ -441,5 +450,69 @@ mod tests {
             p.update(4_000, true);
         }
         assert!(p.freq_trim_mppb().abs() <= p.config().trim_max_mppb);
+    }
+
+    #[test]
+    fn set_i_den_changes_integration_rate_live() {
+        // set_i_den retunes the integral denominator in place (firmware experiment harness sweeps it).
+        // Use a Pi loop (pred=ctrl, no Smith/D) so the trim increment is exactly -pred*1000/i_den.
+        let cfg = PhaseLockLoopConfig {
+            mode: LoopMode::Pi,
+            ..PhaseLockLoopConfig::DEFAULT
+        };
+        let mut p = PhaseLockLoop::with_config(cfg);
+        assert_eq!(p.config().i_den, 128);
+        assert_eq!(p.update(2_000, true).freq_trim_mppb, -2_000 * 1000 / 128);
+        // Loosen: the next in-band edge integrates at the new (slower) rate, trim preserved.
+        p.set_i_den(512);
+        assert_eq!(p.config().i_den, 512);
+        let before = p.freq_trim_mppb();
+        let u = p.update(2_000, true);
+        assert_eq!(u.freq_trim_mppb, before - 2_000 * 1000 / 512);
+    }
+
+    #[test]
+    fn stronger_d_destabilizes_the_underdamped_mode_not_the_reverse() {
+        // The disciplined output's slow phase wander is this loop's underdamped type-II mode. The
+        // continuous-time intuition "add D (or raise P) to damp it" is INVERTED here: with the Smith
+        // one-edge delay and integer truncation, a closed-loop step response rings HARDER with
+        // stronger D. This was confirmed on hardware (the wander is reception-limited; tightening the
+        // loop does not help and can destabilize). Guard it so a future "damping fix" can't silently
+        // re-introduce the instability. (kp_inv is fixed at 8 for Smith; d_den is the available knob.)
+        fn step_ringdown(d_den: i64) -> (i64, usize) {
+            let mut pll = PhaseLockLoop::with_config(PhaseLockLoopConfig {
+                d_den,
+                ..PhaseLockLoopConfig::DEFAULT // production: PidSmith, i_den=128, d_den=4
+            });
+            for _ in 0..40 {
+                pll.update(0, true); // settle + lock at zero phase
+            }
+            let mut p: i64 = 2_000; // apply a 2 µs phase step
+            let (mut peak, mut prev, mut zc) = (0i64, p, 0usize);
+            for _ in 0..500 {
+                let u = pll.update(p, true);
+                p += u.freq_trim_mppb / 1000 - u.phase_corr_ns; // closed-loop plant
+                peak = peak.max(p.abs());
+                if (prev > 0) != (p > 0) {
+                    zc += 1; // count zero-crossings (oscillation)
+                }
+                prev = p;
+            }
+            (peak, zc)
+        }
+        let (peak_prod, _zc_prod) = step_ringdown(4); // production
+        let (peak_mid, _) = step_ringdown(2); // stiffer D
+        let (peak_stiff, _) = step_ringdown(1); // much stiffer D
+        // Production settles to a bounded ring-down (does not blow past a small multiple of the step).
+        assert!(
+            peak_prod <= 4_000,
+            "production (d_den=4) step peak {peak_prod}ns should stay bounded"
+        );
+        // Stiffening D rings monotonically HARDER, not softer — the inversion. A future dev must not
+        // "fix" the wander by lowering d_den.
+        assert!(
+            peak_stiff > peak_mid && peak_mid > peak_prod,
+            "stiffer D should ring harder (inverted): d1={peak_stiff} d2={peak_mid} d4={peak_prod}"
+        );
     }
 }
