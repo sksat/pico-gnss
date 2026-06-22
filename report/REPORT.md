@@ -238,6 +238,16 @@ GP3 も GPS PPS も立ち上がりが十分速く、しきい値を変えても�
 実測では clean な boot で ~52〜95ns、static-nav フリーズを切る `PMTK386,0`（後述）を入れた長時間 boot では ~1.3µs まで上がった（K はほぼ同じ値だった）。
 一方で σ（ジッタ）は独立で、offset が 1.3µs の瞬間でも短期 σ は ~10ns だった。
 σ（ジッタ）は受信由来、絶対 offset の基準値は K 較正と受信機設定と経過由来、と切り分けられる。
+
+絶対 offset は温度でも長期ドリフトする。
+fresh boot から ~4.5 時間、holdover を跨ぎながら長期監視すると、scope の GP3↔GPS offset は 208ns から 1377ns へ単調に上昇し、水晶の ppb（温度プロキシ、~2830→3300）と ~2.34 ns/ppb で連動した（[plot_offset_drift.py](plot_offset_drift.py)、[good_watch.py](good_watch.py) で良受信時に自動測定）。
+同時刻の hwphase（制御量、loopback）は ±50ns に張り付き、ドリフトは hwphase には現れない。
+つまり制御の劣化ではなく、ループが握っていない絶対 offset（loopback-相対だけを駆動している）が温度で漂うもので、σ（ジッタ）は健全なまま。
+K の定期再較正では直らない（K は両捕捉 SM のカウンタ間の定数オフセットで、同一クロックの lockstep ゆえ再較正しても同値）。絶対 offset を握るには外部基準（qErr/ケーブル遅延を持つ timing 受信機）が要る。
+
+![絶対 offset の温度ドリフト](offset-drift.png)
+
+*長期監視: GP3↔GPS の絶対 offset（赤）が ppb（青、温度プロキシ）と ~2.34 ns/ppb で連動し、~4.5h で ~1.4µs ドリフトする。同時の hwphase（制御量）は ±50ns で健全。絶対 offset はループ制御外で、温度が共通の駆動源。*
 ここで言う ~90ns はあくまで良条件での一例で、再現性のある固定値ではない。
 
 ![σ は良いが絶対 offset が大きい例](scope-offset-1us.png)
