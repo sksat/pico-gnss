@@ -109,6 +109,20 @@ impl PpsGpsdo {
         self.clock.freq_ppb()
     }
 
+    /// Crystal frequency (milli-ppb) projected one sample ahead — the value to feed the **output
+    /// period**. Full mppb resolution (no ppb rounding) and slope-projected, so a temperature-driven
+    /// frequency ramp does not leave a standing output-phase error (see
+    /// [`DisciplinedClock::predicted_freq_mppb`](gnssdo::DisciplinedClock::predicted_freq_mppb)).
+    pub fn predicted_freq_mppb(&self) -> i64 {
+        self.clock.clock().predicted_freq_mppb()
+    }
+
+    /// Tracked frequency slope (milli-ppb per sample): how fast the crystal offset is drifting (a
+    /// temperature-ramp proxy). 0 in steady state. For logging.
+    pub fn freq_slope_mppb(&self) -> i64 {
+        self.clock.clock().freq_slope_mppb()
+    }
+
     /// Nanoseconds since the last established epoch (holdover span at `query_ns`).
     pub fn holdover_ns(&self, query_ns: u64) -> u64 {
         self.clock.holdover_ns(query_ns)

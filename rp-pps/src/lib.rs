@@ -253,6 +253,20 @@ pub fn loopback_phase_ticks(
     }
 }
 
+/// Raw (un-folded) loopback tick difference `reference − output − offset`, as a signed count. For an
+/// **adjacent-edge** pairing (the reference and output captures are from the same second) this is the
+/// small true phase; a **mis-pairing** (captures from non-adjacent edges, e.g. after a PPS
+/// dropout/drain/relock) makes it ≈ ±`ticks_per_second`. [`loopback_phase_ticks`] folds mod the
+/// nominal second, which *hides* such a slip and leaves a ppm×1s residual the servo then locks to
+/// (the historic "stale pairing" failure family). Gate the measurement on `|raw| <= max_lag_ticks`
+/// (a few ms ≫ any real phase, ≪ 1 s) so only correctly-paired edges drive the loop, keeping
+/// `phase == 0 ⟺ aligned`.
+pub fn loopback_raw_lag_ticks(reference_capture: u32, output_capture: u32, offset_ticks: u32) -> i32 {
+    reference_capture
+        .wrapping_sub(output_capture)
+        .wrapping_sub(offset_ticks) as i32
+}
+
 /// Phase, in nanoseconds, of an output 1PPS edge relative to the reference edge:
 /// [`loopback_phase_ticks`] converted to ns (multiply-before-divide, exact at 125 MHz where one
 /// tick is 16 ns). Feed this to a phase servo (e.g. `gnssdo`'s `PhaseLockLoop`).
@@ -531,6 +545,22 @@ mod tests {
         // output ahead of reference → negative.
         assert_eq!(loopback_phase_ticks(0, 100, 0, 62_500_000), -100);
         assert_eq!(loopback_phase_ns(0, 100, 0, 125_000_000), -1600);
+    }
+
+    #[test]
+    fn raw_lag_small_for_adjacent_edge_large_for_mispairing() {
+        let tps = 62_500_000u32; // 1 s of capture ticks at 125 MHz (÷2)
+        let k = 1000u32;
+        let gps = 5_000_000u32;
+        // adjacent pairing: output ~94 ticks (≈1.5µs) after the reference → raw lag is the small phase.
+        let out = gps.wrapping_sub(k).wrapping_sub(94);
+        assert_eq!(loopback_raw_lag_ticks(gps, out, k), 94);
+        // mis-pairing by one second (output captured a second later) → raw lag ≈ +1 s, which the
+        // fold would otherwise hide. Gating |raw| <= a few-ms threshold rejects it.
+        let out_next = out.wrapping_sub(tps);
+        assert_eq!(loopback_raw_lag_ticks(gps, out_next, k), 94 + tps as i32);
+        assert!(loopback_raw_lag_ticks(gps, out_next, k).unsigned_abs() > tps / 100);
+        assert!(loopback_raw_lag_ticks(gps, out, k).unsigned_abs() <= tps / 100);
     }
 
     #[test]
