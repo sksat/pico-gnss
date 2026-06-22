@@ -27,6 +27,13 @@ pub fn correct_phase_ns(raw_phase_ns: i64, qerr_ps: i32) -> i64 {
     raw_phase_ns - ps_to_ns_round(qerr_ps as i64)
 }
 
+/// 連続 PPS エッジ間隔 (ns) を、前回と今回の qErr (ps) で補正する純粋関数。状態を持たない building block。
+/// 両エッジが「補正後 = 測定 − qErr」を受けるので、間隔からは qErr の差 `now − prev` を引く。
+/// 差は ps で取ってから ns へ丸める (各 qErr を先に丸めるより精度が良い)。i32 差を i64 で取り overflow を避ける。
+pub fn correct_interval_ns(raw_interval_ns: i64, qerr_prev_ps: i32, qerr_now_ps: i32) -> i64 {
+    raw_interval_ns - ps_to_ns_round(qerr_now_ps as i64 - qerr_prev_ps as i64)
+}
+
 /// 連続 PPS エッジ間隔 (ns) を qErr で補正する小さな状態 (直前エッジの qErr を保持する)。
 ///
 /// `correct_interval_ns` は生間隔から「今回 − 前回」の qErr 差 (ps→ns 丸め) を引く。最初のエッジは前回が
@@ -46,7 +53,7 @@ impl QErrCorrector {
     /// 最初のエッジ (前回 qErr 無し) は生間隔をそのまま返す。
     pub fn correct_interval_ns(&mut self, raw_interval_ns: i64, qerr_now_ps: i32) -> i64 {
         let corrected = match self.prev_qerr_ps {
-            Some(prev) => raw_interval_ns - ps_to_ns_round(qerr_now_ps as i64 - prev as i64),
+            Some(prev) => correct_interval_ns(raw_interval_ns, prev, qerr_now_ps),
             None => raw_interval_ns,
         };
         self.prev_qerr_ps = Some(qerr_now_ps);
@@ -114,6 +121,29 @@ mod tests {
             assert_eq!(corrected, 1_000_000_000, "sawtooth not removed at qerr={q}");
             prev = q;
         }
+    }
+
+    #[test]
+    fn pure_interval_matches_struct_and_handles_extremes() {
+        // 純粋関数は (raw, prev, now) から直接補正。struct と同じ結果。
+        assert_eq!(correct_interval_ns(1_000_000_000, 2_000, 7_000), 999_999_995);
+        assert_eq!(correct_interval_ns(1_000_000_000, 7_000, 2_000), 1_000_000_005);
+        assert_eq!(correct_interval_ns(1_000_000_000, 5_000, 5_000), 1_000_000_000);
+        // i32 の両極端の差 (~±4.29e9 ps = ±4.29ms) を i64 で取り overflow しない。
+        let big = correct_interval_ns(1_000_000_000, i32::MIN, i32::MAX);
+        assert_eq!(big, 1_000_000_000 - ps_to_ns_round(i32::MAX as i64 - i32::MIN as i64));
+        assert!(big < 1_000_000_000); // now>prev なので間隔は縮む
+    }
+
+    #[test]
+    fn rounding_boundaries() {
+        // 0 から離れる向きの四捨五入 (round-half-away-from-zero)。
+        assert_eq!(correct_phase_ns(0, 500), -1); //  500ps → 1ns
+        assert_eq!(correct_phase_ns(0, 499), 0); //  499ps → 0ns
+        assert_eq!(correct_phase_ns(0, -500), 1); // -500ps → -1ns → 引いて +1
+        assert_eq!(correct_phase_ns(0, -499), 0);
+        assert_eq!(correct_interval_ns(1_000_000_000, 0, 1_500), 999_999_998); // 1500ps → 2ns
+        assert_eq!(correct_interval_ns(1_000_000_000, 0, 2_500), 999_999_997); // 2500ps → 3ns
     }
 
     #[test]

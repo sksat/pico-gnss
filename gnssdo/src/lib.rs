@@ -33,4 +33,4 @@ pub use gpsdo::{
 };
 pub use pll::{LoopMode, PhaseLockLoop, PhaseLockLoopConfig, PhaseLockLoopUpdate};
 pub use pps::{NOMINAL_US, PpsEvent, PpsTracker, PpsTrackerConfig, TOLERANCE_US};
-pub use qerr::{QErrCorrector, correct_phase_ns};
+pub use qerr::{QErrCorrector, correct_interval_ns, correct_phase_ns};

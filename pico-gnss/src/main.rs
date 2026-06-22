@@ -97,6 +97,9 @@ const CTRL_SEL: u32 = 4;
 const RECAL_EDGES: u32 = 300;
 /// 再較正で取る (c0,c2) 同一エッジ対の数。先頭 1 個は GP4→GP2 切替トランジェントとして捨て、残りで K を測る。
 const RECAL_SAMPLES: u32 = 6;
+/// 再較正サンプルの旧 K 近傍ゲート (tick)。正しい同一エッジ対なら c0-c2 は旧 K から高々 ~数十 tick
+/// (5分のドリフトは ~6tick) なので、これを超える対は spurious エッジとのミスペア (~±1秒) として捨てる。
+const RECAL_SAMPLE_TICK_GATE: u32 = 64; // ≈1µs。実ドリフト ~19ns/min に対し十分広く、±1秒ミスペアは確実に弾く
 /// 再較正で測った新 K は段差で適用せず、1 エッジあたり最大このtick数だけ slew して寄せる。実効 K は連続的に
 /// 這うので補正も連続が自然。段差適用だと累積ドリフト(~6tick=96ns)を loop が急補正し D 項が跳ねて
 /// offset② が ~30s 暴れる (実機確認)。slew で ramp 化すると loop は滑らかに追従する。dk≈6 なら ~3 エッジで適用。
@@ -211,9 +214,10 @@ async fn time_task() {
 /// エッジで K=mean(c0-c2) を測り直して現在の相対関係に追従する。
 ///
 /// SM2 が出力 (GP4) を見ない間も SM1 は毎秒 1 周期語を消費し、空 FIFO だとパルスを落とす (出力プログラムは
-/// 前周期を保持しない)。そこで直近の周期語 `last_period` を holdover として**生 push** し続ける (dither は
-/// 通常制御経路でのみ進め、ここでは前進させない)。出力と GPS は規律済みでほぼ同時刻なので、僅かな reserve を
-/// 保てば starvation を避けられる。clean (spread≤2 tick・≥3 サンプル) かつ |Δk|≤cap のときだけ新 k を採用。
+/// 前周期を保持しない)。そこで GP2 エッジ待ちをブロッキングにせず ~100ms 毎にポーリングし、その都度 `last_period`
+/// を**生 push** して holdover を養う (dither は通常制御経路でのみ前進。満杯なら set_period は no-op)。GPS が
+/// 数秒遅れても補充が止まらないので starvation しない。clean (spread≤2 tick・≥3 サンプル・各サンプルは旧 K
+/// 近傍) かつ |Δk|≤cap のときだけ新 k を採用。
 async fn recal_k(
     sm: &mut StateMachine<'static, PIO0, 2>,
     output: &mut SteeredPpsOutput<'static, PIO0, 1>,
@@ -225,37 +229,48 @@ async fn recal_k(
     // SM2 を GP2 へ (jmp_pin だけ替わる同一 program。set_config は X を触らないので K の基準カウンタは不変)。
     sm.set_config(cfg_gp2);
     while sm.rx().try_pull().is_some() {} // 切替前後の stale/in-flight 捕捉を捨てる
-    // holdover バッファ: 直近周期語を生 push (dither 不前進)。通常ループが既に ~1 個 queue 済みとみなす。
-    let mut reserve: u32 = 1;
-    while reserve < 3 && output.output_mut().set_period(last_period) {
-        reserve += 1;
-    }
     let mut samples: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
     for i in 0..RECAL_SAMPLES {
         // 同一エッジ対の鍵: c2 を待つ「前」に gen_before を確定する。pps_task は C0_GPS store 後に C0_GEN を
         // Release++ するので、この順なら c2 と同じ GP2 エッジの publish を待てる (c2 後に待ち始めると既に
         // publish 済みのとき次秒へずれ、1 秒ミスペアが安定しうる)。
         let gen_before = C0_GEN.load(Ordering::Acquire);
-        let c2 = match with_timeout(Duration::from_secs(3), sm.rx().wait_pull()).await {
-            Ok(v) => v,
-            Err(_) => break, // GPS 欠落 → 中断 (旧 k 維持)
-        };
-        reserve = reserve.saturating_sub(1); // この ~1 秒で出力 1 パルス消費とみなす
-        while reserve < 2 && output.output_mut().set_period(last_period) {
-            reserve += 1;
+        // GP2 エッジを ~100ms 毎にポーリングしつつ毎回出力を生 push する。ブロッキング待ちだと GPS が遅れた
+        // 数秒のあいだ補充が止まり FIFO が枯れるので、待つ間も必ず養う (満杯なら set_period は no-op)。
+        let sample_deadline = Instant::now() + Duration::from_secs(3);
+        let mut c2: Option<u32> = None;
+        loop {
+            let _ = output.output_mut().set_period(last_period);
+            if let Some(v) = sm.rx().try_pull() {
+                c2 = Some(v);
+                break;
+            }
+            if Instant::now() >= sample_deadline {
+                break;
+            }
+            Timer::after(Duration::from_millis(100)).await;
         }
+        let Some(c2) = c2 else { break }; // GPS 欠落 → 中断 (旧 k 維持)
         // pps_task が同エッジを publish (gen 進行) するのを短時間待つ。進まなければこのサンプルは捨てる。
         let deadline = Instant::now() + Duration::from_millis(150);
         while C0_GEN.load(Ordering::Acquire) == gen_before && Instant::now() < deadline {
             embassy_futures::yield_now().await;
         }
-        if C0_GEN.load(Ordering::Acquire) != gen_before {
-            let c0 = C0_GPS.load(Ordering::Relaxed);
-            // 先頭 (i==0) は GP4→GP2 切替トランジェントとして捨てる。
-            if c0 != 0 && i > 0 {
-                let _ = samples.push((c0, c2));
-            }
+        if C0_GEN.load(Ordering::Acquire) == gen_before {
+            continue; // publish 無し → 捨てる
         }
+        let c0 = C0_GPS.load(Ordering::Relaxed);
+        // 先頭 (i==0) は GP4→GP2 切替トランジェントとして捨てる。
+        if c0 == 0 || i == 0 {
+            continue;
+        }
+        // サンプル毎の旧 K 近傍ゲート: 正しい対なら c0-c2 は旧 K から高々 ~数十 tick (5分のドリフトは ~6tick)。
+        // SM2 が spurious な GP2 エッジを拾って別エッジと対になると ~±1秒 (≫ gate) ずれるので棄却する。
+        let d = c0.wrapping_sub(c2) as i32;
+        if d.wrapping_sub(k as i32).unsigned_abs() > RECAL_SAMPLE_TICK_GATE {
+            continue;
+        }
+        let _ = samples.push((c0, c2));
     }
     // SM2 を GP4 へ戻す (X 保持)。drain して次の GP4 捕捉が新鮮な出力エッジになるように。
     sm.set_config(cfg_gp4);
@@ -450,6 +465,10 @@ async fn gen_capture_task(
                 last_x = None; // GP4 捕捉が再較正の gap を跨ぐので次の interval は無効化
                 last_gen = C0_GEN.load(Ordering::Acquire); // 復帰直後の偽 fresh ジャンプを避ける
             }
+        } else {
+            // cadence は「連続 locked」で数える。unlock したらリセットし、relock 直後に重い再較正
+            // (SM2 を ~数秒奪う) が走らないようにする。
+            edges_since_recal = 0;
         }
     }
 }
