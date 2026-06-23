@@ -5,3 +5,6 @@ __pycache__/
 # firmware RTT run logs + scope monitor outputs (large; contain NMEA coords / scope host) — never commit
 /logs/*
 !/logs/README.md
+
+# skill-creator eval workspaces (local records, not committed)
+.claude/skills/*-workspace/
