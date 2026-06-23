@@ -12,7 +12,9 @@
         "edge-trigger on the reference channel + single-shot acquisition per shot",
         "computes offset by dumping both channel waveforms + finding crossings (NOT the built-in delay/RDELay, which fails on a wide ~100ms 1PPS pulse showing one edge)",
         "takes N shots and reports a distribution (mean/sigma), not a single value",
-        "uses :WAVeform:XINCrement (sample->time) for resolution"
+        "uses :WAVeform:XINCrement (sample->time) for resolution",
+        "names :WAVeform:XINCrement in its OWN explanation (shows understanding of sample->time conversion, not only inheriting it from an imported helper)",
+        "addresses the per-run scope setup the bundled helper does NOT fix automatically for this signal: matching the channel probe ratio to the physical wiring (e.g. 1x direct tap vs 10x probe) AND using NORMal trigger sweep (not AUTO) for the 1Hz 1PPS"
       ]
     },
     {
@@ -59,7 +61,8 @@
       "files": [],
       "expectations": [
         "identifies the channel :CHANnel:PROBe attenuation setting (likely still x1) as the cause: a 3.3V signal shows as 0.33V so the 1.65V level is never crossed",
-        "fix: set :CHANnel1:PROBe to match the physical x10 probe (and/or set the trigger level to the on-screen voltage)"
+        "fix: set :CHANnel1:PROBe to match the physical x10 probe (and/or set the trigger level to the on-screen voltage)",
+        "correctly attributes the no-STOP to the probe-ratio / level scaling and does NOT misdiagnose it as 'no signal' / a dead channel / a broken scope (verifies via the on-screen voltage or :SINGle rather than assuming the signal is absent)"
       ]
     },
     {
