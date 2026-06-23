@@ -115,6 +115,26 @@ impl PhaseLockLoopConfig {
         calm_ns: 1_000,
         i_den_disturbed_shift: 0,
     };
+
+    /// The **naive PID** preset (P + I + D, *no* Smith predictor) — the textbook type-II loop from
+    /// the early report, kept selectable so the Smith predictor's contribution can be measured. The
+    /// missing predictor forces the gentler `kp_inv=16` (see [`LoopMode::kp_inv`]).
+    pub const NAIVE_PID: Self = Self {
+        mode: LoopMode::Pid,
+        ..Self::DEFAULT
+    };
+
+    /// Naive **PI** preset (no derivative, no Smith) — type-II without the D term.
+    pub const NAIVE_PI: Self = Self {
+        mode: LoopMode::Pi,
+        ..Self::DEFAULT
+    };
+
+    /// **Proportional-only** preset — the simplest servo (type-I, settles at a non-zero offset).
+    pub const P_ONLY: Self = Self {
+        mode: LoopMode::P,
+        ..Self::DEFAULT
+    };
 }
 
 impl Default for PhaseLockLoopConfig {
@@ -193,6 +213,13 @@ impl PhaseLockLoop {
     /// that natural period, so sweeping `i_den` moves the mode without re-locking the loop).
     pub fn set_i_den(&mut self, i_den: i64) {
         self.config.i_den = i_den;
+    }
+
+    /// Set the derivative denominator at runtime (experiment harness: sweep damping under matched
+    /// conditions). Larger `d_den` = weaker derivative. Critical damping of this Smith-delayed
+    /// integer loop needs a *joint* move (i_den up + d_den up together), so the harness sets both.
+    pub fn set_d_den(&mut self, d_den: i64) {
+        self.config.d_den = d_den;
     }
 
     /// Whether the loop is currently locked.
@@ -289,6 +316,46 @@ impl PhaseLockLoop {
             d_corr_ns: d_corr,
             predicted_phase_ns: pred,
         }
+    }
+}
+
+/// `PhaseLockLoop` as a pluggable [`PhaseController`](crate::PhaseController): `step` is a lossless
+/// view of the inherent [`update`](PhaseLockLoop::update) (guarded bit-for-bit by a test), so the
+/// firmware/tests keep the richer `update` while the comparison harness drives it through the trait.
+impl crate::PhaseController for PhaseLockLoop {
+    fn step(&mut self, input: crate::ControlInput) -> crate::ControlOutput {
+        let u = self.update(input.err_ns, input.valid);
+        crate::ControlOutput {
+            trim_mppb: u.freq_trim_mppb,
+            pcorr_ns: u.phase_corr_ns,
+            applied: u.applied,
+            locked: u.locked,
+            rejected: u.rejected_outlier,
+            dbg: crate::ControlDebug {
+                pred_ns: u.predicted_phase_ns,
+                p_ns: u.p_corr_ns,
+                d_ns: u.d_corr_ns,
+                // This loop's "residual frequency" estimate *is* its integrated trim.
+                observer_freq_mppb: u.freq_trim_mppb,
+                state: 0,
+            },
+        }
+    }
+
+    fn is_locked(&self) -> bool {
+        PhaseLockLoop::is_locked(self)
+    }
+
+    fn start_segment(&mut self, init: crate::ControlInit) {
+        // Fair cross-controller switch: blank every per-edge history (Smith/derivative + lock +
+        // outlier counters) and seed the residual trim so the output frequency stays continuous.
+        // Lock is blanked → the segment begins unlocked (warmup, excluded from comparison); the
+        // first post-switch correction is P-only (no spurious D kick off stale history).
+        self.lock_cnt = 0;
+        self.reject_cnt = 0;
+        self.last_pred = 0;
+        self.last_pd = 0;
+        self.trim_mppb = init.residual_trim_mppb;
     }
 }
 
@@ -469,6 +536,66 @@ mod tests {
         let before = p.freq_trim_mppb();
         let u = p.update(2_000, true);
         assert_eq!(u.freq_trim_mppb, before - 2_000 * 1000 / 512);
+    }
+
+    #[test]
+    fn trait_step_matches_inherent_update_bit_for_bit() {
+        use crate::{ControlInput, PhaseController};
+        // The trait `step` must be a lossless view of the inherent `update` — the firmware and the
+        // host comparison harness have to agree edge-for-edge, or a "method difference" could really
+        // be a trait-vs-inherent divergence. Drive an identical (err,valid) sequence through both and
+        // require the actuator outputs and telemetry match exactly. The sequence exercises reacq (big
+        // offset), lock, an outlier spike, and an invalid (holdover) edge.
+        let mut a = PhaseLockLoop::new();
+        let mut b = PhaseLockLoop::new();
+        let seq: &[(i64, bool)] = &[
+            (50_000, true),
+            (40_000, true),
+            (3_000, true),
+            (800, true),
+            (100, true),
+            (100, true),
+            (100, true),
+            (100, true),
+            (50_000, true),
+            (120, true),
+            (999_999, false),
+            (90, true),
+            (-300, true),
+            (2_000, true),
+            (0, true),
+        ];
+        for &(err, valid) in seq {
+            let u = a.update(err, valid);
+            let o = PhaseController::step(&mut b, ControlInput { err_ns: err, valid });
+            assert_eq!(o.trim_mppb, u.freq_trim_mppb);
+            assert_eq!(o.pcorr_ns, u.phase_corr_ns);
+            assert_eq!(o.applied, u.applied);
+            assert_eq!(o.locked, u.locked);
+            assert_eq!(o.rejected, u.rejected_outlier);
+            assert_eq!(o.dbg.pred_ns, u.predicted_phase_ns);
+            assert_eq!(o.dbg.p_ns, u.p_corr_ns);
+            assert_eq!(o.dbg.d_ns, u.d_corr_ns);
+        }
+        assert_eq!(PhaseController::is_locked(&b), a.is_locked());
+    }
+
+    #[test]
+    fn start_segment_blanks_history_and_seeds_residual_trim() {
+        use crate::{ControlInit, ControlInput, PhaseController};
+        let mut p = PhaseLockLoop::new();
+        // Lock and accumulate trim + Smith/D history.
+        run(&mut p, 100, 8);
+        assert!(p.is_locked());
+        // Switch into a fresh comparison segment with a seeded residual trim (output freq continuous).
+        PhaseController::start_segment(&mut p, ControlInit { residual_trim_mppb: 12_345 });
+        assert!(!PhaseController::is_locked(&p)); // lock blanked → warmup
+        assert_eq!(p.freq_trim_mppb(), 12_345); // residual trim seeded
+        // First post-switch edge: D needs lock (just blanked), so the correction is P-only — no kick
+        // off stale Smith/derivative history.
+        let o = PhaseController::step(&mut p, ControlInput { err_ns: 800, valid: true });
+        assert_eq!(o.dbg.d_ns, 0);
+        assert_eq!(o.dbg.p_ns, 800 / 8);
     }
 
     #[test]

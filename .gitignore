@@ -36,3 +36,6 @@ report/wander-pps-gain20-spectrum.png
 report/wander-pps-proven-spectrum.png
 report/wander-pps-slew-spectrum.png
 report/wander-review-spectrum.png
+
+# Claude Code workflow worktrees (transient; never commit)
+/.claude/worktrees/

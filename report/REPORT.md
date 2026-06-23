@@ -775,3 +775,100 @@ gating 試作は `experiment/reception-gating` ブランチに残す (未検証�
 | 支配源 | 受信機の position-time coupling (位置誤差→時刻解) による遅いドリフト |
 | firmware の手 | 無し (loop tuning は de-confound で null、減衰ノブは反転で発振、gating は検出不能+検証不能) |
 | 直す道 | 受信側: アンテナ空視野、固定位置 (survey-in) タイミング受信機 + qErr (コア実装済み) |
+
+## 改訂 (2026-06): 制御器の探索 — PRBS 自己同定と現代制御
+
+### 結論(先に)
+出力位相 wander の主成分は**受信律速**で、**計測トラップ**(hwphase=出力 vs 同じ受信機)により静定オフセットの UTC 改善は外部基準なしには検証できない。これは制御器の形に依らない。一方で **PRBS 自己同定**(出力位相に既知の擬似ランダム ±96ns を注入し hwphase との相互相関を LS で同定、受信交絡なし)により、**ループには制御可能な共振が確かに存在し、i_den=512 が 128 より better-damped**(共振ピーク |H| 12.6 vs 14.1、2 サイクル M=200 で再現)であることを受信非依存に実証した。ただし共振はループ応答の ~10% で、wander 全体への寄与は数%。
+
+### 復旧は P 律速(重要)
+relock 級の大誤差では I は `|ctrl|<i_enable_ns`(5µs)でしかゲートが開かず、`i_den` を下げても I は無効。初期復旧は P 律速で、P は反転ノブ(強めると不安定化)のため上げられない。`i_den` の効果は誤差が I-enable 内に入った後の type-II モード周期の変更に留まる。
+
+### 制御器比較(host ハーネス `report/ctrl_eval.py`)
+線形 PID+Smith(firmware 忠実)を i_den=128/256/512 で、加えて非線形・Kalman/LQG を、同一プラント(colored 受信雑音+step+drift)・同一指標(定常 RMS、再捕捉 edge、lock 復帰、step settling/overshoot/zerocross、drift RMS、共振ピーク)で比較。
+
+- 線形固定: config 差は小さい(定常 ~1%、再捕捉 29 vs 32 edge)。受信律速+P 律速をモデルでも再現。
+- **Kalman/LQG(2状態 phase+freq)の素朴版**(deadbeat 補正)は 1 edge で再捕捉するがロックせず毎 edge 振動=高ゲインがノイズを追って不安定。**「速い位相復旧には高い位相ゲインが要り、それはノイズ追従/不安定を招く」根本トレードオフは制御器の形に依らない**ことの実証。
+- **KalmanNL(Kalman の綺麗な推定 phi に非線形ゲイン: 大誤差で高・小誤差で低、調整後 gmin=0.18/phi0=700)**: 6 指標中 5 つで線形 128 を上回る(定常 −14%, 再捕捉 −35%, lock −30%, 振動 −38%, drift −15%)。残る step_settle のみ ~2x 劣化(緩い near-zero ゲインの代償)。flag 切替の危険が無い連続制御で、ユーザの「綺麗な推定に非線形ゲインを当てる」案の有効性を示す。
+
+### 正直な留保
+- host モデルは粗い(定常 ~16ns で実機 ~110ns、共振指標は PRBS と不一致)。**絶対値・改善幅はモデル依存**で、相対比較(特に復旧系の loop ダイナミクス)を信頼する。
+- 計測トラップにより、定常側の改善は実機 hwphase では UTC に対して検証不能。実証には外部基準(独立 2 台目受信機+別アンテナでの PPS 差、Rb 等)が要る。
+- 改善は modest(数%〜数十%)で、**受信律速の床は超えない**。数十ns 持続は受信側/外部基準の領域。
+
+### 揺り戻しの記録(方法論)
+本探索では「512 が静穏で勝つ(~74ns)」と楽観 → de-confound 非再現で「firmware では無理」と悲観 → PRBS 自己同定(受信交絡を脱出)で「共振は触れるが床は受信」という中庸に到達。`|slope|` 単独ビニングの de-confound は弱く(複数物理量の proxy + 選択バイアス)、受信非依存の PRBS が決め手になった(smart-friend codex の指摘)。
+
+### Step 2: 制御器を 5 つ並べた拡張比較 (`report/ctrl_more.py`)
+
+積分の作り直し (フラグ無し連続制御器) と LQG 線形版を加え、同一プラント・同一指標で 5 つを並べた (小さいほど良。resonance_peak は 1 に近いほど良)。
+
+| 指標 | linear_128 | linear_512 | integ_rework | lqg_linear | kalman_nl |
+|---|---|---|---|---|---|
+| steady_rms | 17.11 | 16.88 | 17.11 | 14.82 | **14.74** |
+| resonance_peak | **3.11** | 3.58 | **3.11** | 3.30 | 4.03 |
+| reacq_1us_edge | 29 | 32 | 28 | 71.7 | **19** |
+| lock_edge | 33 | 36 | 32 | 75.7 | **23** |
+| step_settle_edge | **11** | 15.2 | 12 | 51.8 | 25.5 |
+| step_overshoot_ns | 2008 | 2009 | 2008 | 1997 | **1996** |
+| step_zerocross | 455 | 396 | 458 | **258** | 283 |
+| drift_rms | 18.45 | 18.29 | 18.45 | 16.42 | **15.71** |
+
+読み取れた点:
+
+- **`integ_rework`(codex の積分改良)は linear_128 と全指標で実質同値**(reacq 28 vs 29, lock 32 vs 33 の誤差内)。i_enable ゲートを廃し積分入力を ±e_i=800ns にクランプ + back-calculation で巻き戻す「フラグ無し連続制御器」だが、**この差は出ない**。すなわち **I-enable ゲート(モードフラグ)は性能の律速ではなかった** — フラグを綺麗に消すのは「タダ」(害なし) だが、ユーザが期待した「フラグを消せば復旧と静定が両立する」効果は出ない。律速は別(P 律速 + ゲインの大きさ)にある。
+- **`lqg_linear`(Kalman を定ゲイン 0.12)= 速い復旧と静穏のトレードオフの実証**。定常 14.82・drift 16.42・zerocross 258 と静定系は最良だが、reacq 71.7 / lock 75.7 / step_settle 51.8 と復旧が最悪。低い定ゲインは静かだが遅い。
+- **`kalman_nl`(非線形ゲイン)だけが両取り**。phi が大きいとき高ゲイン (lqg_linear より速い復旧: reacq 19 / lock 23 で線形 128 すら上回る)、小さいとき低ゲイン (lqg_linear 並の静穏: steady 14.74 / drift 15.71 が最良)。ユーザの問い「外乱からの高速復旧と静定オフセット最小化を両立できないか」への host 上の答えは **「ゲインを状態で連続スケジュールすれば両立する」**。
+- ただし `kalman_nl` の代償は **resonance_peak 4.03 (最悪) と step_settle 25.5**。非線形ゲインが wander 時に強く当たって mid-band 共振をやや励起し、step の最終 <200ns 接近は「軟着陸」で鈍る。潰したい共振をこの指標上はむしろ増やしており、両取りはタダではない。
+
+### Step 2 の到達点と留保
+- 連続制御器の本命は **状態推定 + 非線形ゲインスケジュール (`kalman_nl`)**。線形固定や積分作り直しでは出ない両取りが、ゲインを誤差で連続に変えると出る。これがフラグ切替を使わずに復旧/静定を両立する筋。
+- ただし resonance_peak の悪化と step_settle の鈍化はモデル上の実コスト。かつ **resonance_peak は host モデルでは 3〜4 で PRBS 実機の 12〜14 と一致せず、最も信用できない指標**。共振への実影響は実機 PRBS でしか判定できない。
+- **採否は host では決めない**(プロジェクト規律 2)。定常の改善 (~14%) は計測トラップの床下で hwphase では検証不能。`kalman_nl` を実装するなら、判定は **実機 + 受信非依存 PRBS** で復旧応答 (h[k] のリンギング = 共振の増減) を見るしかない。これが Step 3。
+
+## 改訂 (2026-06): 制御器を「選択可能ライブラリ」化 — gnssdo に集約
+
+手法を一つ焼くのでなく、複数の制御手法を実装して**選択・比較できる**ライブラリにした(計測トラップ下で手法差を受信非依存に出すには、同一 boot で制御器を巡回し各々に PRBS、が要る。その器)。smart-friend(codex)に trait 境界を 2 度相談して設計を確定。
+
+### 抽象 (gnssdo/src/control.rs)
+`trait PhaseController { fn step(ControlInput)->ControlOutput; fn is_locked(); fn start_segment(ControlInit); }`。`ControlOutput` は 2 アクチュエータ(`trim_mppb`=FF の上の残差周波数, `pcorr_ns`=即時位相補正)+ telemetry。host ハーネス(ctrl_eval.py)の `step()` と同形にし、**Rust 実装を単一の真実**に。**FF(DisciplinedClock の水晶周波数)と PRBS は trait の外**(FF は全手法同一、PRBS は plant 入力。さもないと「PRBS を見越して消す制御器」を作れ比較が汚れる)。`start_segment` は公平な切替: 出力周波数が連続になるよう次手法へ残差 trim を引き継ぎ、Smith/observer/lock は blank、pcorr は 0 始動。
+
+### 実装した手法 (整数 no_std、host テスト付)
+- `PhaseLockLoop`(production, PID+Smith)を trait 実装に refactor。現行 `update` を温存し `step` は委譲 — **bit 一致 test** で守る。
+- naive PID 系: `PhaseLockLoopConfig::{NAIVE_PID, NAIVE_PI, P_ONLY}`(Smith 無し。過去レポートの素朴な型 II)。
+- `OpenLoopFf`: ループバック無しの構成(過去レポート)= 位相サーボ無し、FF 開ループ。
+- `IntegralRework`: フラグ無し連続積分(I-enable ゲート廃、積分入力クランプ + back-calc)。
+- `AlphaBetaBoost`: **本命**。固定ゲイン α-β 位相観測器 + 残差(innovation)トリガの過渡 boost を hysteresis 状態機械で。phi でなく innovation でゲートし、steady wander では boost しない(共振を励起しない)。Kalman+非線形ゲインの整数実装版で、適応共分散の役(大不一致を速く信じる)を fast-α/β で代替。
+
+### host 検証の仕組み (gnssdo/tests/control_bench.rs)
+ctrl_eval.py のプラントを Rust に移植し、**全手法を同一 trait 経由で**比較。計測レジームを 2 つ(`pio`=16ns 量子化 / `no-pio`=µs 量子化+µs ジッタ)持ち、PIO 無し/ループバック無しの歴史的構成も比較可能に。`cargo test --test control_bench -- --ignored compare_controllers --nocapture`。
+
+PIO レジーム(6 seed 平均、小さいほど良):
+
+| 手法 | steady_rms | reacq1us | lock | step_settle | step_zc | drift_rms |
+|---|---|---|---|---|---|---|
+| open_loop | 93.0 | — | — | — | — | 1957 |
+| naive_pid | 15.0 | 47 | 51 | 12.5 | 317 | 14.9 |
+| pll_smith_128 | 16.3 | 29 | 33 | 10.7 | 409 | 16.1 |
+| pll_smith_512 | 16.3 | 32 | 36 | 15.3 | 364 | 16.2 |
+| integ_rework | 16.3 | 28 | 32 | 11.8 | 408 | 16.1 |
+| **ab_boost** | **14.4** | **25** | **29** | **3.0** | **280** | **15.9** |
+
+読み: `ab_boost` がほぼ全指標で最良。とくに **step_settle 3.0・zerocross 280 が最小** — 過渡 boost で速く復旧しつつ**振動(共振 proxy)を最小**にしている。これは Python の `kalman_nl`(phi ゲイン)が step_settle/zerocross を悪化させたのと対照的で、codex の懸念「非線形ゲインは共振を励起」を、ゲートを phi でなく innovation にすることで回避できたことを model 上は示す。`integ_rework`≈`pll_smith_128`(no-op を Rust でも再現)。`open_loop` は lock せず(ループバック無し=FF のみ)。
+
+no-PIO レジームでは全手法 steady ~1µs(量子化/ジッタ床律速)— PIO 導入の理由をそのまま再現。
+
+### 留保(規律 2)
+この表は**粗い model** 上の dynamics ランキングで、`ab_boost` の step_settle/zerocross 優位も model 依存。実機で受信非依存に効くかは **PRBS h[k]**(共振の増減)でしか判定しない。steady の改善は計測トラップで実機 hwphase では検証不能。Python の制御器(ctrl_eval.py の PidSmith、ctrl_kalman.py)は reference から**凍結・格下げ**し、以後の真実は Rust 実装。Python は FFT/plot/ログ解析に専念。
+
+### firmware 配線: 制御器を選択・同一 boot 巡回 (experiment/controller-library ブランチ)
+
+firmware (gen_capture_task) を単一 `PhaseLockLoop` から `gnssdo::Controller` enum に置き換え、手法を選択・巡回できるようにした。
+
+- 本番は `make_controller(0)` 固定 (= 現行 firmware の PID+Smith チューニングを保持、挙動不変)。`CONTROLLER_SWEEP=false` が既定で、**production が黙ってループ動特性を変えない** (code-review-gpt の P2 指摘を解消。旧 `I_DEN_SWEEP=true` は production を 900 エッジ毎に 128↔512 へ振っていた)。
+- `CONTROLLER_SWEEP=true` で locked 中に `CONTROLLER_SWEEP_EDGES` 毎に手法を巡回 (slot 0=本番 / 1=ab_boost / 2=integ_rework / 3=ライブラリ既定 128 PllSmith / 4=naive_pid)。切替は `start_segment` で**出力周波数が連続になるよう residual trim = 直近適用周波数 − 新手法の現 pred を継ぎ**、観測器/Smith/lock を blank (再捕捉を比較に混ぜない=公平)。
+- PRBS 注入は制御器の**外** (plant 入力) のまま維持。巡回しながら各手法に注入すれば、手法ごとの復旧応答 h[k] を**受信非依存に比較**できる (go/no-go の判定軸)。ログは `cidx` (制御器インデックス=segment 鍵) と `state` (制御器内部状態) を出す。`report/analyze_prbs.py` を `cidx` キーに更新済み。
+- 撤去した死んだ実験足場: `ADAPTIVE_BW` / `SLOPE_ADAPTIVE` (de-confound で no-op 確定・常時 false)、`RECOVERY_SUP` / `KICK_*` (未配線の dead const。recovery supervisor の発想は ab_boost が体現)、`PHASE_EXPERIMENT` / `cfg_to_mode` (制御器巡回が代替)。受信品質テレメトリ (rxbad/jit) は残す。
+- firmware は **0 warning でビルド成立**。実機投入 (flash) と PRBS go/no-go は次段 (実機は対話で実行)。
+
+**未決**: 本番 slot 0 のチューニングは現行 firmware 値 (i_den=512/d_den=16) を保持したが、本調査の結論は **i_den=128** (ライブラリ既定。slot 3)。どちらを production にするかは実機 PRBS h[k] (512 が better-damped という旧 PRBS 結果 vs 128 の応答) で決める。

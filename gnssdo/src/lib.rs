@@ -23,11 +23,20 @@
 //! responsibility and live in the sibling `rp-pps` crate, not here.
 #![cfg_attr(not(test), no_std)]
 
+mod control;
+mod controllers;
 mod gpsdo;
 mod pll;
 mod pps;
 mod qerr;
 
+pub use control::{
+    ControlDebug, ControlInit, ControlInput, ControlOutput, PhaseController,
+};
+pub use controllers::{
+    AlphaBetaBoost, AlphaBetaBoostConfig, Controller, IntegralRework, IntegralReworkConfig,
+    OpenLoopFf,
+};
 pub use gpsdo::{
     DisciplinedClock, DisciplinedClockConfig, FreqUpdate, Gnssdo, GnssdoStep, snap_to_second_ns,
 };

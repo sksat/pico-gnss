@@ -46,7 +46,10 @@ use embedded_io_async::Read;
 use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
-use gnssdo::{LoopMode, PhaseLockLoop, PhaseLockLoopConfig, PpsEvent, snap_to_second_ns};
+use gnssdo::{
+    AlphaBetaBoost, ControlInput, Controller, IntegralRework, PhaseController, PhaseLockLoop,
+    PhaseLockLoopConfig, PpsEvent, snap_to_second_ns,
+};
 use rp_pps::embassy::{SteeredPpsOutput, TimedPpsCapture};
 use rp_pps::{NmeaLineAssembler, PpsGpsdo, PpsSteer};
 
@@ -103,23 +106,58 @@ const PHASE_USE_HW: bool = true;
 /// (host モデルはロック窓を持たないので高ゲインの不安定を過小評価する。gnssdo/tests/thermal_plant.rs の
 /// i_den_sweep_under_thermal_curvature 参照)。残る温度 wander は環境 (連続 ±250ppb 振動) 律速で、firmware
 /// ゲインでは安全に削れない。
-const I_DEN_CALM: i64 = 128; // ライブラリ既定。i_den は wander 振幅に効かない (下記、受信律速) ので既定へ。適応無効で常時この値。
+const I_DEN_CALM: i64 = 512; // 実験: critically-damp 用 joint tuning (i_den 128→512 + D_DEN_TUNED 4→16, kp_inv=8 据置)。
+/// 実験: critically-damped joint tuning の D。wander はループ自身の周期 (93s≈2π√128) でリンギングする
+/// underdamped 共振 (hwphase 残差の autocorr +0.99/-0.54、短期床 12ns の 7.7×) と判明。個別ノブは反転する
+/// (kp_inv↓/D↑ 単独は発振、i_den 単独は共振周波数を動かすだけ) が、**i_den↑ と D 弱化を joint で**動かすと
+/// 閉ループ極が単位円の深部へ入り overdamped 化 (host: 300ns step で overshoot 23%→0%・リンギング 24→0回・
+/// 整定 39→13 edge、ノイズ sd 7→2.5ns、100% lock)。共振が消えれば hwphase が ~92ns → 数十ns/床へ落ちる
+/// はず。**host モデルは白色ノイズで共振を過小励起する**ので減衰特性の証拠どまり、実機ループバックの
+/// hwphase 実測が判定者。effective だが Default は不変 (実験は firmware tuning のみ)。
+const D_DEN_TUNED: i64 = 16;
 const CALM_NS: i64 = 1_000;
 const DISTURBED_SHIFT: u32 = 0; // 適応無効: 固定 i_den=128。旧 2 (32<<2=128) の calm/disturbed 切替を撤去
 
-/// 実験 harness: i_den を**一定受信下で掃引**して、振幅 vs i_den の真の法則を測る。旧 i_den=32 ログは
-/// 適応スイッチ(shift=2)が同時に効いていて、しかも別セッション(受信が違う)なので、6× の振幅低下が i_den
-/// なのか適応スイッチ撤去なのか受信差なのか切り分けられない。これを 1 boot・固定 shift=0・同一受信で掃引し、
-/// 各 i_den セグメントの hwphase 振幅を比べて confound を潰す。本番は false (固定 I_DEN_CALM)。
-const I_DEN_SWEEP: bool = false; // 掃引完了。振幅は受信律速で i_den に依らない (de-confound 後) → 既定 128。
-const I_DEN_LIST: [i64; 3] = [32, 128, 512];
-const I_DEN_SWEEP_EDGES: u32 = 240; // 各 i_den の locked エッジ数 (~4min)。recal=300 とずらして干渉を避ける。
-/// 制御項の実験モード: true で **P→PI→PID を ~120 エッジ毎に巡回**し各項の効果を観察 (cfg を PPSGEN に出力)。
-/// false で本番 = 常時 PID。
-const PHASE_EXPERIMENT: bool = false;
-/// 単一制御構成の固定選択 (PHASE_EXPERIMENT=false 時)。0=P,1=PD,2=PI,3=PID,4=PID+Smith(本番)。
-/// 各構成をコールドスタートから個別キャプチャして compare 風に重ねる用。
-const CTRL_SEL: u32 = 4;
+/// 実験 harness: **制御器ライブラリの同一 boot 巡回**。複数の出力位相制御手法 (gnssdo::Controller) を 1 boot で
+/// 順に切替え、各セグメントに PRBS を注入すれば、受信を揃えた状態で手法差を同定できる (計測トラップ対策。
+/// hwphase = 出力 vs 同じ受信機なので、固定比較や別 boot 比較では受信交絡が手法差に混ざる)。切替は
+/// start_segment で出力周波数を連続にし観測器/Smith/lock を blank = 公平比較。**本番は false** (固定の本番制御器)。
+const CONTROLLER_SWEEP: bool = false;
+const CONTROLLER_SWEEP_EDGES: u32 = 900; // 各手法のセグメント長 (locked エッジ ≈ 秒)。整定 ~2 周期を捨てても標本が残る
+const CONTROLLER_LIST_LEN: usize = 5;
+/// idx 番目の制御手法を生成 (巡回・本番初期化の単一の出所)。slot 0 = 現行 firmware の本番チューニングを保つ。
+fn make_controller(idx: usize) -> Controller {
+    match idx % CONTROLLER_LIST_LEN {
+        // 本番: 現行 firmware の PID+Smith チューニング (構造変更で挙動を変えないよう保持)。
+        0 => Controller::Pll(PhaseLockLoop::with_config(PhaseLockLoopConfig {
+            i_den: I_DEN_CALM,
+            calm_ns: CALM_NS,
+            i_den_disturbed_shift: DISTURBED_SHIFT,
+            d_den: D_DEN_TUNED,
+            ..PhaseLockLoopConfig::DEFAULT
+        })),
+        // 本命候補: 固定ゲイン α-β 観測器 + 残差トリガ過渡 boost。
+        1 => Controller::AbBoost(AlphaBetaBoost::new()),
+        // フラグ無し連続積分 (I-enable ゲート廃止 + 積分入力クランプ + back-calc)。
+        2 => Controller::IntegRework(IntegralRework::new()),
+        // ライブラリ既定 PID+Smith (i_den=128/d_den=4。report の結論。比較用)。
+        3 => Controller::Pll(PhaseLockLoop::new()),
+        // 素朴 PID (Smith 無し。過去レポートの型 II)。
+        _ => Controller::Pll(PhaseLockLoop::with_config(PhaseLockLoopConfig::NAIVE_PID)),
+    }
+}
+
+/// 受信品質テレメトリ: GPS 間隔ジッタ (直近 RX_JIT_WIN エッジの interval 範囲 = max−min) を hysteresis で
+/// 良/悪受信に判定し、RECEPTION_BAD/JITTER として publish する (ログの rxbad/jit。制御の分岐には使わない)。
+const RX_JIT_HI_NS: i64 = 120; // これ超で悪受信へ
+const RX_JIT_LO_NS: i64 = 70; // これ未満で良受信へ戻る (hysteresis で chatter 防止)
+const RX_JIT_WIN: usize = 8;
+/// 実験: **PRBS 自己同定**。ロック中、出力位相に既知の擬似ランダム ±PRBS_AMP_NS を注入 (plant 入力外乱) し、
+/// hwphase の応答を inj と相互相関すると、受信ノイズ (inj と非相関→平均で落ちる) を分離して**閉ループ伝達**
+/// (共振/実効 damping/帯域) を受信交絡なしに同定できる。制御器を巡回しながら各々に注入すれば、手法ごとの
+/// 復旧応答 h[k] (共振/リンギング) を受信非依存に比較でき、go/no-go の判定軸になる (codex 推奨)。
+const PRBS_INJECT: bool = false;
+const PRBS_AMP_NS: i64 = 96; // ±96ns (16ns 捕捉量子化より十分大、lock 窓 1µs より十分小)
 
 /// 定期 K 再較正の cadence (locked 中の出力エッジ数 ≈ 秒)。実効 K の温度ドリフト (#5 後で ~5ns/min) を
 /// 追従する。5分なら最大 ~25ns 振れ → 2桁ns 維持。短くすると holdover 中断が増える tradeoff。
@@ -139,16 +177,12 @@ static C0_GPS: AtomicU32 = AtomicU32::new(0);
 /// GPS PPS エッジの世代カウンタ。出力エッジ間に進んでいなければ GPS 欠落 = C0_GPS は古い → 補正に使わない。
 static C0_GEN: AtomicU32 = AtomicU32::new(0);
 
-/// 実験 harness の cfg (0-4) を PhaseLockLoop の LoopMode へ。本番は 4=PidSmith。
-fn cfg_to_mode(cfg: u32) -> LoopMode {
-    match cfg {
-        0 => LoopMode::P,
-        1 => LoopMode::Pd,
-        2 => LoopMode::Pi,
-        3 => LoopMode::Pid,
-        _ => LoopMode::PidSmith,
-    }
-}
+/// 受信適応帯域: 1=悪受信 (遅い/減衰ループ)、0=良受信 (速いループ)。pps_task が間隔ジッタから set、
+/// gen_capture_task が読んで (i_den,d_den) を切替える。
+static RECEPTION_BAD: AtomicU32 = AtomicU32::new(0);
+/// 直近の GPS 間隔ジッタ (ns, ログ用)。
+static RECEPTION_JITTER: AtomicU32 = AtomicU32::new(0);
+
 
 /// gen_capture_task 用の高優先度割込エグゼキュータ。ループバックエッジ→Instant 読みの
 /// ウェイクアップ遅延 (thread executor だと UART 処理等で ~ms) を ~µs に下げ、位相測定を精密化する。
@@ -169,6 +203,8 @@ fn now_local_ns() -> u64 {
 #[embassy_executor::task]
 async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
     let mut count: u32 = 0; // ログ用エッジ連番
+    let mut iv_buf = [0i64; RX_JIT_WIN]; // 直近 Locked エッジの interval_ns (受信品質ジッタ用 ring buffer)
+    let mut iv_cnt: usize = 0;
 
     loop {
         // wait_edge + timeline.observe は TimedPpsCapture に委譲。生カウンタは edge.raw で取れる。
@@ -187,6 +223,22 @@ async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
         if matches!(step.event, PpsEvent::Locked { .. }) {
             C0_GPS.store(edge_raw, Ordering::Relaxed);
             C0_GEN.fetch_add(1, Ordering::Release); // gen++ (Release: gen 進行で直前の C0_GPS store が見える)
+            // 受信品質: Locked エッジの interval ジッタ (直近 RX_JIT_WIN の範囲 = max−min) を hysteresis で判定。
+            // 水晶オフセット (~+2900ns) は共通なので範囲では相殺し、純粋なエッジ間ジッタ (= 受信劣化) を拾う。
+            iv_buf[iv_cnt % RX_JIT_WIN] = edge.interval_ns as i64;
+            iv_cnt += 1;
+            if iv_cnt >= RX_JIT_WIN {
+                let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+                for &v in &iv_buf {
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+                let jit = hi - lo;
+                RECEPTION_JITTER.store(jit.clamp(0, u32::MAX as i64) as u32, Ordering::Relaxed);
+                let was_bad = RECEPTION_BAD.load(Ordering::Relaxed) != 0;
+                let now_bad = if was_bad { jit > RX_JIT_LO_NS } else { jit > RX_JIT_HI_NS };
+                RECEPTION_BAD.store(now_bad as u32, Ordering::Relaxed);
+            }
         }
         let (state, missed): (&str, u32) = match step.event {
             PpsEvent::First => ("First", 0),
@@ -363,20 +415,18 @@ async fn gen_capture_task(
     // recal_k に渡る (再較正はループ末尾＝周期語確定後にしか発火しない) ので、初期値は不要。
     let mut last_period: u32;
     let mut edges_since_recal: u32 = 0;
-    // 出力位相 PLL (制御=gnssdo)。sub-cycle period 生成 (dither) + period word push は
-    // SteeredPpsOutput (rp-pps) が内包するので、ここは freq_mppb と phase_corr を渡すだけ。
-    let mut pll = PhaseLockLoop::with_config(PhaseLockLoopConfig {
-        i_den: I_DEN_CALM,
-        calm_ns: CALM_NS,
-        i_den_disturbed_shift: DISTURBED_SHIFT,
-        ..PhaseLockLoopConfig::DEFAULT
-    });
-    // 実験: i_den 掃引の状態 (I_DEN_SWEEP=true で先頭値から開始し、locked エッジで順に切替)。
+    // 出力位相の制御器 (gnssdo::Controller)。sub-cycle period 生成 (dither) + period word push は
+    // SteeredPpsOutput (rp-pps) が内包するので、ここは freq_mppb と phase_corr を渡すだけ。本番は
+    // slot 0 (現行 firmware の PID+Smith チューニング)。CONTROLLER_SWEEP=true で locked 中に巡回する。
     let mut sweep_idx: usize = 0;
+    let mut controller = make_controller(sweep_idx);
     let mut edges_since_sweep: u32 = 0;
-    if I_DEN_SWEEP {
-        pll.set_i_den(I_DEN_LIST[0]);
-    }
+    // 制御器巡回の公平切替に使う、直近に適用した出力周波数 (= pred_mppb + trim_mppb)。次手法へ residual
+    // trim = applied_freq − new_pred を渡し、出力周波数を連続にする (再捕捉を比較に混ぜない)。毎エッジ
+    // controller.step 後に代入してから (同一反復の後段の) 切替で読むので、初期値は不要。
+    let mut last_applied_freq_mppb: i64;
+    // PRBS 自己同定の LFSR 状態 (16bit maximal-length, tap 0xB400)。
+    let mut prbs_lfsr: u16 = 0xACE1;
     loop {
         let x0 = sm.rx().wait_pull().await; // 出力エッジの生カウンタ (C2_out)。wait_pull は FIFO 最古を返す。
         // backlog があれば最新エッジまで drain する (K 較正の drain と同じ対策)。ループが holdover 復帰等で
@@ -442,64 +492,78 @@ async fn gen_capture_task(
         } else {
             phase.unwrap_or(0)
         };
-        // 実験モード: 制御構成を ~130 エッジ毎に巡回し実機で比較 (0=P,1=PD,2=PI,3=PID,4=PID+Smith)。
-        // 先頭を PID+Smith にしてコールドスタートをロックしてから P/PD/PI/PID を回す。本番は常に 4。
-        let cfg: u32 = if PHASE_EXPERIMENT {
-            let ph = (count / 130) % 5;
-            if ph == 0 { 4 } else { ph - 1 }
-        } else {
-            CTRL_SEL // 本番=4(PID+Smith)。0-3 で単一構成に固定キャプチャ (compare 用の公平比較)
-        };
-        pll.set_mode(cfg_to_mode(cfg));
         // valid = この位相サンプルが信用できるか (GPS 新鮮 + 間隔健全 + 隣接エッジ対)。!valid は holdover
         // ホールド。paired=false (gross ミスペア) は fold が隠す ppm×1s 残差を避けるため捨てる。
         if !paired {
             warn!("PPSGEN mispair raw_lag={} ticks (>~10ms) -> drop", raw_lag);
         }
         let valid = fresh && sane && c0 != 0 && paired;
-        let u = pll.update(ctrl, valid);
-        // 周波数 = 水晶推定の 1 サンプル先予測 (mppb, ppb 丸めなし) + PLL の I トリム(milli-ppb)。
+        // 選択中の制御器に位相誤差を渡す (gnssdo::Controller。本番=slot0、CONTROLLER_SWEEP 中は巡回)。
+        let u = controller.step(ControlInput {
+            err_ns: ctrl,
+            valid,
+        });
+        // 周波数 = 水晶推定の 1 サンプル先予測 (mppb, ppb 丸めなし) + 制御器の周波数トリム (milli-ppb)。
         // 温度ランプ中、単一 EMA だと推定が遅れて出力位相が ramp 速度に比例してずれる (offset② のドリフト)。
         // DisciplinedClock の α-β が傾きを先回りするので、出力周期にその予測周波数を入れて定常誤差を抑える。
         // 位相補正は dither が cycle に変換して引く。
-        let freq_mppb = pred_mppb + u.freq_trim_mppb;
+        let freq_mppb = pred_mppb + u.trim_mppb;
+        last_applied_freq_mppb = freq_mppb; // 制御器巡回の公平切替用 (次手法へ residual trim を継ぐ)
+        // PRBS 自己同定: ロック中、出力位相に既知の ±PRBS_AMP_NS 擬似ランダム外乱を注入(plant 入力)。ループは
+        // これを hwphase 経由で見て打ち消すので、inj と hwphase の相互相関で閉ループ伝達(共振)が受信交絡なしに出る。
+        let prbs_inj = if PRBS_INJECT && u.locked {
+            let bit = prbs_lfsr & 1;
+            prbs_lfsr = (prbs_lfsr >> 1) ^ if bit != 0 { 0xB400 } else { 0 };
+            if bit != 0 { PRBS_AMP_NS } else { -PRBS_AMP_NS }
+        } else {
+            0
+        };
         // 周期語を保持: 再較正中の holdover 生 push に再利用 (dither はこの通常経路でのみ前進)。
-        last_period = output.set_next_period(freq_mppb, u.phase_corr_ns);
+        last_period = output.set_next_period(freq_mppb, u.pcorr_ns + prbs_inj);
         if let Some(iv) = interval_ns {
             count += 1;
-            // 制御信号を全部出力 → ホストでプラント同定 + ゲイン掃引シミュ + 項別比較ができる。
-            // (互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残し、cfg/trim/p/d を追記)
+            // 制御信号を全部出力 → ホストでプラント同定 + 制御器比較 + 項別比較ができる。
+            // 互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残す。cidx=制御器インデックス
+            // (CONTROLLER_SWEEP の segment 鍵)、state=制御器の内部状態コード (ab_boost の boost 等)。
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cfg={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} iden={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
                 phase.unwrap_or(0),
                 hwphase_ns,
-                u.freq_trim_mppb / 1000,
-                cfg,
-                u.p_corr_ns,
-                u.d_corr_ns,
-                u.freq_trim_mppb,
+                u.trim_mppb / 1000,
+                sweep_idx as u32,
+                u.dbg.p_ns,
+                u.dbg.d_ns,
+                u.trim_mppb,
                 slope_mppb,
                 raw_lag,
                 u.locked as u8,
-                pll.config().i_den
+                u.dbg.state,
+                RECEPTION_JITTER.load(Ordering::Relaxed),
+                RECEPTION_BAD.load(Ordering::Relaxed),
+                prbs_inj
             );
         }
         last_x = Some(x);
         // 定期 K 再較正: locked 中、RECAL_EDGES 出力エッジ毎に SM2 を GPS へ戻して実効 K を測り直す。
         // 実効 K は温度で這う (#5 後も ~5ns/min) ので boot 一発較正では追えない。再較正中は holdover。
         if u.locked {
-            // 実験: i_den 掃引。locked エッジを数え、I_DEN_SWEEP_EDGES 毎に次の i_den へ (短い unlock は
-            // カウントを進めないだけで segment を跨いで継続)。一定受信下で各 i_den の hwphase 振幅を比較する。
-            if I_DEN_SWEEP {
+            // 実験: 制御器巡回。locked エッジを数え、CONTROLLER_SWEEP_EDGES 毎に次の手法へ切替える (短い
+            // unlock はカウントを進めないだけで segment を跨いで継続)。一定受信下で各手法の hwphase / PRBS
+            // h[k] を比較する。切替は start_segment: 出力周波数が連続になるよう residual trim = 直近適用
+            // 周波数 − 新手法の現 pred を継ぎ、観測器/Smith/lock を blank (再捕捉を比較に混ぜない=公平)。
+            if CONTROLLER_SWEEP {
                 edges_since_sweep += 1;
-                if edges_since_sweep >= I_DEN_SWEEP_EDGES {
+                if edges_since_sweep >= CONTROLLER_SWEEP_EDGES {
                     edges_since_sweep = 0;
-                    sweep_idx = (sweep_idx + 1) % I_DEN_LIST.len();
-                    pll.set_i_den(I_DEN_LIST[sweep_idx]);
-                    info!("PLLSWEEP i_den={}", I_DEN_LIST[sweep_idx]);
+                    sweep_idx = (sweep_idx + 1) % CONTROLLER_LIST_LEN;
+                    controller = make_controller(sweep_idx);
+                    controller.start_segment(gnssdo::ControlInit {
+                        residual_trim_mppb: last_applied_freq_mppb - pred_mppb,
+                    });
+                    info!("CTRLSWEEP idx={} name={}", sweep_idx as u32, controller.name());
                 }
             }
             edges_since_recal += 1;
