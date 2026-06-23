@@ -73,6 +73,32 @@
         "after nulling/subtracting the skew, the remaining offset at the two real points is the physical one (mean = physical + skew)",
         "matches probe attenuation / cable so the skew is minimized / repeatable"
       ]
+    },
+    {
+      "id": 6,
+      "name": "trap7-1pps-norm-sweep-wait-status",
+      "prompt": "Rigol DHO800 で 1Hz の 1PPS をエッジトリガで見ている。:TRIGger:STATus? を読むと WAIT ばかりで、波形もたまにしか更新されず、しかも AUTO にすると波形が同期せず流れる。トリガが壊れている? どう事実確認して直す?",
+      "expected_output": "1Hz では NORM で大半が WAIT(エッジ待ち)なのは正常で不発ではない。AUTO は 1 秒のエッジを待たず自動トリガして未同期波形を出すので NORMal にする。発火しているかは :SINGle が STOP を返すか(N/N)で事実を取る。:MEASure の 9.9E37 は測定無効であって信号なしではない。",
+      "files": [],
+      "expectations": [
+        "explains that on a 1Hz signal in NORM sweep, :TRIGger:STATus? reading WAIT most of the time is normal (waiting between edges), not a broken trigger",
+        "fixes the unsynced display by using sweep=NORMal instead of AUTO (AUTO auto-triggers between the 1s edges -> unsynced display)",
+        "uses :SINGle returning STOP (N out of N tries) as the authoritative test that the trigger actually fires",
+        "does not treat a WAIT status or a 9.9E37 measurement value as proof of no signal / no trigger"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "trap8-ch-voltage-mismatch-overvoltage-scare",
+      "prompt": "Rigol で CH1(GPS PPS)が settled 5.8V、CH2(同じ基板の 3.3V GPIO 出力)が 3.3V と表示される。GPS PPS は 5V 系の信号で、これを 3.3V の RP2040 に直結したら過電圧で壊れるのでは? 確かめて判断して。",
+      "expected_output": "5.8V を信号と即断しない。CH2 が正しく 3.3V なので CH1 側の probe ratio と物理結線のミスマッチを疑う(1× 直結を 10× 設定にすると 3.3V×10=33V で画面外に振り切れ、生バイトが railed して表示天井 ~5.8V を返す)。probe ratio を物理結線に合わせれば真値 ~3.3V。データシート(モジュール IO は 3.3V 系、5V には追従しない)と RP2040 GPIO abs-max≈IOVDD+0.5≈3.8V から、3.3V 直結は安全と結論。",
+      "files": [],
+      "expectations": [
+        "does NOT accept 5.8V as the real signal voltage / does not conclude the GPS PPS is a 5V signal at face value",
+        "suspects a probe-ratio vs physical-connection mismatch (e.g. a 1x direct tap set to 10x pushes 3.3V off-screen so the raw bytes rail at the display ceiling ~5.8V)",
+        "verifies the true level by matching the probe ratio to the physical connection (or probing a known node) and/or cross-checks the module datasheet IO level (3.3V class, not 5V)",
+        "concludes (using RP2040 GPIO abs-max ~ IOVDD+0.5 ~ 3.8V vs a real ~3.3V signal) that the direct connection is safe / not an over-voltage problem"
+      ]
     }
   ]
 }
