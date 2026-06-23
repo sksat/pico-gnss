@@ -8,3 +8,31 @@ __pycache__/
 
 # skill-creator eval workspaces (local records, not committed)
 .claude/skills/*-workspace/
+
+# 調査の作業用/再生成可能な図(最終図は個別に追跡)
+report/refute-pps-gain20-spectrum.png
+report/refute-pps-proven-spectrum.png
+report/refute-pps-review-spectrum.png
+report/refute-pps-slew-spectrum.png
+report/scope-autoscale.png
+report/scope-band.png
+report/scope-band2.png
+report/scope-band3.png
+report/scope-ch1-1x-fixed.png
+report/scope-debug-iden128.png
+report/scope-fixed.png
+report/scope-located.png
+report/scope-now.png
+report/scope-recheck.png
+report/scope-trig-ok.png
+report/scope-zoom.png
+report/sim_actuator_dither.png
+report/sim_plant_colored.png
+report/sim_resonance.png
+report/wander-critdamp-spectrum.png
+report/wander-iden128-full-spectrum.png
+report/wander-iden128-spectrum.png
+report/wander-pps-gain20-spectrum.png
+report/wander-pps-proven-spectrum.png
+report/wander-pps-slew-spectrum.png
+report/wander-review-spectrum.png
