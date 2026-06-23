@@ -2,12 +2,15 @@
 """Robust, SELF-CONFIGURING oscilloscope capture of the GPS->output 1PPS phase wander.
 
 Unlike scope_pps.py `phase` (which only set trigger+timebase and so silently broke when the
-probe ratio drifted to 1x), this sets the FULL vertical config (probe ratio, scale, offset),
-trigger, timebase and memory depth every run, and records a WALL-CLOCK TIMESTAMP per shot so the
-wander spectrum (period) can be computed offline. Use it for the external before/after that VERIFIES
-the firmware self-measurement (hwphase) — the scope is for verify/debug, tuning is on hwphase.
+front-panel probe ratio didn't match the physical probes), this sets the FULL vertical config
+(probe ratio, scale, offset), trigger, timebase and memory depth every run, and records a
+WALL-CLOCK TIMESTAMP per shot so the wander spectrum (period) can be computed offline. Use it for
+the external before/after that VERIFIES the firmware self-measurement (hwphase) — the scope is for
+verify/debug, tuning is on hwphase.
 
-  CH1 = GPS 1PPS (trigger), CH2 = disciplined output (GP4 loopback / GP3), both via 10x probes.
+  CH1 = GPS 1PPS (trigger, 1x DIRECT — not a 10x probe), CH2 = disciplined output (GP4 / GP3) via 10x probe.
+  NOTE: CH1 is a direct (1x) tap. Forcing CH1 to 10x clips the 3.3V signal off the screen top
+  (raw bytes rail -> a bogus ~5.8V readout); the edge timing still works but the voltage is garbage.
 
   RIGOL_HOST=<ip> python3 report/scope_wander.py <N> <out.log> [tag]
 
@@ -27,8 +30,8 @@ SETUP = [
     ":CHANnel1:DISPlay 1", ":CHANnel2:DISPlay 1",
     ":CHANnel3:DISPlay 0", ":CHANnel4:DISPlay 0",
     ":CHANnel1:COUPling DC", ":CHANnel2:COUPling DC",
-    ":CHANnel1:PROBe 10", ":CHANnel2:PROBe 10",     # physical probes are 10x (verified 2026-06)
-    ":CHANnel1:SCALe 1.0", ":CHANnel2:SCALe 1.0",   # 1 V/div: 0..3.3 V on-screen
+    ":CHANnel1:PROBe 1", ":CHANnel2:PROBe 10",      # CH1 GPS = 1x DIRECT, CH2 output = 10x probe (verified 2026-06)
+    ":CHANnel1:SCALe 1.0", ":CHANnel2:SCALe 1.0",   # 1 V/div: 0..3.3 V on-screen (both read ~3.3 V now)
     ":CHANnel1:OFFSet -1.5", ":CHANnel2:OFFSet -1.5",
     ":TRIGger:MODE EDGE", ":TRIGger:EDGE:SOURce CHANnel1",
     ":TRIGger:EDGE:SLOPe POSitive", ":TRIGger:EDGE:LEVel 1.65",
