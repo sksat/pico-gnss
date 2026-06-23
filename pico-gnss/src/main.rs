@@ -111,7 +111,7 @@ const DISTURBED_SHIFT: u32 = 0; // 適応無効: 固定 i_den=128。旧 2 (32<<2
 /// 適応スイッチ(shift=2)が同時に効いていて、しかも別セッション(受信が違う)なので、6× の振幅低下が i_den
 /// なのか適応スイッチ撤去なのか受信差なのか切り分けられない。これを 1 boot・固定 shift=0・同一受信で掃引し、
 /// 各 i_den セグメントの hwphase 振幅を比べて confound を潰す。本番は false (固定 I_DEN_CALM)。
-const I_DEN_SWEEP: bool = false; // 掃引完了 (32→198/128→73/512→53ns)。本番は固定 I_DEN_CALM=512。
+const I_DEN_SWEEP: bool = false; // 掃引完了。振幅は受信律速で i_den に依らない (de-confound 後) → 既定 128。
 const I_DEN_LIST: [i64; 3] = [32, 128, 512];
 const I_DEN_SWEEP_EDGES: u32 = 240; // 各 i_den の locked エッジ数 (~4min)。recal=300 とずらして干渉を避ける。
 /// 制御項の実験モード: true で **P→PI→PID を ~120 エッジ毎に巡回**し各項の効果を観察 (cfg を PPSGEN に出力)。
