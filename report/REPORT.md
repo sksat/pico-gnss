@@ -991,3 +991,29 @@ hwphase = 出力 vs **同一受信機** (firmware/main.rs:493 loopback_phase_ns)
 - **受信は均一**: median jit=16・rxbad=0 が全手法・全セグメントで一致、jit_p90=32 も均一。両除外窓 (post-switch 120 edge + post-kick 30 edge) が kept_frac 0.54-0.55 で均一適用。reception は弱点でなく、弱点は**切り詰められた・不均一なセグメント数のみ**。
 - **追加計測 (これがあれば判定を覆せるか確かめられる)**: capture を最低 1 サイクル完走させ各手法 ≥5 セグメントを capture 全域に分散 (integ/smith の前半固まりを解消)、kick を各手法 ≥5 個に増やして PI 群内の settle 差を有意化、温度併記、外部基準 (TIC/独立受信機) で steady sd のトラップを外す。
 - **ただし**: 本データで ab_boost を覆す材料は**ない**。共振・回復の受信非依存 2 軸とも production に劣り、唯一の売り (boost) は今回発火して**なお改善しないことが確定**した。追加計測は PI 群内の序列を詰めるためには要るが、**production 据え置きの結論を変える見込みは低い**。
+
+## 受信側の検討: 静止拘束は既に上限・wander 機構は未同定(受信機が天井)
+
+「地球上で静止という拘束を使えば position-time coupling を断てないか」という問いを実機データで検証した(`report/analyze_postime.py`、**座標は一切出さず偏差[m]・相関のみ**)。クリーン production capture(12k locked、注入なし、span 206分)で:
+
+### 静止拘束は**既に掛かっている**
+- **NMEA 位置偏差 RMS = 0.00m**(12457 GGA で lat/lon/alt が完全一定=ピン留め)。
+- 正体: firmware (`mt3333.rs`) が **`PMTK886,4`(stationary dynamic model)** を送信。= 静止拘束は既に適用済で、位置ピン留めはそのため。
+- 受信機は **MT3333(秋月 AE-GNSS-EXTANT)**。開発者コメント済: 「PMTK386,0/319,1 は ACK するが timing に観測効果なし。**MT3333 は qErr/survey-in 非対応でコマンドで詰める余地は無い**」。→ この受信機では静止拘束は上限。
+
+### wander は幾何にも追従しない
+位置ピン留めで位置相関は不可なので、観測できる幾何/品質量と相関(locked, |hw|<5µs):
+
+| 相関 | r |
+|---|---|
+| \|hwphase\| vs 衛星数 | +0.03 |
+| \|hwphase\| vs HDOP | −0.02 |
+| \|hwphase\| vs 受信機報告 σ_alt (GST) | −0.04 |
+
+全てほぼゼロ。**レポートが「原因」とした position-time coupling は、この実機では確認できない**(幾何無相関は弱い反証)。ただし**振幅は整合**: GST の鉛直 σ_alt は中央値 17m で 17m/c ≈ 57ns ≈ 観測 wander(σ131ns、ループ込み)と同オーダー。位置出力がピン留め(886,4)で**瞬時誤差が見えない**ため相関では確認できない=「大きさは coupling と一致だが証明不能」。
+
+### 到達点
+- 静止拘束は**正しいレバーで既に適用済**。MT3333 が soft な stationary motion model でそれを頭打ちにしている(位置を解から外す hard な survey-in/over-determined clock ではない。qErr も非対応)。
+- wander の支配機構は実機で同定しきれない(幾何・温度[既出]・受信ジッタ[既出]無相関、位置はピン留めで不可視)。
+- **次の一手は受信機交換**: u-blox タイミング系(NEO/LEA-M8T, ZED-F9T)。一つで (1) **qErr/sawtooth 出力**(TIM-TP)→ ns 級 sawtooth を引ける(qErr 補正コアは gnssdo 実装済)、(2) **真の survey-in + position-hold**→ coupling が本物なら根で断て、かつ**機構を最終確認**(現受信機では不可)、を同時に解く。併せて**温度ログ**で crystal-thermal と受信機 wander を初めて分離。
+- 解析ツール `report/analyze_postime.py`(座標非出力)を残す。
