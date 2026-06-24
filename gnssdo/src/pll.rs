@@ -274,7 +274,9 @@ impl PhaseLockLoop {
                         } else {
                             self.config.i_den << self.config.i_den_disturbed_shift.min(20)
                         };
-                        self.trim_mppb = (self.trim_mppb - pred * 1000 / i_den_eff)
+                        // `.max(1)`: `i_den` is settable via `set_i_den`, and integer divide-by-zero
+                        // panics on the no_std firmware — guard it structurally.
+                        self.trim_mppb = (self.trim_mppb - pred * 1000 / i_den_eff.max(1))
                             .clamp(-self.config.trim_max_mppb, self.config.trim_max_mppb);
                     }
                 } else {
@@ -285,9 +287,9 @@ impl PhaseLockLoop {
                     p_corr =
                         (pred / self.config.mode.kp_inv()).clamp(-CORR_CLAMP_NS, CORR_CLAMP_NS);
                 }
-                // D term (only while locked).
+                // D term (only while locked). `.max(1)` guards `set_d_den(0)` (no_std divide-by-zero).
                 if self.config.mode.use_d() && locked {
-                    d_corr = ((pred - self.last_pred) / self.config.d_den)
+                    d_corr = ((pred - self.last_pred) / self.config.d_den.max(1))
                         .clamp(-CORR_CLAMP_NS, CORR_CLAMP_NS);
                 }
                 self.lock_cnt = if ctrl.abs() < self.config.lock_ns {
@@ -536,6 +538,17 @@ mod tests {
         let before = p.freq_trim_mppb();
         let u = p.update(2_000, true);
         assert_eq!(u.freq_trim_mppb, before - 2_000 * 1000 / 512);
+    }
+
+    #[test]
+    fn zero_denominator_setters_do_not_panic() {
+        // `set_i_den(0)` / `set_d_den(0)` must not cause an integer divide-by-zero panic (the no_std
+        // firmware has no panic budget). Drive an in-band, locked edge so both the I and D paths run.
+        let mut p = PhaseLockLoop::new();
+        run(&mut p, 100, 8); // lock
+        p.set_i_den(0);
+        p.set_d_den(0);
+        let _ = p.update(2_000, true); // in i_enable band + locked → exercises both divisors
     }
 
     #[test]

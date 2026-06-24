@@ -147,18 +147,22 @@ type Factory = fn() -> Box<dyn PhaseController>;
 fn evaluate(make: Factory, reg: Regime, seeds: u64) -> Metrics {
     let mut m = Metrics::default();
     for s in 0..seeds {
+        // Each sub-experiment draws BOTH its reception (gen_reception offset) and its plant jitter
+        // (run_plant seed) from a distinct stream, so the four no-PIO traces are independent for each
+        // s — reusing one jitter seed `s` across all four would correlate them and shrink the
+        // effective sample count behind each averaged metric.
         // steady
         let rec = gen_reception(6000, 1000 + s);
-        let (hw, _) = run_plant(&mut *make(), 6000, &rec, reg, 0.0, None, 0.0, 0.0, s);
+        let (hw, _) = run_plant(&mut *make(), 6000, &rec, reg, 0.0, None, 0.0, 0.0, 5000 + s);
         m.steady_rms += std_dev(&hw[1500..]);
         // reacquire from 50 µs
         let rec = gen_reception(1500, 2000 + s);
-        let (hw, lk) = run_plant(&mut *make(), 1500, &rec, reg, 0.0, None, 0.0, 50_000.0, s);
+        let (hw, lk) = run_plant(&mut *make(), 1500, &rec, reg, 0.0, None, 0.0, 50_000.0, 6000 + s);
         m.reacq_1us_edge += hw.iter().position(|v| v.abs() < 1000.0).unwrap_or(1500) as f64;
         m.lock_edge += lk.iter().position(|&v| v).unwrap_or(1500) as f64;
         // step
         let rec = gen_reception(2000, 3000 + s);
-        let (hw, _) = run_plant(&mut *make(), 2000, &rec, reg, 0.0, Some(800), 2000.0, 0.0, s);
+        let (hw, _) = run_plant(&mut *make(), 2000, &rec, reg, 0.0, Some(800), 2000.0, 0.0, 7000 + s);
         let seg = &hw[800..1600];
         m.step_settle_edge += seg.iter().position(|v| v.abs() < 200.0).unwrap_or(800) as f64;
         m.step_overshoot_ns += seg.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
@@ -168,7 +172,7 @@ fn evaluate(make: Factory, reg: Regime, seeds: u64) -> Metrics {
             .count() as f64;
         // drift
         let rec = gen_reception(3000, 4000 + s);
-        let (hw, _) = run_plant(&mut *make(), 3000, &rec, reg, 0.002, None, 0.0, 0.0, s);
+        let (hw, _) = run_plant(&mut *make(), 3000, &rec, reg, 0.002, None, 0.0, 0.0, 8000 + s);
         m.drift_rms += std_dev(&hw[1500..]);
     }
     let n = seeds as f64;
@@ -262,6 +266,31 @@ fn open_loop_never_servos_phase() {
     let mut c = OpenLoopFf::new();
     let (_hw, lk) = run_plant(&mut c, 500, &rec, PIO, 0.0, None, 0.0, 20_000.0, 3);
     assert!(!lk.iter().any(|&v| v), "open-loop must never claim lock");
+}
+
+#[test]
+fn ab_boost_does_not_lag_badly_under_harsh_drift() {
+    // Regression for the verification workflow's main robustness finding: the OLD open-loop predict
+    // (phase_hat + freq/1000, ignoring the applied trim) gave AlphaBetaBoost a large steady-state lag
+    // under a sustained ramp (~2300 ns at accel 0.05, vs the PI loops' ~7 ns). The closed-loop predict
+    // makes its drift integrator a true type-II on the ramp. Under a harsh ramp, ab_boost's drift tail
+    // must stay within a small multiple of pll_smith_128's — not the ~300× the defect produced.
+    let harsh = 0.02;
+    let drift_tail = |make: Factory| {
+        let mut acc = 0.0;
+        for s in 0..6u64 {
+            let rec = gen_reception(3000, 4000 + s);
+            let (hw, _) = run_plant(&mut *make(), 3000, &rec, PIO, harsh, None, 0.0, 0.0, 9000 + s);
+            acc += std_dev(&hw[1500..]);
+        }
+        acc / 6.0
+    };
+    let ab = drift_tail(|| Box::new(AlphaBetaBoost::new()));
+    let pi = drift_tail(|| Box::new(PhaseLockLoop::new()));
+    assert!(
+        ab < pi * 4.0 + 50.0,
+        "ab_boost harsh-drift tail {ab:.0}ns should be within ~4x of pll_smith_128 {pi:.0}ns (was ~300x before the closed-loop-predict fix)"
+    );
 }
 
 #[test]

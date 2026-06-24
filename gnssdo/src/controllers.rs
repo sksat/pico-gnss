@@ -218,8 +218,10 @@ impl Default for AlphaBetaBoostConfig {
 #[derive(Debug)]
 pub struct AlphaBetaBoost {
     cfg: AlphaBetaBoostConfig,
-    phase_hat: i64,    // estimated output phase (ns)
-    freq_hat_mppb: i64, // estimated residual frequency (milli-ppb); phase advances freq/1000 ns/edge
+    phase_hat: i64,      // estimated output phase error (ns)
+    drift_hat_mppb: i64, // estimated *uncorrected* drift rate (milli-ppb); the trim cancels it
+    last_trim_mppb: i64, // trim applied last edge (for the closed-loop predict)
+    last_pcorr_ns: i64,  // phase correction applied last edge (Smith-like predict term)
     boosting: bool,
     boost_edges: u32,
     exit_cnt: u32,
@@ -238,7 +240,9 @@ impl AlphaBetaBoost {
         Self {
             cfg,
             phase_hat: 0,
-            freq_hat_mppb: 0,
+            drift_hat_mppb: 0,
+            last_trim_mppb: 0,
+            last_pcorr_ns: 0,
             boosting: false,
             boost_edges: 0,
             exit_cnt: 0,
@@ -252,10 +256,22 @@ impl AlphaBetaBoost {
         &self.cfg
     }
 
-    /// Current residual frequency trim (milli-ppb) = −(observer freq estimate), clamped. Mirrors
+    /// Current residual frequency trim (milli-ppb) = −(drift estimate), clamped. Mirrors
     /// [`PhaseLockLoop::freq_trim_mppb`](crate::PhaseLockLoop::freq_trim_mppb) for logging/tests.
     pub fn freq_trim_mppb(&self) -> i64 {
-        (-self.freq_hat_mppb).clamp(-self.cfg.trim_max_mppb, self.cfg.trim_max_mppb)
+        (-self.drift_hat_mppb).clamp(-self.cfg.trim_max_mppb, self.cfg.trim_max_mppb)
+    }
+
+    /// Force the boost backstop forward and drop out of boost once it expires — runs on *every* edge
+    /// (applied, rejected, or holdover) so a periodic outlier cannot starve the timer and latch the
+    /// boost on. Returns the (possibly updated) boost state.
+    fn tick_boost_backstop(&mut self) {
+        if self.boosting {
+            self.boost_edges = self.boost_edges.saturating_add(1);
+            if self.boost_edges >= self.cfg.boost_max_edges {
+                self.boosting = false;
+            }
+        }
     }
 }
 
@@ -269,64 +285,76 @@ impl PhaseController for AlphaBetaBoost {
     fn step(&mut self, input: ControlInput) -> ControlOutput {
         let z = input.err_ns;
         let locked = self.lock_cnt >= self.cfg.lock_hold;
+        let held_trim =
+            (-self.drift_hat_mppb).clamp(-self.cfg.trim_max_mppb, self.cfg.trim_max_mppb);
 
         if !input.valid {
-            // Holdover: hold trim + lock state, emit no correction. The observer does not advance on
-            // an untrusted edge (no measurement to predict against).
+            // Holdover: hold trim + lock, emit no correction, observer frozen. The backstop still
+            // ticks so a long holdover cannot leave the loop latched in boost.
+            self.tick_boost_backstop();
             return ControlOutput {
-                trim_mppb: (-self.freq_hat_mppb)
-                    .clamp(-self.cfg.trim_max_mppb, self.cfg.trim_max_mppb),
+                trim_mppb: held_trim,
                 pcorr_ns: 0,
                 applied: false,
                 locked,
                 rejected: false,
                 dbg: ControlDebug {
                     pred_ns: self.phase_hat,
-                    observer_freq_mppb: self.freq_hat_mppb,
+                    observer_freq_mppb: self.drift_hat_mppb,
                     state: self.boosting as u8,
                     ..ControlDebug::default()
                 },
             };
         }
 
-        // α-β prediction and innovation (independent of which gains we pick this edge).
-        let phase_pred = self.phase_hat + self.freq_hat_mppb / 1000;
+        // Closed-loop α-β prediction. The trim applied last edge cancels the estimated drift, so the
+        // only motion the model expects since the last edge is the drift residual minus the phase
+        // correction we applied (Smith-like). Writing it with the applied last_trim makes it exact and
+        // — crucially — phantom-free across a fair segment switch (drift_hat = −seed, last_trim = seed
+        // ⇒ phase_pred = 0 at a steady edge, so the first emitted trim equals the seed; see
+        // start_segment). Ignoring the applied control (the old `phase_hat + drift/1000`) both broke
+        // switch continuity and lagged on sustained drift.
+        let phase_pred = self.phase_hat + (self.drift_hat_mppb + self.last_trim_mppb) / 1000
+            - self.last_pcorr_ns;
         let innov = z - phase_pred;
 
-        // Post-lock single-sample spike: hold (do not let one bad edge move the output or the
-        // observer). Distinct from the boost path: this *rejects* an isolated spike; a spike that
-        // persists past outlier_max is accepted below as a real disturbance and enters boost.
+        // Isolated post-lock spike: reject (hold). Backstop ticks regardless (anti-latch).
         if locked && z.abs() > self.cfg.outlier_ns && self.reject_cnt < self.cfg.outlier_max {
             self.reject_cnt += 1;
+            self.tick_boost_backstop();
             return ControlOutput {
-                trim_mppb: (-self.freq_hat_mppb)
-                    .clamp(-self.cfg.trim_max_mppb, self.cfg.trim_max_mppb),
+                trim_mppb: held_trim,
                 pcorr_ns: 0,
                 applied: false,
                 locked,
                 rejected: true,
                 dbg: ControlDebug {
                     pred_ns: phase_pred,
-                    observer_freq_mppb: self.freq_hat_mppb,
+                    observer_freq_mppb: self.drift_hat_mppb,
                     state: self.boosting as u8,
                     ..ControlDebug::default()
                 },
             };
         }
-        let accepted_disturbance = self.reject_cnt >= self.cfg.outlier_max;
+        // A disturbance accepted after a full reject run — but only if THIS edge is itself out of the
+        // lock window. A zero-error edge that merely broke the reject streak is not a disturbance and
+        // must not trigger boost (the phantom-boost-latch defect).
+        let accepted_disturbance =
+            self.reject_cnt >= self.cfg.outlier_max && z.abs() >= self.cfg.lock_ns;
         self.reject_cnt = 0;
 
-        // Transient-boost hysteresis state machine. Enter on a genuine surprise — a large innovation,
-        // a disturbance accepted after the reject run, or a lost lock — NOT on steady |phase| wander.
+        // Boost hysteresis. Enter ONLY on a genuine surprise — a large *innovation* (a real step or a
+        // lost lock both surface as a big innovation) or an accepted persistent disturbance. Keyed to
+        // the innovation, never to raw |z|, so steady wander crossing the lock window cannot flap the
+        // aggressive regime (which would re-excite the very resonance this controller exists to avoid).
         if !self.boosting {
-            let lost_lock = locked && z.abs() >= self.cfg.lock_ns;
-            if innov.abs() > self.cfg.innov_enter_ns || accepted_disturbance || lost_lock {
+            if innov.abs() > self.cfg.innov_enter_ns || accepted_disturbance {
                 self.boosting = true;
                 self.boost_edges = 0;
                 self.exit_cnt = 0;
             }
         } else {
-            self.boost_edges += 1;
+            self.boost_edges = self.boost_edges.saturating_add(1);
             if z.abs() < self.cfg.exit_lock_ns {
                 self.exit_cnt += 1;
             } else {
@@ -337,28 +365,31 @@ impl PhaseController for AlphaBetaBoost {
             }
         }
 
+        // Gains by regime. `.max(1)` keeps every divisor ≥ 1: an integer divide-by-zero would panic
+        // on the no_std firmware (and the gain fields are a public, settable API), and a non-positive
+        // gain would invert the feedback sign — so this both guards the panic and pins the precondition.
         let (alpha_inv, beta_inv, pgain_inv) = if self.boosting {
             (
-                self.cfg.fast_alpha_inv,
-                self.cfg.fast_beta_inv,
-                self.cfg.fast_pgain_inv,
+                self.cfg.fast_alpha_inv.max(1),
+                self.cfg.fast_beta_inv.max(1),
+                self.cfg.fast_pgain_inv.max(1),
             )
         } else {
             (
-                self.cfg.steady_alpha_inv,
-                self.cfg.steady_beta_inv,
-                self.cfg.steady_pgain_inv,
+                self.cfg.steady_alpha_inv.max(1),
+                self.cfg.steady_beta_inv.max(1),
+                self.cfg.steady_pgain_inv.max(1),
             )
         };
 
-        // α-β update.
+        // α-β update: phase correction + drift integrator.
         self.phase_hat = phase_pred + innov / alpha_inv;
-        self.freq_hat_mppb = (self.freq_hat_mppb + innov * 1000 / beta_inv)
+        self.drift_hat_mppb = (self.drift_hat_mppb + innov * 1000 / beta_inv)
             .clamp(-self.cfg.trim_max_mppb, self.cfg.trim_max_mppb);
 
-        // Actuators: cancel the residual drift (trim) and pull the estimated phase to zero (pcorr).
+        // Actuators: cancel the drift (trim) and pull the estimated phase to zero (pcorr).
         let trim_mppb =
-            (-self.freq_hat_mppb).clamp(-self.cfg.trim_max_mppb, self.cfg.trim_max_mppb);
+            (-self.drift_hat_mppb).clamp(-self.cfg.trim_max_mppb, self.cfg.trim_max_mppb);
         let pcorr_ns = (self.phase_hat / pgain_inv).clamp(-CORR_CLAMP_NS, CORR_CLAMP_NS);
 
         // Lock tracking on the raw measurement.
@@ -367,6 +398,9 @@ impl PhaseController for AlphaBetaBoost {
         } else {
             0
         };
+
+        self.last_trim_mppb = trim_mppb;
+        self.last_pcorr_ns = pcorr_ns;
 
         ControlOutput {
             trim_mppb,
@@ -378,7 +412,7 @@ impl PhaseController for AlphaBetaBoost {
                 pred_ns: phase_pred,
                 p_ns: pcorr_ns,
                 d_ns: 0,
-                observer_freq_mppb: self.freq_hat_mppb,
+                observer_freq_mppb: self.drift_hat_mppb,
                 state: self.boosting as u8,
             },
         }
@@ -389,10 +423,13 @@ impl PhaseController for AlphaBetaBoost {
     }
 
     fn start_segment(&mut self, init: ControlInit) {
-        // Fair segment start: seed the residual trim (freq_hat so that -freq_hat = residual trim),
-        // blank the phase estimate and every counter/state (pcorr starts at 0 → no kick).
+        // Fair segment start: seed the drift estimate so the first emitted trim equals the seed AND
+        // the first predict at a steady (err==0) edge yields zero innovation — output frequency
+        // continuous, pcorr 0, no phantom kick. Blank the phase estimate and every counter/state.
+        self.drift_hat_mppb = -init.residual_trim_mppb;
+        self.last_trim_mppb = init.residual_trim_mppb;
         self.phase_hat = 0;
-        self.freq_hat_mppb = -init.residual_trim_mppb;
+        self.last_pcorr_ns = 0;
         self.boosting = false;
         self.boost_edges = 0;
         self.exit_cnt = 0;
@@ -509,13 +546,16 @@ impl PhaseController for IntegralRework {
                 // transient cannot wind it up (this replaces the I-enable gate), then back-calculate
                 // any trim saturation so the integrator stays consistent with the actuator.
                 let pin = pred.clamp(-self.cfg.e_i_ns, self.cfg.e_i_ns);
-                let want = self.trim_mppb - pin * 1000 / self.cfg.i_den;
+                // `.max(1)` on every divisor: integer divide-by-zero panics on the no_std firmware,
+                // and these denominators are a public, settable API (no in-tree caller passes 0, but
+                // the precondition must be enforced structurally, not just documented).
+                let want = self.trim_mppb - pin * 1000 / self.cfg.i_den.max(1);
                 let clamped = want.clamp(-self.cfg.trim_max_mppb, self.cfg.trim_max_mppb);
-                self.trim_mppb = clamped - (want - clamped) / self.cfg.kbc_inv;
-                p_corr = (pred / self.cfg.kp_inv).clamp(-CORR_CLAMP_NS, CORR_CLAMP_NS);
+                self.trim_mppb = clamped - (want - clamped) / self.cfg.kbc_inv.max(1);
+                p_corr = (pred / self.cfg.kp_inv.max(1)).clamp(-CORR_CLAMP_NS, CORR_CLAMP_NS);
                 if locked {
-                    d_corr =
-                        ((pred - self.last_pred) / self.cfg.d_den).clamp(-CORR_CLAMP_NS, CORR_CLAMP_NS);
+                    d_corr = ((pred - self.last_pred) / self.cfg.d_den.max(1))
+                        .clamp(-CORR_CLAMP_NS, CORR_CLAMP_NS);
                 }
                 self.lock_cnt = if ctrl.abs() < self.cfg.lock_ns {
                     (self.lock_cnt + 1).min(self.cfg.lock_hold)
@@ -627,18 +667,76 @@ mod tests {
     }
 
     #[test]
-    fn alpha_beta_start_segment_seeds_residual_trim() {
+    fn alpha_beta_start_segment_keeps_output_frequency_continuous() {
+        // Regression for the start_segment phantom-innovation defect: the FIRST EMITTED trim after a
+        // switch must equal the seed (not just the getter), with pcorr 0 and no boost — otherwise the
+        // controller injects a self-made phase excursion at every switch that the others don't, biasing
+        // a cross-controller comparison. Check across magnitudes incl. near the trim clamp (where the
+        // old truncation-induced ratchet was ~47 ppb/edge).
+        for seed in [-7_000, 0, 12_345, 2_999_999, -2_999_999] {
+            let mut c = AlphaBetaBoost::new();
+            c.start_segment(ControlInit {
+                residual_trim_mppb: seed,
+            });
+            assert_eq!(c.freq_trim_mppb(), seed, "getter before first edge");
+            assert!(!c.is_locked());
+            let o = drive(&mut c, 0, true); // steady (err==0) first edge
+            assert_eq!(o.trim_mppb, seed, "first emitted trim must equal the seed (seed={seed})");
+            assert_eq!(o.pcorr_ns, 0, "no phase kick on the first post-switch edge");
+            assert_eq!(o.dbg.state, 0, "not boosting on a steady switch");
+        }
+    }
+
+    #[test]
+    fn alpha_beta_boost_does_not_latch_on_periodic_outliers() {
+        // Regression for the phantom-boost latch: a periodic outlier (a spike, then one in-window
+        // edge, repeating) must NOT pin the boost on — the in-window edge is not a disturbance, and the
+        // boost_max_edges backstop must keep ticking through rejected edges. Drive the pattern and
+        // require the boost duty stays low (well under half), not the ~82% the defect produced.
         let mut c = AlphaBetaBoost::new();
-        c.start_segment(ControlInit {
-            residual_trim_mppb: -7_000,
+        let mut out: i64 = 0;
+        for _ in 0..40 {
+            let o = drive(&mut c, out, true);
+            out += o.trim_mppb / 1000 - o.pcorr_ns;
+        }
+        assert!(c.is_locked());
+        let mut boosting = 0;
+        let n = 600;
+        for k in 0..n {
+            // spike past outlier_ns most edges, a clean in-window edge every 13th.
+            let err = if k % 13 == 12 { 0 } else { 50_000 };
+            let o = drive(&mut c, err, true);
+            boosting += o.dbg.state as usize;
+        }
+        assert!(
+            boosting * 2 < n,
+            "boost must not latch on periodic outliers (boosting {boosting}/{n} edges)"
+        );
+    }
+
+    #[test]
+    fn controllers_do_not_panic_on_zero_denominator_config() {
+        // Regression for the divide-by-zero hardening: zero-valued (public) config denominators must
+        // not panic the no_std core. Each `.step` with a zero gain/denominator must return.
+        let mut a = AlphaBetaBoost::with_config(AlphaBetaBoostConfig {
+            steady_alpha_inv: 0,
+            steady_beta_inv: 0,
+            steady_pgain_inv: 0,
+            fast_alpha_inv: 0,
+            fast_beta_inv: 0,
+            fast_pgain_inv: 0,
+            ..AlphaBetaBoostConfig::DEFAULT
         });
-        // The seed is exact before any edge advances the observer (output frequency continuous).
-        assert_eq!(c.freq_trim_mppb(), -7_000);
-        assert!(!c.is_locked());
-        // First edge at zero phase: pcorr 0 (phase_hat blanked → no kick), steady (not boosting).
-        let o = drive(&mut c, 0, true);
-        assert_eq!(o.pcorr_ns, 0);
-        assert_eq!(o.dbg.state, 0);
+        let _ = drive(&mut a, 100, true);
+        let mut i = IntegralRework::with_config(IntegralReworkConfig {
+            i_den: 0,
+            kbc_inv: 0,
+            kp_inv: 0,
+            d_den: 0,
+            ..IntegralReworkConfig::DEFAULT
+        });
+        let _ = drive(&mut i, 0, true); // the sharp kbc_inv 0/0 first-edge case
+        let _ = drive(&mut i, 500, true);
     }
 
     #[test]

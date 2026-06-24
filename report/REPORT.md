@@ -872,3 +872,26 @@ firmware (gen_capture_task) を単一 `PhaseLockLoop` から `gnssdo::Controller
 - firmware は **0 warning でビルド成立**。実機投入 (flash) と PRBS go/no-go は次段 (実機は対話で実行)。
 
 **未決**: 本番 slot 0 のチューニングは現行 firmware 値 (i_den=512/d_den=16) を保持したが、本調査の結論は **i_den=128** (ライブラリ既定。slot 3)。どちらを production にするかは実機 PRBS h[k] (512 が better-damped という旧 PRBS 結果 vs 128 の応答) で決める。
+
+### 敵対的検証ワークフローと ab_boost の欠陥修正 (実機前)
+
+実機に焼く前に、新ライブラリを多エージェントの敵対的検証ワークフロー (20 agents、5 レンズで bug を探し→反証検証、+ 40 seed のロバストネス掃引) にかけた。**12 件中 5 件が確定欠陥**で、いずれも実機比較を歪める/手法を誤評価するものだった。host の 6 seed bench はこれらを隠していた。
+
+| Sev | 欠陥 | 影響 |
+|---|---|---|
+| **P1** | `AlphaBetaBoost::start_segment` が切替で出力周波数の連続性を壊す (観測器が自分の制御入力を無視した open-loop predict + 切替シードの truncation で phantom innovation) | ab_boost だけ切替毎に ~26-34ns の自己位相励起 → **巡回 PRBS 比較が不公平** |
+| **P2** | boost の `lost_lock` が innovation でなく生 `|z|` で発火 | steady wander が lock 窓を跨ぐ度に boost が ~50-80% flap → **潰すはずの共振を再励起** |
+| **P2** | phantom-boost **latch** (零誤差エッジを accepted_disturbance と誤判定 + reject で backstop が starve) | boost が 82% latch → **steady wander 2.15x (14.7→31.6ns)** |
+| P3 | `pub` config 分母のゼロで整数 div-by-zero panic | no_std firmware (panic budget 無) で abort。既定は安全だが API は無防備 |
+| P3 | bench が plant ジッタ seed を 4 副実験で再利用 | no-PIO の標本相関 |
+
+**ロバストネス結論: `ab_boost_win_holds = FALSE` (両エージェント)** — 固定ゲイン α-β に sustained drift の積分器が無く lag (旧コードで 110→2297ns、PI は ~7ns。bench の gentle drift が隠した)、かつ no-PIO レジームで integrator 系に ~8% 劣る。**`IntegralRework` は不安定性ゼロ**。コアは健全 (40 seed で発散/NaN/lock 失敗/limit-cycle 無し) だが、**ab_boost を host model だけで採用してはいけない**。
+
+**修正 (全て回帰テストで pin):**
+- ab_boost を **closed-loop predict** に作り直し: `phase_pred = phase_hat + (drift_hat + last_trim)/1000 − last_pcorr`。観測器が自分の trim/pcorr を勘定に入れ、(a) 切替で phantom が出ず**初回 emit trim = シード** (`alpha_beta_start_segment_keeps_output_frequency_continuous`)、(b) drift 積分器が真の type-II になり harsh drift lag が ~300x→<4x (`ab_boost_does_not_lag_badly_under_harsh_drift`)。
+- `lost_lock` トリガ撤去 — boost は innovation (大ステップ/lock 喪失は大 innovation で出る) と「窓外で受理された持続外乱」のみ。steady wander では発火しない。
+- latch 修正: backstop を**全エッジ** (reject/holdover 含む) で tick、accepted_disturbance は現エッジが窓外のときだけ (`alpha_beta_boost_does_not_latch_on_periodic_outliers`)。
+- 全制御器の分母を `.max(1)` でガード (`controllers_do_not_panic_on_zero_denominator_config`、`zero_denominator_setters_do_not_panic`)。
+- bench の plant ジッタ seed を副実験毎に分離。
+
+修正後の host 再評価 (PIO): ab_boost は reacq 15 (最速)・steady 14.7・drift 14.7 と依然強いが、no-PIO では steady ~1137 と integrator 系 (~1040) に劣る。**採否は実機 PRBS h[k] で決める** (規律 2)。gnssdo 79 unit + 4 integration tests pass、firmware 0 warning。
