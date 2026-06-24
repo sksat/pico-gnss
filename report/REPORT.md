@@ -895,3 +895,37 @@ firmware (gen_capture_task) を単一 `PhaseLockLoop` から `gnssdo::Controller
 - bench の plant ジッタ seed を副実験毎に分離。
 
 修正後の host 再評価 (PIO): ab_boost は reacq 15 (最速)・steady 14.7・drift 14.7 と依然強いが、no-PIO では steady ~1137 と integrator 系 (~1040) に劣る。**採否は実機 PRBS h[k] で決める** (規律 2)。gnssdo 79 unit + 4 integration tests pass、firmware 0 warning。
+
+## 実機 PRBS コントローラ掃引 (ctrlsweep-prbs): ab_boost 採否の結論
+
+実機で `Controller` を同一 boot 巡回し各手法に PRBS (±96ns) を注入、閉ループ外乱インパルス応答 h[k] を受信非依存に同定。解析は多レンズワークフロー (`report/analyze_ctrlsweep_workflow.js`、PPSGEN/CTRLSWEEP のみ参照・NMEA/座標は未読)。**第 1 サイクル (各手法 1 セグメント) の結論:**
+
+### ボトムライン: No-go
+**受信非依存軸 (h[k]) で production (pll_prod) を上回る手法は無い。ab_boost は最も振動的で最下位。** host モデルが推した ab_boost 優位は実機で再現せず。production を据え置く。
+
+### h[k] 共振ランキング (全 5 手法 1 セグメント。jit median=16・rxbad=0 が全セグメント一致 → 受信非依存)
+| 順 | 手法 | peak h | min h | ring(zc) | |
+|---|---|---|---|---|---|
+| 1 (最良) | **pll_prod** | +0.20 | -0.93 | **0** | 単一負ローブ、後続ゼロ交差なし、単調減衰 |
+| 2 | pll_smith128 | +0.46 | -1.04 | 1 | |
+| 2 | naive_pid (Smith 無し) | +0.41 | -0.95 | 1 | 素朴な型 II も実機では十分減衰 |
+| 4 | integ_rework | +0.40 | -0.93 | 5 | |
+| 5 (最悪) | **ab_boost** | **+0.66** | **-1.00** | **7** | 最大オーバーシュート、最長の振動リングダウン |
+
+**重要な控除**: min h の大ローブは全手法で同一ラグ (k≈8) = inject→actuate→readback の構造遅延であって制御器固有の共振ではない。`min h=-1.0 だから ab_boost が悪い`とは読まない。制御器固有の信号は早期応答 (k0..4) と**ローブ後のゼロ交差数**のみ。その軸で ab_boost(zc=7)が明確に最も振動的、pll_prod(zc=0)が最も減衰がよい。これが頑健な結論 (2位/3位の細部は誤差内)。
+
+### ab_boost go/no-go (採用ルール: 共振 ≤ production かつ recovery 改善のときのみ)
+- 共振条件 **FALSE**: peak h・ring zc とも production に劣る。
+- recovery 条件 **未証明**: boost は本キャプチャで一度も発火せず (boost_duty 0.00%、state=1 が 0 回)。発火閾値 innov_enter_ns=3000ns に対し全期間の最大位相偏差 1424ns で届かず。定常 wander を追わない挙動は正しい (host 回帰と一致＝P2 修正が実機で効いている) が、**ab_boost の目的=遷移回復の加速は本実験で未実証**。加えて自然 unlock は ab_boost が最多 (4回)・lockfrac 最低 (0.966)・最大偏差最大。
+- → **両条件とも満たさず不採用**。規律 2 (モデルは欠落制約に楽観、実機が決める) の実例。
+
+### トラップ限界 (外部基準なしには判定不可)
+steady_hwphase_sd (pll_prod 271 / integ_rework 272 / pll_smith128 287 / ab_boost 354) は**精度ランキングに使わない** — 同一受信機の wander を強く追う手法ほど sd は小さく見えるが真 UTC には悪化しうる。平均 hwphase・holdover 絶対精度・Allan も同様に観測不能。判定には外部基準 (独立アンテナ+受信機 / Rb / TIC) が要る。
+
+### 公平性の留保 (第 1 サイクルの限界) と追加計測
+- **順序↔時刻の完全エイリアス**: 各手法 1 セグメント・固定時間順 (~63 分連続) なので、温度/空/受信機ドリフトが「どの手法か」に 1:1 で写る。接近差はドリフトと分離不能 (ab_boost が**明確に最下位**である粗い事実は頑健)。
+- **boot 非対称**: pll_prod のみ電源直後で cold acquisition を負う (warmup 除外しても初期条件同一は不保証)。
+- 第 1 サイクル完走後 naive_pid も full セグメントが揃い評価済 (zc=1、十分減衰)。各手法とも依然 1 セグメントなので順序↔時刻交絡は残る。
+- 完全な de-confound には: interleave + 反復 (ラウンドロビンで各手法 ≥3-4 短セグメント)、boot slot に捨て手法、ab_boost の boost を実際に発火 (≥3000ns ステップ外乱)、温度併記、外部基準。
+
+**現データの確定事項: production を据え置く。ab_boost は受信非依存軸で劣り、その売りの boost は未実証。** ab_boost を覆すには上記 interleave + boost 発火キャプチャが必要だが、その前にまず「最下位」を覆す材料が無い。
