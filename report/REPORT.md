@@ -929,3 +929,65 @@ steady_hwphase_sd (pll_prod 271 / integ_rework 272 / pll_smith128 287 / ab_boost
 - 完全な de-confound には: interleave + 反復 (ラウンドロビンで各手法 ≥3-4 短セグメント)、boot slot に捨て手法、ab_boost の boost を実際に発火 (≥3000ns ステップ外乱)、温度併記、外部基準。
 
 **現データの確定事項: production を据え置く。ab_boost は受信非依存軸で劣り、その売りの boost は未実証。** ab_boost を覆すには上記 interleave + boost 発火キャプチャが必要だが、その前にまず「最下位」を覆す材料が無い。
+
+## サイクル 2: INTERLEAVE + KICK (de-confound + boost 発火)
+
+`logs/pps-interleave-kick.log` (4776 PPSGEN行 / 26 kick / 13 CTRLSWEEP)。サイクル 1 の 2 つの欠陥を埋めた再計測。
+(1) **INTERLEAVE**: 各手法を Latin-square で複数の短セグメント (~300 edge) に分散 → 順序↔時刻ドリフトの完全エイリアスを破る。`report/analyze_prbs.py` がセグメントを cidx ごとに pool する。
+(2) **KICK**: lock 中 150 edge ごとに +8000ns の出力位相ステップ外乱を注入 (kick_ns=8000)。これは outlier_ns=3000 を超え一時的に loop を unlock させる → サイクル 1 では一度も発火しなかった **ab_boost の遷移 BOOST をついに発火させる**。`report/analyze_kick_recovery.py` で回復を直接測る。
+受信非依存の 2 計測: (a) 定常共振 h[k]=crosscorr(±96ns PRBS inj, hwphase)、kick 後 30 edge は除外。(b) kick 回復 (settle edge・boost 発火%)。両者とも注入信号は既知で受信ノイズと無相関。
+
+### ボトムライン: No-go (production を据え置く)
+**受信非依存の 2 軸 (h[k] 共振 / kick 回復) いずれでも production (pll_prod) を上回る手法は無い。** サイクル 1 で唯一未証明だった ab_boost の boost は本パスで毎 kick 100% 発火したが、**それでも回復は全手法中最も遅い**。host モデルが推した ab_boost 優位は実機の 2 軸とも再現せず。
+
+### (2) RECOVERY ランキング — 本パスの決定的新証拠 (kick = 既知 +8000ns ステップ、受信非依存)
+`report/analyze_kick_recovery.py` を live log で再実行 (JSON と一致):
+
+| 順 (速い順) | 手法 | settle中央 | settle p90 | peak中央 ns | boost発火% (n) |
+|---|---|---|---|---|---|
+| 1 | pll_smith128 | 26.0 | 27 | 8448 | 0% (n=2) |
+| 2 | integ_rework | 26.5 | 27 | 8280 | 0% (n=2) |
+| 3 | naive_pid | 28.0 | 29 | 8432 | 0% (n=3) |
+| 4 | pll_prod | 29.0 | 29 | 8096 | 0% (n=3) |
+| 5 (最遅) | **ab_boost** | **30.0** | **30** | 8176 | **100% (n=3)** |
+
+- 全手法 peak ~8.1-8.4kns (kick は MIN_PEAK 3000 を全 event で超えてクリーンに着地)、差は **peak でなく回復速度のみ**に出る。
+- **ab_boost の boost は設計どおり配線され発火した** (3/3 event で state=1)。だが settle は全手法中最遅で、3 event すべて正確に 30 (spread ゼロ＝偶然の外れ値でない)。**機能は動くのに、何もしない PI 制御器より回復が遅い。** これがその存在理由 (遷移回復の加速) に対する決定的 no-go。
+- ab_boost の定常 boost duty = 0.000% (kick 回復窓外では発火せず)。boost ロジックは誤発火していない。単に reacquisition を速めないだけ。
+- **留保 (small n)**: 各手法 kick は 2-3 個・全 settle 範囲 25-30 edge と狭い。1-4 位 (PI 群) の 1-2 step 差は単発ジッタ内で**有意でない** → 「smith128 が最速」は弱主張、1-4 位は同程度の塊と読む。頑健なのは **ab_boost が最遅** (3 event 全て 30、spread ゼロ) のみ。
+
+### (3) RESONANCE — サイクル 1 (クリーンだが交絡) と本パス (de-confound だがノイジー) の整合
+本パスは交絡を破った代わりにセグメントが短く (~380 sample/手法 vs サイクル 1 の ~800)、h[k] はノイジー。live 再計測の h[k] (×100, k=0..15):
+
+| 手法 | min h @lag | 後続オーバーシュート (k14-40) | k13 残差 | 減衰の質 |
+|---|---|---|---|---|
+| **pll_prod** | **-0.84** @2 | **+0.09** (最小) | -0.09 | 最浅ディップ・最小オーバーシュート・最速減衰 |
+| integ_rework | -0.99 @3 | +0.17 | -0.04 | |
+| pll_smith128 | -1.04 @2 | +0.19 | -0.13 | 単一ディップ最深 |
+| ab_boost | -0.97 @2 | +0.29 | -0.01 | 大きい復帰スイング |
+| naive_pid | -1.00 @3 | +0.34 (最大) | -0.16 | 最大オーバーシュート・最遅減衰 |
+
+**整合の honest reading**:
+- スクリプトの `peak h @lag20-35` 列と `ring(zc)` 列は **両パスとも誤導**。本パスで pll_prod の zc=10 は trough 前の正の肩 (k0,1 が +0.09,+0.14) を peak-lag から数えた**スクリプト由来の人工物**で、共振ではない。ab_boost/integ/smith/naive の `peak@lag20-35` は早期共振ピークでなく**尾部の正復帰ローブの大きさ**。peak/zc を hk_head の形なしに読むと結論が反転する。判定は **min h ディップ深さ + 尾部オーバーシュート + 減衰速度**で行う。
+- その軸では **pll_prod が最も減衰がよい** (最浅 -0.84・最小オーバーシュート +0.09・k13 で -0.09 まで減衰)。ab_boost はディップ (-0.97 vs -0.84)・オーバーシュート (+0.29 vs +0.09) とも production に劣る。
+- **サイクル 1 との整合**: サイクル 1 は ab_boost を最下位 (zc=7)・pll_prod 最良 (zc=0) としたが、これは固定順序による順序↔時刻の完全エイリアスと長セグメントの低ノイズが効いていた。本パス (de-confound・短セグメント) では **PI 群 (integ/smith/naive) の細かい順位はノイズ内で入れ替わり、サイクル 1 の clean separation は再現しない**。
+- **頑健に言えるのはこれだけ**: pll_prod が最も減衰がよく、ab_boost は明確に production より振動的。**だが PI 群どうしの共振の優劣は実機で頑健に区別できない** (サイクル 1 の分離は一部が交絡＋低ノイズの産物)。**ランキングが反転したのではなく、「production が最良」と「ab_boost が production に劣る」以外は分離不能、というのが正直な読み**。
+
+### (4) ab_boost go/no-go (採用ルール: 共振 ≤ production **かつ** recovery 改善のときのみ)
+- **共振条件 FALSE**: ab_boost のディップ (-0.97) もオーバーシュート (+0.29) も production (-0.84 / +0.09) に劣る。サイクル 1・本パスとも production を上回らない。
+- **recovery 条件 FALSE (今回ついに証明)**: boost は本パスで毎 kick **100% 発火** (サイクル 1 の「未発火・未証明」状態を解消)。**にもかかわらず回復は全手法中最遅** (settle 30、3 event 全て)。「発火するが速くならない」ことが実機で確定。
+- → **両条件とも満たさず不採用**。サイクル 1 の「boost 未発火で未証明」から、本パスは「boost 発火・しかし改善せず」へ**昇格して棄却**。規律 2 (モデルは欠落制約に楽観、実機が決める) の実例。
+
+### (5) トラップ限界 (外部基準なしには判定不可)
+hwphase = 出力 vs **同一受信機** (firmware/main.rs:493 loopback_phase_ns) のため、以下は本キャプチャでは判定不能:
+- steady_hwphase_sd (pll_prod 238 / integ_rework 281 / pll_smith128 302 / ab_boost 302 / naive_pid 338 ns) を**精度ランキングに使わない**。同一受信機の wander を強く追う手法ほど sd は小さく見えるが真 UTC には悪化しうる。平均 hwphase・holdover 絶対精度・Allan も同様。
+- 受信非依存で valid なのは inj↔hwphase と kick↔hwphase の **cross-correlation のみ** (受信ノイズが平均で消える): すなわち h[k] 共振の形と boost 発火%。
+- アクチュエータ努力 (|Δtrim| per edge) は制御器自身の指令出力なので受信非依存の観測ではあるが、低 sd と低努力の**ペアリング** (pll_prod が ~339 mppb と他の 1/4-1/5 で最小 sd を達成) は behavioral observation に留め、精度主張には使わない。
+- 確定には外部基準 (独立アンテナ+受信機 / Rb / TIC) が要る。
+
+### (6) 残る公平性の留保と追加計測の要否
+- **INTERLEAVE は部分的にしか効いていない**: capture がサイクル途中で停止し、設計の ~5 セグメント/手法に未達。pll_prod/ab_boost/naive_pid は 3 セグメントが早/中/晩に分散し交絡が破れているが、**integ_rework と pll_smith128 は 2 セグメントとも前半**に固まり、順序↔時刻/熱ドリフトのエイリアスが**この 2 手法では破れていない**。両者を他手法と slow-drift 量で比べる主張には caveat が要る。
+- **kick 統計が薄い**: 2-3 kick/手法 (integ/smith は n=2)。settle 中央/p90 は 2-3 点の中央値＝directional のみ、p90 を percentile として読まない。
+- **受信は均一**: median jit=16・rxbad=0 が全手法・全セグメントで一致、jit_p90=32 も均一。両除外窓 (post-switch 120 edge + post-kick 30 edge) が kept_frac 0.54-0.55 で均一適用。reception は弱点でなく、弱点は**切り詰められた・不均一なセグメント数のみ**。
+- **追加計測 (これがあれば判定を覆せるか確かめられる)**: capture を最低 1 サイクル完走させ各手法 ≥5 セグメントを capture 全域に分散 (integ/smith の前半固まりを解消)、kick を各手法 ≥5 個に増やして PI 群内の settle 差を有意化、温度併記、外部基準 (TIC/独立受信機) で steady sd のトラップを外す。
+- **ただし**: 本データで ab_boost を覆す材料は**ない**。共振・回復の受信非依存 2 軸とも production に劣り、唯一の売り (boost) は今回発火して**なお改善しないことが確定**した。追加計測は PI 群内の序列を詰めるためには要るが、**production 据え置きの結論を変える見込みは低い**。
