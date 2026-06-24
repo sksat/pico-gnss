@@ -13,11 +13,12 @@ import re, sys, statistics
 LOG = sys.argv[1] if len(sys.argv) > 1 else "logs/pps-prbs.log"
 MAXLAG = 60
 WARMUP = 120  # 切替後に捨てる整定エッジ(手法に共通の固定 warmup ≳2 周期。non-PLL は固有周期が無いため固定)
+KICK_EXCLUDE = 30  # kick 後に捨てるエッジ数(大振幅の回復過渡で steady h[k] を汚さない。recovery は別解析)
 
 # 制御器インデックス → 名前(firmware の make_controller と対応。表示用)。
 CIDX_NAMES = {0: "pll_prod", 1: "ab_boost", 2: "integ_rework", 3: "pll_smith128", 4: "naive_pid"}
 
-rows = []  # (hw, inj, cidx, lk)
+rows = []  # (hw, inj, cidx, lk, kick)
 for l in open(LOG, errors="ignore"):
     if "PPSGEN" not in l:
         continue
@@ -25,8 +26,10 @@ for l in open(LOG, errors="ignore"):
     inj = re.search(r"\binj_ns=(-?\d+)\b", l)
     cidx = re.search(r"\bcidx=(\d+)\b", l)
     lk = re.search(r"\blk=(-?\d+)\b", l)
+    kk = re.search(r"\bkick_ns=(-?\d+)\b", l)  # 旧ログ(kick 無し)互換: 無ければ 0
     if hw and inj and cidx and lk:
-        rows.append((int(hw.group(1)), int(inj.group(1)), int(cidx.group(1)), int(lk.group(1))))
+        rows.append((int(hw.group(1)), int(inj.group(1)), int(cidx.group(1)), int(lk.group(1)),
+                     int(kk.group(1)) if kk else 0))
 if not rows:
     sys.exit("no PPSGEN inj_ns/cidx rows (need PRBS + CONTROLLER_SWEEP firmware)")
 
@@ -35,7 +38,7 @@ def name(cidx):
     return CIDX_NAMES.get(cidx, f"c{cidx}")
 
 
-# cidx でセグメント分割、各制御器の locked サンプルを束ねる(切替直後の warmup を捨てる)
+# cidx でセグメント分割(interleave で同 cidx が複数の非連続セグメントに出る → 下で cidx 毎に pool)
 segs = []
 i = 0
 while i < len(rows):
@@ -47,9 +50,18 @@ while i < len(rows):
 print(f"# {LOG}: {len(rows)} PPSGEN rows, segments: " +
       " ".join(f"{name(v)}({h-l}e)" for v, l, h in segs))
 
-by_iden = {}  # 旧名のまま(下流の表ロジックは制御器キーで再利用)
+by_iden = {}  # cidx → [セグメントの (hw, inj) ペア列] (旧名のまま。下流の表ロジックを再利用)
 for cidx, lo, hi in segs:
-    seg = [(rows[k][0], rows[k][1]) for k in range(lo + WARMUP, hi) if rows[k][3] == 1]
+    # 切替直後 warmup と「直近 KICK_EXCLUDE エッジ以内に kick があった」エッジを除外し、定常 PRBS 応答だけ残す。
+    seg = []
+    since_kick = KICK_EXCLUDE  # セグメント先頭は kick の影響なしとみなす
+    for k in range(lo, hi):
+        if rows[k][4] != 0:
+            since_kick = 0
+        else:
+            since_kick += 1
+        if k - lo >= WARMUP and rows[k][3] == 1 and since_kick >= KICK_EXCLUDE:
+            seg.append((rows[k][0], rows[k][1]))
     if len(seg) > 100:
         by_iden.setdefault(cidx, []).append(seg)
 

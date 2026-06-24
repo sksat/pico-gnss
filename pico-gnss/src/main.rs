@@ -122,9 +122,20 @@ const DISTURBED_SHIFT: u32 = 0; // 適応無効: 固定 i_den=128。旧 2 (32<<2
 /// 順に切替え、各セグメントに PRBS を注入すれば、受信を揃えた状態で手法差を同定できる (計測トラップ対策。
 /// hwphase = 出力 vs 同じ受信機なので、固定比較や別 boot 比較では受信交絡が手法差に混ざる)。切替は
 /// start_segment で出力周波数を連続にし観測器/Smith/lock を blank = 公平比較。**本番は false** (固定の本番制御器)。
-const CONTROLLER_SWEEP: bool = false;
-const CONTROLLER_SWEEP_EDGES: u32 = 900; // 各手法のセグメント長 (locked エッジ ≈ 秒)。整定 ~2 周期を捨てても標本が残る
+const CONTROLLER_SWEEP: bool = false; // 制御器を同一 boot 巡回する比較実験。**production 既定 false** (固定 slot0)。true で巡回。
+const CONTROLLER_SWEEP_EDGES: u32 = 300; // セグメント長 (locked エッジ)。interleave 用に短く = 各手法を多時刻サンプル
 const CONTROLLER_LIST_LEN: usize = 5;
+/// **interleave スケジュール** (de-confound)。固定順巡回だと「どの手法か」が時刻に 1:1 で写り、温度/受信ドリフト
+/// と分離できない。各 cidx を**異なる時刻・順**で複数回サンプルすれば順序↔時刻交絡を破れる。各ラウンドを巡回シフト
+/// した Latin-square 的並び (5 手法 × 5 ラウンド = 各手法が 5 つの異なる時間帯に出る)。全 25 後に繰り返す。
+/// analyze_prbs.py は cidx で pool するので、同 cidx の複数セグメントが自動的に束ねられ誤差棒が得られる。
+const SWEEP_SCHEDULE: [usize; 25] = [
+    0, 1, 2, 3, 4, //
+    2, 3, 4, 0, 1, //
+    4, 0, 1, 2, 3, //
+    1, 2, 3, 4, 0, //
+    3, 4, 0, 1, 2, //
+];
 /// idx 番目の制御手法を生成 (巡回・本番初期化の単一の出所)。slot 0 = 現行 firmware の本番チューニングを保つ。
 fn make_controller(idx: usize) -> Controller {
     match idx % CONTROLLER_LIST_LEN {
@@ -156,8 +167,17 @@ const RX_JIT_WIN: usize = 8;
 /// hwphase の応答を inj と相互相関すると、受信ノイズ (inj と非相関→平均で落ちる) を分離して**閉ループ伝達**
 /// (共振/実効 damping/帯域) を受信交絡なしに同定できる。制御器を巡回しながら各々に注入すれば、手法ごとの
 /// 復旧応答 h[k] (共振/リンギング) を受信非依存に比較でき、go/no-go の判定軸になる (codex 推奨)。
-const PRBS_INJECT: bool = false;
+const PRBS_INJECT: bool = false; // 各手法に PRBS 注入し h[k] を受信非依存比較する実験。**production 既定 false**。
 const PRBS_AMP_NS: i64 = 96; // ±96ns (16ns 捕捉量子化より十分大、lock 窓 1µs より十分小)
+/// 実験: **boost 強制発火 / 遷移回復計測**。PRBS(±96ns)は線形域の定常共振 h[k] しか測れず、ab_boost の売りで
+/// ある遷移回復 (boost) は発火しないため未評価のままになる。そこでロック中、KICK_PERIOD locked エッジ毎に出力
+/// 位相へ +KICK_AMP_NS のステップ外乱を 1 発注入する。≥ outlier_ns(3000) なので各手法は数エッジ outlier-reject
+/// した後に本物外乱として受理し、ab_boost はそこで boost を発火する。kick イベントに整列して手法ごとの整定
+/// エッジ数を測れば、遷移回復を受信非依存に比較できる(kick は PRBS LFSR と無相関なので h[k] には平均で落ちる
+/// が、回復中の大振幅は h[k] 推定を汚すので解析側で kick 後 ~20 エッジを除外する)。本番は false。
+const KICK_INJECT: bool = false; // boost 強制発火/回復計測の実験。**production 既定 false**。
+const KICK_AMP_NS: i64 = 8000; // outlier_ns(3000) 超の明確なステップ。reject 後受理で boost 発火、lock 窓外
+const KICK_PERIOD: u32 = 150; // locked エッジ毎に 1 発(セグメント 300 に ~2 発、回復が収まる間隔)
 
 /// 定期 K 再較正の cadence (locked 中の出力エッジ数 ≈ 秒)。実効 K の温度ドリフト (#5 後で ~5ns/min) を
 /// 追従する。5分なら最大 ~25ns 振れ → 2桁ns 維持。短くすると holdover 中断が増える tradeoff。
@@ -418,9 +438,10 @@ async fn gen_capture_task(
     // 出力位相の制御器 (gnssdo::Controller)。sub-cycle period 生成 (dither) + period word push は
     // SteeredPpsOutput (rp-pps) が内包するので、ここは freq_mppb と phase_corr を渡すだけ。本番は
     // slot 0 (現行 firmware の PID+Smith チューニング)。CONTROLLER_SWEEP=true で locked 中に巡回する。
-    let mut sweep_idx: usize = 0;
-    let mut controller = make_controller(sweep_idx);
+    let mut sweep_idx: usize = 0; // SWEEP_SCHEDULE 内の位置 (0..25)。実 cidx = SWEEP_SCHEDULE[sweep_idx]。
+    let mut controller = make_controller(SWEEP_SCHEDULE[sweep_idx]);
     let mut edges_since_sweep: u32 = 0;
+    let mut edges_since_kick: u32 = 0; // KICK 注入の locked エッジカウンタ
     // 制御器巡回の公平切替に使う、直近に適用した出力周波数 (= pred_mppb + trim_mppb)。次手法へ residual
     // trim = applied_freq − new_pred を渡し、出力周波数を連続にする (再捕捉を比較に混ぜない)。毎エッジ
     // controller.step 後に代入してから (同一反復の後段の) 切替で読むので、初期値は不要。
@@ -518,22 +539,36 @@ async fn gen_capture_task(
         } else {
             0
         };
+        // boost 強制発火 / 回復計測: ロック中 KICK_PERIOD locked エッジ毎に出力位相へ +KICK_AMP_NS のステップ。
+        // ≥ outlier_ns なので各手法は数エッジ reject 後に受理し、ab_boost はそこで boost 発火 → kick 整列で
+        // 整定エッジ数を手法比較できる。kick イベントは kick_ns でログし、解析は kick 後窓を h[k] から除外する。
+        let kick_inj = if KICK_INJECT && u.locked {
+            edges_since_kick += 1;
+            if edges_since_kick >= KICK_PERIOD {
+                edges_since_kick = 0;
+                KICK_AMP_NS
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         // 周期語を保持: 再較正中の holdover 生 push に再利用 (dither はこの通常経路でのみ前進)。
-        last_period = output.set_next_period(freq_mppb, u.pcorr_ns + prbs_inj);
+        last_period = output.set_next_period(freq_mppb, u.pcorr_ns + prbs_inj + kick_inj);
         if let Some(iv) = interval_ns {
             count += 1;
             // 制御信号を全部出力 → ホストでプラント同定 + 制御器比較 + 項別比較ができる。
             // 互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残す。cidx=制御器インデックス
             // (CONTROLLER_SWEEP の segment 鍵)、state=制御器の内部状態コード (ab_boost の boost 等)。
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
                 phase.unwrap_or(0),
                 hwphase_ns,
                 u.trim_mppb / 1000,
-                sweep_idx as u32,
+                SWEEP_SCHEDULE[sweep_idx] as u32,
                 u.dbg.p_ns,
                 u.dbg.d_ns,
                 u.trim_mppb,
@@ -543,7 +578,8 @@ async fn gen_capture_task(
                 u.dbg.state,
                 RECEPTION_JITTER.load(Ordering::Relaxed),
                 RECEPTION_BAD.load(Ordering::Relaxed),
-                prbs_inj
+                prbs_inj,
+                kick_inj
             );
         }
         last_x = Some(x);
@@ -558,12 +594,14 @@ async fn gen_capture_task(
                 edges_since_sweep += 1;
                 if edges_since_sweep >= CONTROLLER_SWEEP_EDGES {
                     edges_since_sweep = 0;
-                    sweep_idx = (sweep_idx + 1) % CONTROLLER_LIST_LEN;
-                    controller = make_controller(sweep_idx);
+                    edges_since_kick = 0; // 新セグメント先頭で kick 位相を揃える
+                    sweep_idx = (sweep_idx + 1) % SWEEP_SCHEDULE.len();
+                    let cidx = SWEEP_SCHEDULE[sweep_idx];
+                    controller = make_controller(cidx);
                     controller.start_segment(gnssdo::ControlInit {
                         residual_trim_mppb: last_applied_freq_mppb - pred_mppb,
                     });
-                    info!("CTRLSWEEP idx={} name={}", sweep_idx as u32, controller.name());
+                    info!("CTRLSWEEP idx={} name={}", cidx as u32, controller.name());
                 }
             }
             edges_since_recal += 1;
