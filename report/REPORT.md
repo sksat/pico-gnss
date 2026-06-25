@@ -1047,3 +1047,21 @@ hwphase = 出力 vs **同一受信機** (firmware/main.rs:493 loopback_phase_ns)
 - 解析: `report/analyze_postime.py`(座標非出力)。
 
 **到達点**: wander は「underdamped ループ共振 × 受信機広帯域励起」で、基準が真 UTC に揺れる説は否定。励起の内訳(ジッタ/位置結合/共通環境要因)と stationary の効きは方向は出たが交絡が残る。床を下げる道は (a) ループ減衰(反転ノブで困難、制御器掃引で確認済)、(b) 受信機励起の低減(硬い position-hold のタイミング受信機、良アンテナ=multipath 低減、qErr)。
+
+### 追い込み: i_den 5点掃引 + P-only で 144s = ループ固有モードを airtight 化
+
+codex 提案の決め手計測。firmware を i_den=64/128/256/512/1024 + P-only の 6 config 掃引(PRBS 注入、各 ~700 edge)にして閉ループ周波数応答 |H(f)| と自己相関周期を config 別に出した(uncommitted 実験、後に production へ revert)。
+
+| i_den | 理論 2π√i_den | 実測共振周期 | peakゲイン | coherence |
+|---|---|---|---|---|
+| 64 | 50s | **51s**(周波数応答) | 23× | 0.73 |
+| 128 | 71s | 64–73s | 22× | 0.74 |
+| 256 | 101s | 125s(自己相関) | 10× | 0.82 |
+| 512 | 142s | **158s**(=本番 144s) | 13× | **0.99** |
+| 1024 | 201s | 313s(自己相関) | 9× | 0.94 |
+
+- **周期が i_den とともに単調増加し 2π√i_den を ~1.5× 内で追う**(係数ズレは Smith/D/FF/整数のため)。低 i_den は周波数応答(coh 0.73 で 51s≈理論50s)、高 i_den は自己相関(nfft 非依存)で補完。**coherence 0.99(i_den=512)= その帯域の hwphase は純粋に PRBS 注入駆動**=受信機ノイズでなくループ共振。→ **144s wander = ループ underdamped type-II 固有モードで確定(全 5 点、受信非依存)**。
+- **P-only は共振が消えない**(ゲイン 12.8, 周期 352s)。予測外れだが理由が示唆的: P-only は PLL の I 項を切るが **feedforward(DisciplinedClock の α-β predicted_freq)は残る**ので、ループにまだ積分要素がある。→ 144s 共振は **PLL-I + FF の合成 type-II** で、単一項でない。クリーンな type-I テストには FF-off フラグが要る(未配線)。
+- nfft=256 の低周波分解能の天井で周波数応答は高 i_den の周期を過小評価(256/512 が両方 128s、1024 が誤検出 85s)。自己相関で補正。
+
+**到達点(ループ側)**: 144s はループ固有モードで airtight(5 点 i_den スケール + coherence 0.99)。励起源(受信機広帯域)と stationary 抑制は方向は出たが交絡が残る(codex 指摘、FF-off と mobile/stationary 交互反復で更に詰められる)。
