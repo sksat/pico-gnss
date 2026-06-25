@@ -1017,3 +1017,33 @@ hwphase = 出力 vs **同一受信機** (firmware/main.rs:493 loopback_phase_ns)
 - wander の支配機構は実機で同定しきれない(幾何・温度[既出]・受信ジッタ[既出]無相関、位置はピン留めで不可視)。
 - **次の一手は受信機交換**: u-blox タイミング系(NEO/LEA-M8T, ZED-F9T)。一つで (1) **qErr/sawtooth 出力**(TIM-TP)→ ns 級 sawtooth を引ける(qErr 補正コアは gnssdo 実装済)、(2) **真の survey-in + position-hold**→ coupling が本物なら根で断て、かつ**機構を最終確認**(現受信機では不可)、を同時に解く。併せて**温度ログ**で crystal-thermal と受信機 wander を初めて分離。
 - 解析ツール `report/analyze_postime.py`(座標非出力)を残す。
+
+## wander 機構の同定: ループ共振 × 受信機励起(基準 wander 説は否定、自分+smart-friend 独立分析)
+
+「hwphase の ~145–206ns / 周期~144s の wander は受信機由来か出力ループ由来か」を、複数手法で実機検証し、**自分と smart-friend(codex)で独立に分析**して突き合わせた(codex にはログを渡さず数値のみ=座標保護)。出発点の「基準が真 UTC に対し揺れる/reception-limited」は**過剰主張で、修正された**。
+
+### 検証チェーン(全て実データ、座標非出力)
+1. **スペクトル分解**(stationary 22h): hwphase は 88% が 64–300s 帯・ピーク 144s。受信機由来の slope は別周期 392s、trim も 392s。64–300s 帯で r(hwphase, slope)=−0.02。→ 144s は受信機系列に無い。
+2. **i_den 周期スケール**: i_den=128→111s, 512→193s(自己相関)。**周期がノブで動く=ループ固有モード**(受信機固定 wander なら不変のはず)。
+3. **PRBS 閉ループ周波数応答**(受信非依存): \|H(f)\| が 40–256s 帯にピーク、ゲイン **8.6–11.6×**(Q~10 underdamped)、coherence 0.57–0.74。ピーク周期が **√i_den で 2.0 倍**にスケール(64s→128s)。→ **共振を周波数領域で直視、ループ固有モード確定**。
+4. **非リミットサイクル**: hwphase 自己相関が 1 周期で減衰(包絡 0.48→0.02)。注入線形性ではなくノイズ駆動。
+5. **励起源 = 受信機**: 隣接エッジ差 σ=15ns(=16ns PIO 床)。jit と hwphase σ のブロック相関 r=+0.47。
+6. **オシロ独立裏取り**(DHO804、CH1=GPS/CH2=出力): output−GPS σ=92ns(PIO と整合)。**相対 wander は実在**(PIO アーティファクトでない)。ただし相対=トラップで loop/受信機は分離せず。
+7. **受信機 dynamic model A/B**(PMTK886,4 stationary ↔ 886,0 mobile): mobile で hwphase σ=206ns(stationary 145ns、+2.6σ)、位置が wander(RMS 北12m)。**位置偏差 vs 制御量が相関**: r(hwphase,北)=−0.50, r(trim,北)=−0.69, **ゼロラグ**でピーク(同一エポックで位置と時刻を共決定=position-time coupling と整合)。stationary は位置をピン留め(0m)し wander を抑制。
+
+### 和解した機構(自分 × codex、両者一致)
+- **144s = ループの underdamped 閉ループ固有モード**(2,3 で確定。周期と Q をループが決める)。
+- **受信機由来の広帯域ノイズが連続励起**(3 の coherence、5 の jit 相関)。392s=低速周波数経路(slope/trim)、144s=位相閉ループ共振、と分かれる。
+- 受信機励起には **position-coupling 成分**(7、stationary が抑制)と **per-edge ジッタ成分**(5)があり、**両方が共通の環境要因(multipath/SV 幾何)由来の可能性**。
+
+### codex の押し戻し(過剰主張の修正、明記)
+- 「励起は2成分で閉じた」は強すぎ: r=0.47 は寄与の証拠で主因の証明でない。jit は SV 配置/C/N0/multipath の代理かも。
+- 「position-coupling を単独原因と確定」は強すぎ: mobile は位置解だけでなく速度フィルタ/スムージング/PPS 選別/内部時刻フィルタ全体を変える=**交絡**。正確には「位置解 wander と連動する成分を抑えている可能性が高い」。
+- +2.6σ は単一 20 分窓 vs 分布で A/B サンプル不足(stationary σ も 97–220 と振れる)。決め手には mobile/stationary 交互反復が要る。
+
+### 未確認(両者一致)・追加計測
+- 「基準 PPS が真 UTC に対し揺れる/出力が真 UTC からどれだけ」= **絶対時刻品質は相対計器(hwphase/このオシロ)では不可**。TIC/Rb/2台目受信機/独立 PPS が要る。
+- 決め手の追加計測(現ハードで可): i_den 5 点掃引(周期連続性)、d_den 掃引(Q 変化)、mobile/stationary 交互反復(交絡除去)、PLL を P-only/FF-off(144s ピーク変化)、注入振幅線形性(リミットサイクル排除)。
+- 解析: `report/analyze_postime.py`(座標非出力)。
+
+**到達点**: wander は「underdamped ループ共振 × 受信機広帯域励起」で、基準が真 UTC に揺れる説は否定。励起の内訳(ジッタ/位置結合/共通環境要因)と stationary の効きは方向は出たが交絡が残る。床を下げる道は (a) ループ減衰(反転ノブで困難、制御器掃引で確認済)、(b) 受信機励起の低減(硬い position-hold のタイミング受信機、良アンテナ=multipath 低減、qErr)。
