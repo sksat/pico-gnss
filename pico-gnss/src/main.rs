@@ -59,6 +59,7 @@ mod mt3333;
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    ADC_IRQ_FIFO => embassy_rp::adc::InterruptHandler;
 });
 
 /// GPSDO 状態 (rp-pps の一体型 state bundle = gnssdo 規律 + PPS↔NMEA 対応付け)。pps_task が
@@ -202,6 +203,26 @@ static C0_GEN: AtomicU32 = AtomicU32::new(0);
 static RECEPTION_BAD: AtomicU32 = AtomicU32::new(0);
 /// 直近の GPS 間隔ジッタ (ns, ログ用)。
 static RECEPTION_JITTER: AtomicU32 = AtomicU32::new(0);
+
+/// RP2040 内蔵温度センサの生 ADC 値 (12bit)。temp_task が ~2s 毎に更新し PPSGEN ログに出す。
+/// ℃ 換算: `27 - (raw*3.3/4096 - 0.706)/0.001721` (データシート式)。水晶/受信機でなく MCU 温度で、
+/// 単発は ±数℃ とノイジー (運用時の傾向監視向け)。**規律コア (gnssdo) には入れない** — これは
+/// example firmware の運用監視機能で、規律ロジックは温度非依存に保つ (HAL/ADC をコアに持ち込まない)。
+static TEMP_RAW: AtomicU32 = AtomicU32::new(0);
+
+/// 内蔵温度センサを定期サンプルして TEMP_RAW に積む (運用時の熱監視。制御には未使用、ログのみ)。
+#[embassy_executor::task]
+async fn temp_task(
+    mut adc: embassy_rp::adc::Adc<'static, embassy_rp::adc::Async>,
+    mut ch: embassy_rp::adc::Channel<'static>,
+) {
+    loop {
+        if let Ok(raw) = adc.read(&mut ch).await {
+            TEMP_RAW.store(raw as u32, Ordering::Relaxed);
+        }
+        Timer::after_secs(2).await;
+    }
+}
 
 
 /// gen_capture_task 用の高優先度割込エグゼキュータ。ループバックエッジ→Instant 読みの
@@ -561,7 +582,7 @@ async fn gen_capture_task(
             // 互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残す。cidx=制御器インデックス
             // (CONTROLLER_SWEEP の segment 鍵)、state=制御器の内部状態コード (ab_boost の boost 等)。
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
@@ -579,7 +600,8 @@ async fn gen_capture_task(
                 RECEPTION_JITTER.load(Ordering::Relaxed),
                 RECEPTION_BAD.load(Ordering::Relaxed),
                 prbs_inj,
-                kick_inj
+                kick_inj,
+                TEMP_RAW.load(Ordering::Relaxed)
             );
         }
         last_x = Some(x);
@@ -753,6 +775,11 @@ async fn main(spawner: Spawner) {
     spawner_high.spawn(pps_task(capture).unwrap());
     spawner.spawn(time_task().unwrap());
     spawner_high.spawn(gen_capture_task(output, sm2, k, cfg_gp2, cfg_gp4).unwrap());
+
+    // 内蔵温度センサ (運用時の熱監視。規律には未使用、PPSGEN ログに temp_raw を出すだけ)。
+    let adc = embassy_rp::adc::Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
+    let ts = embassy_rp::adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
+    spawner.spawn(temp_task(adc, ts).unwrap());
 
     // UART0: TX=GP0 (モジュール設定送信), RX=GP1 (NMEA 受信)。
     static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
