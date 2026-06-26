@@ -1085,9 +1085,9 @@ mobile/stationary を 6 分ごとに交互切替(PMTK886,0↔886,4、PPSGEN の 
 
 **機構同定の最終像(多手法+dual+追い込み)**: 144s wander = ループ underdamped type-II 固有モード(i_den 5点+coherence 0.99 で airtight)× 受信機広帯域励起。受信機側は dynamic model に依存し、**stationary が wander を増やす**(mobile が良、paired 6/6)。当初の「基準 wander/reception-limited」「stationary が抑制」は**いずれも実機検証で否定・反転**された。床を下げる道: ループ減衰(反転ノブで困難)、受信機励起の低減(良アンテナ=multipath 減、dynamic model 再検討、真の position-hold タイミング受信機+qErr)。絶対時刻品質は外部基準(TIC/Rb/2台目/raw)が要る。
 
-## 制御器+ゲイン掃引 (温度・オシロ込み, `gainsweep-prbs`): 受信律速を確定 — ゲインも制御器も本番を超えない
+## 制御器+ゲイン掃引 (温度・オシロ込み, `gainsweep-prbs`): ゲイン/制御器では下げられない — 受信側律速を示唆
 
-前節で「床を下げるにはループ減衰だが反転ノブで困難」とした点を、**6 config を完全 interleave + PRBS + 温度 + オシロ同時計測**で airtight に詰めた(uncommitted 実験、production へ revert 済。解析 [`report/gainsweep_analysis.py`](gainsweep_analysis.py)、オシロ連続収録 [`scripts/scope_logger.py`](../scripts/scope_logger.py))。
+前節で「床を下げるにはループ減衰だが反転ノブで困難」とした点を、**6 config を完全 interleave + PRBS + 温度 + オシロ同時計測**という強い統制下で詰めた(uncommitted 実験、production へ revert 済。解析 [`report/gainsweep_analysis.py`](gainsweep_analysis.py)、オシロ連続収録 [`scripts/scope_logger.py`](../scripts/scope_logger.py))。
 
 **指標の定義**(本節の表で初出):
 - **hwphase** = firmware が PIO で GP4 loopback(規律出力)と GP2(GPS PPS)の立ち上がりを ~16ns 捕捉した `出力 − GPS` 位相(既出 L77–78・L210)。閉ループの追従誤差で、制御に使う自己計測。
@@ -1108,17 +1108,18 @@ mobile/stationary を 6 分ごとに交互切替(PMTK886,0↔886,4、PPSGEN の 
 
 (各 config 3 セグメントの中央。**jit=16・温度 22.9℃ が全 config 一致** = 受信・熱を揃えた統制実験。)
 
-**3 つの決定的所見:**
+**3 つの所見(統制は強いが留保付き。smart-friend=codex の敵対的レビューで過剰主張を是正):**
 
-1. **ゲインも制御器も本番を超えない。** i_den=512(本番 d16 と d4 変種)が最良域(~240ns)。**overdamp 側へ振った iden1024/d64 はむしろ悪化(296)**、低 i_den(128)もわずかに悪い、代替制御器(integ_rework 329, ab_boost 378)は明確に劣る。jit が全 config 16 で揃うので σ 差は受信差でなく**制御差**。→ **「ループ減衰で床を下げる」は反転ノブで困難**を実証(前節の予測を確認)。
+1. **ゲインも制御器も本番を超えない。** i_den=512(本番 d16 と d4 変種)が最良域(~240ns)。**overdamp 側へ振った iden1024/d64 はむしろ悪化(296)**、低 i_den(128)もわずかに悪い、代替制御器(integ_rework 329, ab_boost 378)は明確に劣る。jit が全 config 16 で揃い各 config を複数時間帯へ散らした interleave で slow drift も平準化したので、σ 差は主に**制御差**と読める(ただし jit median は短期エッジ jitter の一致を示すだけで、遅い position-time wander・衛星配置・受信機内部状態までは統制しきれない)。→ **現行ノブと実装済み代替では measured σ を大きく下げる見込みは低い**(「ループ減衰で床を下げる」が反転ノブで困難という前節予測と整合)。
 
-2. **温度交絡を棄却。** 温度 vs hwphase σ のブロック相関は interleave の蓄積で **r=+0.84(10ブロック)→ +0.60 → +0.16(18ブロック)** と消えた。初期の高相関は「高 σ config がたまたま少し後=わずかに高温の時間帯に走った」時間交絡で、真の熱機構ではない。温度の実スイングも平滑後 ~1℃(生 min/max は単発 ADC ノイズ)。→ **wander に有意な熱成分なし**(規律 2: interleave が交絡を割った好例)。
+2. **温度交絡はこのランでは検出されず。** 温度 vs hwphase σ のブロック相関は interleave の蓄積で **r=+0.84(10ブロック)→ +0.60 → +0.16(18ブロック)** と消えた。初期の高相関は「高 σ config がたまたま少し後=わずかに高温の時間帯に走った」時間交絡だった。ただし温度実スイングは平滑後 ~1℃・MCU 内蔵温度(水晶/受信機/アンテナではない)・18 ブロックなので、**「熱成分が小さい/この条件で支配的でない」までで、熱成分ゼロの証明ではない**(config を回帰で落とした残差 vs 温度や within-config slope でさらに詰まる)。
 
-3. **独立計器で裏取り。** scope σ が PIO σ と**同順**(238/258, 240/256, 296/308, 329/359, 378/395)で、相互相関 **r=+0.97**(ラグ ≈0、~3千 shot)で出力/GPS が pulse-by-pulse 対応。→ PIO 相対測定は信用してよい。
+3. **独立計器で大局裏取り。** scope σ は PIO σ と**大局的に同傾向**(低 σ 群 238–256 vs 高 σ 群 329–395)で、相互相関 **r=+0.97**(ラグ≈0、~3千 shot)で出力/GPS が pulse-by-pulse 対応。→ PIO 相対測定に大きな破綻はない。ただし**完全同順ではない**(iden128 は PIO 253<iden1024 296 だが scope 311>308 と逆転)ので、r=0.97 は計測の健全性の裏取りであって config 細順位の保証ではない。
 
 **正直な留保:**
-- σ の**絶対値(~240ns)は全 config 共通の ±96ns PRBS で水増しされた相対ストレステスト値**で、本番の無注入スペック(窓依存 ~35–138ns、前出)ではない。**有効なのは config 間の相対順位**。
-- **PRBS 共振 G は per-config では測れない**: 300 edge 窓が高 i_den の共振周期(iden512→142s, iden1024→201s)を 1 周期も張れず Welch が立たない(データ長の限界、どの指標でも resolve 不能)。per-config 共振の決着は別途の長時間 i_den 掃引(period∝√i_den 確認済、前節)に委ね、本掃引は **jit-matched σ** で読む。PRBS はここでは受信非依存の**相互相関アライメント**(r=0.97)として働いた。
+- σ の**絶対値(~240ns)は全 config 共通の ±96ns PRBS で水増しされた相対ストレステスト値**で、本番の無注入スペック(窓依存 ~35–138ns、前出)ではない。さらに注入の出力への寄与は config ごとの閉ループ伝達で変わる(観測 σ ≈ 自然wander + PRBS応答 + 相互項)ので、**PRBS 注入下の順位を無注入時順位へそのまま外挿するのは弱い**。有効なのは「注入下ストレス順位」。
+- **短セグメント巡回の再整定ペナルティ**: 制御 trait は切替時に観測器/Smith/D/lock 履歴を blank する(出力周波数は連続)。固有周期 142–201s の高 i_den に先頭 60 edge burn-in は短く、**iden1024/d64 の悪化は「本番定常性能」でなく短セグメント再整定ペナルティを一部含む可能性**がある(長セグメント単独走行での再確認が要る)。
+- **PRBS 共振 G は per-config では測れない**: 300 edge 窓が高 i_den の共振周期(iden512→142s, iden1024→201s)を 1 周期も張れず Welch が立たない(データ長の限界)。per-config 共振の決着は別途の長時間 i_den 掃引(period∝√i_den 確認済、前節)に委ね、本掃引は σ で読む。PRBS はここでは受信非依存の**相互相関アライメント**(r=0.97)として働いた。
 - scope は **200ns/div で収録**(50ns/div=±250ns 窓だと wander が画面外に出る瞬間を選択的に落とし scope σ を下偏させる罠を踏み、是正。oscilloscope-timing skill #4 に追記)。
 
-**含意**: 本番の i_den=512 は既に最良域で、ゲイン調整・制御器変更では wander を削れない。**床は受信機励起が律速**で、下げる道は制御側でなく受信側(良アンテナで multipath 減、真の position-hold + qErr のタイミング受信機)。「制御器を変えれば共振を潰せる」期待は、温度・第3計器・完全 interleave 込みで**否定**された。
+**含意(過剰主張を避けた言い方)**: 本 sweep の ±96ns PRBS・短セグメント interleave 条件では、i_den=512 系が最良域で、試した overdamp/代替制御器は PIO/scope の相対測定で改善を示さなかった。→ **現行ノブと実装済み代替で measured output−GPS σ を大きく下げる見込みは低い**。一方、(a) 無注入時順位、(b) hwphase は同一受信機 PPS 相対で「出力が綺麗か/受信機 PPS が揺れているだけか」を分離できない(計測トラップ)。よって**「受信側が床を律速」は有力仮説であって確定ではない**。次の床下げ仮説(受信機 PPS / position-time coupling)は外部基準または timing 受信機で独立に検証する。当初の「制御器を変えれば共振を潰せる」期待が本条件で支持されなかった、までが言える。
