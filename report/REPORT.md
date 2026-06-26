@@ -1065,3 +1065,22 @@ codex 提案の決め手計測。firmware を i_den=64/128/256/512/1024 + P-only
 - nfft=256 の低周波分解能の天井で周波数応答は高 i_den の周期を過小評価(256/512 が両方 128s、1024 が誤検出 85s)。自己相関で補正。
 
 **到達点(ループ側)**: 144s はループ固有モードで airtight(5 点 i_den スケール + coherence 0.99)。励起源(受信機広帯域)と stationary 抑制は方向は出たが交絡が残る(codex 指摘、FF-off と mobile/stationary 交互反復で更に詰められる)。
+
+### 受信機 dynamic model の paired A/B: stationary は wander を**増やす**(以前の主張を反転)
+
+mobile/stationary を 6 分ごとに交互切替(PMTK886,0↔886,4、PPSGEN の `dynmode` 欄に記録)し、隣接ペアで比較した(同一アンテナ・近接時刻 = slow drift を相殺。uncommitted 実験、production へ revert 済)。
+
+| mode | hwphase σ(各6分窓) | 中央 |
+|---|---|---|
+| stationary (886,4) | 217,189,187,237,155,182,158 | 187ns |
+| mobile (886,0) | 142,67,78,73,111,157 | 95ns |
+
+**隣接ペア(mobile σ − stationary σ): −76,−122,−109,−164,−44,−25 → 平均 −90ns、6/6 全て負。**
+
+→ **mobile の方が hwphase wander が小さい。stationary(886,4)は wander を ~90ns 増やす。** これは前節までの単一窓比較(mobile 206 > stationary 145 → 「stationary が抑制」)を**反転・否定**する。あの比較は交絡(mobile capture がたまたま高 wander の時間帯、stationary は 22h 平均)で、codex の「単一窓は A/B 不足」がまさに的中した(規律 2 の好例)。
+
+**機構の解釈**: MT3333 の stationary は soft な拘束で位置を**出力上**ピン留めするだけで、multipath 誤差が位置に吸われず**時刻解へ押し込まれる**(位置固定の代償)→ PPS wander 増 → hwphase wander 増。真のタイミング受信機の position-hold(raw で clock を over-determine)とは**逆**。良受信下では stationary が時刻を悪化させる。
+
+**実用上の含意(要検討)**: 本番 firmware は OP_MODE=FixedTiming(886,4 stationary)。この A/B では 886,0(mobile)の方が wander が ~90ns 小さい。firmware コメントの「stationary が timing を助ける」(GPT-5.5 助言)は**良受信では逆**。ただし留保: (a) hwphase は相対(計測トラップ)で真 UTC 近さは未測、(b) 6 ペア・良受信のみ(弱信号では stationary の位置/速度安定化が効く可能性)、(c) 本番切替は外部基準での裏取りが望ましい。
+
+**機構同定の最終像(多手法+dual+追い込み)**: 144s wander = ループ underdamped type-II 固有モード(i_den 5点+coherence 0.99 で airtight)× 受信機広帯域励起。受信機側は dynamic model に依存し、**stationary が wander を増やす**(mobile が良、paired 6/6)。当初の「基準 wander/reception-limited」「stationary が抑制」は**いずれも実機検証で否定・反転**された。床を下げる道: ループ減衰(反転ノブで困難)、受信機励起の低減(良アンテナ=multipath 減、dynamic model 再検討、真の position-hold タイミング受信機+qErr)。絶対時刻品質は外部基準(TIC/Rb/2台目/raw)が要る。
