@@ -150,5 +150,9 @@ if len(H) > 2000:
     rr = np.corrcoef(bt, bs)[0, 1] if bt.std() > 1e-3 else float("nan")
     print(f"\n# 温度 vs hwphase σ ブロック相関 r={rr:+.2f} ({nb}ブロック) → |r|大なら wander に熱成分")
 print("# PIO σ と scope σ が config 間で同順なら、PIO 相対測定が独立計器で裏取りされた。")
-print("# iden1024/d64(最 overdamp)が prod より PIO σ・共振 G とも明確低 →『ゲインで削れる』。"
-      "全 config 誤差内 →『受信律速』。")
+print("# 受信は jit で統制: config 間で jit が揃っていれば σ 比較は受信差でなく制御差を見ている。")
+print("# 共振 G(PRBS Welch)は 300 エッジ窓では高 i_den の長周期(iden512→142s, iden1024→201s)を")
+print("#   1 周期も張れず nan になる(データ長の限界、どの指標でも resolve 不能)。per-config 共振の決着は")
+print("#   別途の長時間 i_den 掃引(period∝√i_den を確認済)に委ね、ここは jit-matched σ で読む。")
+print("# 読み: 最 overdamp iden1024/d64 が prod より σ 高(jit 同等)→『overdamp 側に振っても削れない・むしろ悪化』。")
+print("#       prod/低 i_den が最良で全代替が劣る → ゲイン/制御器調整では削れない=受信律速を支持。")
