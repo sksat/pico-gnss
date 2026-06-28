@@ -41,8 +41,10 @@ CLIP_FF = 200_000      # ff_delta single lock-acquisition spikes (~-1.3e6) -> dr
 # ff_delta (temp-FF contribution) shares the temp panel on a twin axis since it is derived from temp.
 PANELS = [
     (("offset / hwphase [ns]", [("scope offset", "off", "tab:blue"), ("fw hwphase", "hwphase", "tab:orange")], 0.0, 100.0), None),
-    (("time err [ns]", [("err_ns", "err", "tab:purple")], 0.0, None), None),
-    (("crystal ppb", [("ppb", "ppb", "tab:green")], 0.0, None), None),
+    # err (left, 0 nominal) + ppb (right twin). ppb ref=None so the axis zooms to its data
+    # range (nominal 0 is ~2500ppb away and would flatten the ~tens-of-ppb variation).
+    (("time err [ns]", [("err_ns", "err", "tab:purple")], 0.0, None),
+     ("crystal ppb", [("ppb", "ppb", "tab:green")], None, None)),
     (("temp_raw (x256)", [("temp_raw", "temp", "tab:red")], None, None),
      ("ff_delta [mppb]", [("ff_delta", "ff_delta", "tab:brown")], 0.0, None)),
 ]
