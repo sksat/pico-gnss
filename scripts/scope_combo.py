@@ -20,10 +20,15 @@ Set RIGOL_HOST=<scope-ip>. Usage:
 """
 import os, sys, io, re, json, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+try:
+    FONT = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 22)
+except Exception:
+    FONT = ImageFont.load_default()
 
 CLIP_NS = 100_000      # pre-lock hwphase/err garbage (e.g. -222e6) -> drop
 CLIP_FF = 200_000      # ff_delta single lock-acquisition spikes (~-1.3e6) -> drop
@@ -141,6 +146,13 @@ def render_gif(series, png_bytes, out):
     for i in range(len(series)):
         panel = render_panel(series, i, xlim, ylims)
         top = Image.open(io.BytesIO(png_bytes[i])).convert("RGB")
+        s = series[i]                                  # overlay t/PPS#/offset/scale on the scope image
+        off = s.get("off")
+        txt = (f"t={s['t']:.0f}s  PPS#{i+1}  offset={off:+.1f} ns  {s['sdiv']*1e9:.0f} ns/div"
+               if off is not None else f"t={s['t']:.0f}s  PPS#{i+1}  {s['sdiv']*1e9:.0f} ns/div")
+        d = ImageDraw.Draw(top)
+        d.rectangle([8, 60, 8 + 11 * len(txt), 96], fill=(0, 0, 0))
+        d.text((14, 62), txt, fill=(255, 255, 0), font=FONT)
         if top.width != W:
             top = top.resize((W, round(top.height * W / top.width)))
         if panel.width != W:
