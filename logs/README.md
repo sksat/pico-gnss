@@ -1,24 +1,32 @@
 # logs/
 
-firmware の RTT 実行ログ(`pps-*.log` = `cargo run` の defmt 出力)と、オシロのモニタ出力
-(`offset-*.log` = scope_pps / offset_wander 系)を置く。
+実機試行の作業ディレクトリ。**コミットしない**(`/logs/*` を gitignore、この README だけ追跡)。理由:
 
-**コミットしない(.gitignore 済み)。理由:**
-
-- 大きい(1本で数十 MB、defmt の生ストリーム)。
+- 大きい(RTT 1本で数十 MB、defmt の生ストリーム)。
 - NMEA センテンスに**測位座標**が含まれる。リポジトリに残してはいけない。
 - scope を実 IP(`RIGOL_HOST`)で駆動した文脈も混ざりうる。
 
-`.gitignore` は `logs/` 配下を無視し、この README だけ追跡する。
+## 構成: 1 試行 = 1 サブディレクトリ
+
+1 回の試行ごとに `logs/<YYYYMMDD>-<topic>/` を切り、その試行の成果物を全部そこに入れる:
+
+- firmware の RTT 実行ログ(`pps-*.log` = `cargo run` の defmt 出力)
+- オシロのモニタ出力・スクショ・GIF(`scope_logger.py` / `scripts/scope_raw.py` の生成物)
+- 解析の中間生成物、ログ抜粋など
+- **その試行専用の単発スクリプト**(使い捨て。再利用可能になったら `scripts/` へ昇格)
+
+`logs/` 配下は丸ごと無視されるので、サブディレクトリ内は自由に散らかしてよい。
+真に再利用可能なスクリプトだけ repo top の `scripts/` に置く(env で機器 IP、引数で入出力パス)。
+集計・図化して残すべき結論は `report/`(マスク済みの図 PNG・要約)へ。生ログはここで捨ててよい。
 
 ## 使い方
 
 ```bash
+RUN=logs/$(date +%Y%m%d)-precision-scope; mkdir -p $RUN
+
 # 実機フラッシュ + ログ記録 (古いバイナリを焼かないよう build && run)
-cd pico-gnss && cargo build --release && cargo run --release > ../logs/pps-$(date +%Y%m%d-%H%M).log 2>&1
+cd pico-gnss && cargo build --release && cargo run --release > ../$RUN/pps-boot.log 2>&1
 
-# オシロのモニタ (IP は env、リポジトリに直書きしない)
-RIGOL_HOST=<scope-ip> python3 report/plot_wander.py logs/pps-XXXX.log report/offset-wander.png
+# オシロ (IP は env、リポジトリに直書きしない)。再利用ツールは scripts/ から呼ぶ
+RIGOL_HOST=<scope-ip> python3 scripts/scope_raw.py convergence $RUN/convergence.gif 180
 ```
-
-集計・図化して残すべき結論は `report/`(図 PNG・要約)へ。生ログはここに置いて捨ててよい。
