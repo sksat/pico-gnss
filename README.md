@@ -86,4 +86,10 @@ center = 0; the disciplined output leads it by a small, steerable offset):
 
 ![oscilloscope: disciplined 1PPS vs GPS PPS](report/scope-pps-small.png)
 
+The whole pull-in from boot, one frame per PPS: the output PPS converging onto the GPS edge
+(top, auto-zooming scope) alongside the firmware's internal state — offset/hwphase, time
+error, crystal ppb, and temperature with its feed-forward contribution:
+
+![GPSDO pull-in from boot — scope + parameters, per-PPS](report/combo-gpsdo-fromboot.gif)
+
 See [`report/REPORT.md`](report/REPORT.md) for the full methodology and figures (Japanese).

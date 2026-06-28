@@ -82,4 +82,9 @@ before/after — 位相の「測定」精度 (Instant ±ms → PIO 16 ns) と、
 
 ![オシロ: 規律 1PPS vs GPS PPS](report/scope-pps-small.png)
 
+起動からの引き込み全体を毎 PPS で: 出力 PPS が GPS エッジへ収束する様子 (上段, auto-zoom するオシロ) と、
+firmware の内部状態 — offset/hwphase・時刻誤差・水晶 ppb・温度とその feed-forward 寄与 — を同時に:
+
+![起動からの GPSDO 引き込み — オシロ + パラメータ, 毎PPS](report/combo-gpsdo-fromboot.gif)
+
 手法の詳細・全図は [`report/REPORT.md`](report/REPORT.md) を参照。
