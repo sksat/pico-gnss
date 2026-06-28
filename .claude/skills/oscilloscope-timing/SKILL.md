@@ -180,10 +180,46 @@ CLI の `phase` は現在の s/div で測る。
 可視化が要るなら、`phase ... <log>` の 1行/shot ログを matplotlib で時系列 + ヒストグラムにする(ドリフトと
 分布が一目で分かる)。
 
+### 10. VXI-11 read が完全に死ぬことがある → raw socket 5555 にフォールバック(lazy-flush 地獄)
+
+VXI-11(`scripts/rigol_vxi11.py`)は基本だが、**read が完全に死ぬ**ことがある(`device clear` は成功するのに
+`ask()` の read が毎回 IO timeout。backlog 排出でも復旧せず、その session では VXI-11 が使えない)。このとき
+raw socket 5555 は生きているが SCPI が **lazy-flush** で厄介:
+
+- コマンドを受け取ると「それ以前に pending だった応答を**全部** socket に push」し、**自身の応答は次コマンドまで
+  pending**(素朴な read は1つ遅延。drain しても pending は wire 上に無いので出てこない)。
+- `*CLS` は応答を持たない pusher。**text 応答は flush するが、pending の波形 block / measurement は ABORT する**。
+  だから瞬時の text query は `send(cmd); send("*CLS"); readline()` でOK、**block は実 query(`:WAV:FORMat?`)を
+  pusher** にして flush(abort されない)→ skip-to-`#`。block の前に `drain` して設定が flush した stale text を除く。
+- **取得中は *CLS を使わない**(捕捉済みフレームを消す。:SINGle の status polling に混ぜると顕著)。毎 shot は
+  `:SINGle` + 固定待ち(>1 PPS 周期 ~1.4s)で独立フレームを1枚。**トリガ発火は ch1(=トリガ源)のエッジ有無で
+  検証**(status polling より安全。空フレーム=トリガ未発火を弾ける)。RDELay 等の delay measurement は raw では
+  返らないので**波形 download + 自前エッジ検出**。
+- 実装は `scripts/scope_raw.py`(`RawScope` + CLI `phase`/`shot`/`convergence`)。`rigol_vxi11.py` が死んだら此方。
+
 ## 波形/スクリーンショットの記録
 
-`capture <out.png> [s/div]` で1発トリガしてスクリーンショットを保存する(レポート用の証跡)。`Rigol.waveform()`
-で生サンプル(BYTE)を吸い出して自前解析/プロットもできる。
+`capture <out.png> [s/div]`(VXI-11)/ `scope_raw.py shot <out.png> [sdiv_ns]`(raw)で1発トリガしてスクショ保存。
+`Rigol.waveform()` / `RawScope.waveform()` で生サンプル(BYTE)を吸い出し自前解析もできる。**作法**:
+
+- **時間スケールは実現精度に合わせる**。数十 ns の整合を 500ns/div で撮ると「重なって見える」だけで何も分からない。
+  20〜50ns/div(達成 σ の ~1div 相当)まで詰める。粗いと精度が見えず、細かすぎると wander でエッジが画面外に出る。
+- **スクショ/GIF では基準でない冗長 ch を切る**。ここでは GP2(ch3, 受信機@Pico)は ch1(受信機源)とほぼ同一で、
+  かつ小信号で立上りが緩く ringing → エッジ検出も暴れる。**ch3 を OFF にして ch1(GPS基準)vs ch2(出力)の2本**に
+  すると見やすく、しかも ch1(クリーン&トリガ源)基準にすると σ が大きく改善する(実測 std 84→36ns)。
+- **GIF は「毎トリガ独立フレーム」**。`:SINGle`+トリガ検証(ch1 エッジ有無)で空フレームを混ぜない。ただし
+  `:SINGle` の直列 floor は「1トリガ(≤1s)+読み出し(PNG ~0.5s + 波形 ~0.24s×n)」≈ 1.5-2s で、**1 PPS=1frame
+  には届かない**(エッジを1つ飛ばす)。
+- **真の毎 PPS GIF は NORMal sweep で RUN したまま最速 grab + dedup**(`scope_raw.py wander`)。RUN 中は scope が
+  毎 PPS 自動トリガし最新フレームを保持。grab(~0.4s)< PPS周期(1s)なので各 PPS を 2-3 回拾う=取りこぼし無し。
+  **ch2 波形バイトのハッシュで dedup** して 1 PPS=1 フレームにする(offset が連続推移すれば取りこぼし無しの証拠)。
+  `:SINGle`/status polling/RECORD モードは raw socket では脆い・不明瞭(polling は *CLS でフレーム消失 or desync、
+  DHO804 の RECORD コマンドツリーは要マニュアル)。RUN-grab-dedup が一番素直で確実。
+- **再起動後チェックは起動直後から撮る**。`scope_raw.py convergence <out.gif>` は boot から PLL 引き込みを撮り、
+  **per-frame 自動タイムスケール**で「大オフセット→収束」を可視化する(実測 +36µs→+6ns)。スケールは **1-2-5 ラダーを
+  1フレーム1ノッチずつ**緩やかに動かす(急な decade 飛びは見づらい)。エッジが画面外に出たときだけ素早く widen して
+  見失わない。xinc はクエリせず `sdiv*1e7`(NORMal は ~1000pt/10div)で計算(block 後の `:WAV:FORMat?` 応答と
+  desync しないため)。
 
 ## 他機種への移植
 

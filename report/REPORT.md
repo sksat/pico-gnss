@@ -47,7 +47,7 @@ RP2040 (Raspberry Pi Pico) と秋月 [AE-GNSS-EXTANT](https://akizukidenshi.com/
   | boot2 | −5362 | −3.1ns | 59 | 100% |
   | boot3 | −5387 | +1.6ns | 36 | 100% |
 
-  絶対オフセットは 3 boot とも 0 近傍 (平均 ~+6ns、boot 毎の静的残差ばらつき ~±30ns) に張り付き、**~793ns は再現せず**。オシロ画面でも 3 本のエッジ (ch1 受信機源・ch2 GP4 出力・ch3 GP2 受信機@Pico) が trigger で重畳する ([scope-delaycomp-wander.gif](scope-delaycomp-wander.gif))。ch1≒ch3 (受信機源と受信機@Pico) で経路遅延は極小、というユーザ予測も裏取りできた。
+  絶対オフセットは 3 boot とも 0 近傍 (平均 ~+6ns、boot 毎の静的残差ばらつき ~±30ns) に張り付き、**~793ns は再現せず**。オシロ画面でも出力エッジ (ch2 GP4) が GPS 基準 (ch1, トリガ源) と trigger で重畳し、毎ショット数十 ns で揺れる ([scope-delaycomp-wander.gif](scope-delaycomp-wander.gif), 50ns/div, ch1=GPS vs ch2=出力)。ch1≒ch3 (受信機源と受信機@Pico) で経路遅延は極小、というユーザ予測も別途裏取りできたため、スクショは冗長な ch3 を切り ch1 を基準にした (小信号 ch3 はエッジ検出を乱し σ を 84→36ns 悪化させていた)。起動直後からの引き込み (大オフセット→収束) は [scope-convergence.gif](scope-convergence.gif) に示す: +25µs → overshoot → 最終 ±数十 ns (per-frame 自動タイムスケール)。
 - **注意**。100ns を超える残差は静的オフセットではなく**受信律速の wander** (std 36〜79ns、悪い受信窓で稀に超過) である。実際 boot3 は最初の窓で mean+50/std79/70% と出たが再測定で +2/std36/100% に戻り、wander の悪窓を掴んだ transient と確認した。すなわち**絶対オフセットの中心化は再現するが、瞬時値が常に ≤100ns に入るかは受信次第**で、これは前述の wander 床と同根である。
 
 ### 長時間 wander の正体と、firmware で詰められる線
