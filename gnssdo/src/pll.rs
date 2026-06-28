@@ -97,6 +97,19 @@ pub struct PhaseLockLoopConfig {
     /// Integral slow-down outside the calm band: effective `i_den` becomes `i_den << shift`. 0 disables
     /// adaptation (the integral always uses `i_den`), preserving the fixed-gain behaviour. Default 0.
     pub i_den_disturbed_shift: u32,
+    /// Override the proportional inverse gain (P = `pred / kp_inv`). 0 = derive from [`LoopMode`]
+    /// (8 with Smith, 16 without) — the default, preserving the original behaviour. Set >0 to sweep
+    /// damping (a *smaller* `kp_inv` = stronger P = more damping, but only stable if the loop delay is
+    /// compensated — see `smith_edges`). Lets the loop-delay/damping trade-off be tuned.
+    pub kp_inv: i64,
+    /// How many in-flight edges the Smith predictor subtracts (default 1). The predictor cancels the
+    /// not-yet-observed P+D corrections so a higher P gain stays stable; with a one-edge actuation
+    /// delay, one edge is enough. If the real output pipeline delay is `d`>1 edges (FIFO depth +
+    /// freshness gating), a 1-edge predictor under-compensates and stronger damping oscillates.
+    /// Setting `smith_edges`=`d` subtracts all `d` in-flight corrections, restoring phase margin so a
+    /// smaller `kp_inv` actually damps the resonance. Clamped to the history depth (8). Only used when
+    /// `mode` includes Smith.
+    pub smith_edges: u32,
 }
 
 impl PhaseLockLoopConfig {
@@ -114,6 +127,8 @@ impl PhaseLockLoopConfig {
         d_den: 4,
         calm_ns: 1_000,
         i_den_disturbed_shift: 0,
+        kp_inv: 0,
+        smith_edges: 1,
     };
 
     /// The **naive PID** preset (P + I + D, *no* Smith predictor) — the textbook type-II loop from
@@ -165,6 +180,10 @@ pub struct PhaseLockLoopUpdate {
     pub predicted_phase_ns: i64,
 }
 
+/// Depth of the in-flight p+d history for the (multi-edge) Smith predictor; `smith_edges` is clamped
+/// to this. 8 covers any realistic 1 Hz output-pipeline delay.
+const SMITH_MAX: usize = 8;
+
 /// A type-II output-phase PLL. Feed it a measured phase error each output edge; it integrates a
 /// frequency trim and emits an immediate phase correction. See the [module docs](self).
 #[derive(Debug, Default)]
@@ -174,7 +193,9 @@ pub struct PhaseLockLoop {
     reject_cnt: u32,
     trim_mppb: i64,
     last_pred: i64, // previous edge's predicted phase (for the derivative term)
-    last_pd: i64, // previous edge's p+d correction (the in-flight amount the Smith predictor removes)
+    // ring of recent *applied* p+d corrections (most-recent first); the Smith predictor subtracts the
+    // first `smith_edges` (the still-in-flight ones). `pd_hist[0]` alone reproduces the 1-edge Smith.
+    pd_hist: [i64; SMITH_MAX],
 }
 
 impl PhaseLockLoop {
@@ -191,13 +212,30 @@ impl PhaseLockLoop {
             reject_cnt: 0,
             trim_mppb: 0,
             last_pred: 0,
-            last_pd: 0,
+            pd_hist: [0; SMITH_MAX],
         }
     }
 
     /// Current configuration.
     pub fn config(&self) -> &PhaseLockLoopConfig {
         &self.config
+    }
+
+    /// Effective inverse proportional gain: the config override if set (>0), else the mode default.
+    fn kp_inv(&self) -> i64 {
+        if self.config.kp_inv > 0 {
+            self.config.kp_inv
+        } else {
+            self.config.mode.kp_inv()
+        }
+    }
+
+    /// Sum of the still-in-flight p+d corrections the Smith predictor subtracts (the last
+    /// `smith_edges` applied corrections, clamped to the history depth). `smith_edges`=1 → the most
+    /// recent only (the original 1-edge Smith).
+    fn smith_in_flight(&self) -> i64 {
+        let n = (self.config.smith_edges as usize).clamp(1, SMITH_MAX);
+        self.pd_hist[..n].iter().sum()
     }
 
     /// Switch the active control terms (the firmware's experiment harness uses this; production
@@ -222,6 +260,21 @@ impl PhaseLockLoop {
         self.config.d_den = d_den;
     }
 
+    /// Set the proportional inverse gain at runtime (0 = derive from [`LoopMode`]). Smaller = stronger
+    /// P = more damping of the underdamped mode, but only stable if the loop delay is compensated
+    /// (raise [`set_smith_edges`](Self::set_smith_edges) to match the real pipeline delay first).
+    /// Experiment-harness knob for the delay/damping sweep.
+    pub fn set_kp_inv(&mut self, kp_inv: i64) {
+        self.config.kp_inv = kp_inv;
+    }
+
+    /// Set how many in-flight edges the Smith predictor compensates at runtime (1 = original). Match
+    /// it to the measured output-pipeline delay `d` (FIFO + freshness gating); with `d` compensated, a
+    /// smaller `kp_inv` damps the resonance instead of oscillating. Experiment-harness knob.
+    pub fn set_smith_edges(&mut self, smith_edges: u32) {
+        self.config.smith_edges = smith_edges;
+    }
+
     /// Whether the loop is currently locked.
     pub fn is_locked(&self) -> bool {
         self.lock_cnt >= self.config.lock_hold
@@ -239,7 +292,7 @@ impl PhaseLockLoop {
         let ctrl = phase_err_ns;
         // Smith predictor: control on the phase minus the still-in-flight correction.
         let pred = if self.config.mode.smith() {
-            ctrl - self.last_pd
+            ctrl - self.smith_in_flight()
         } else {
             ctrl
         };
@@ -284,8 +337,7 @@ impl PhaseLockLoop {
                 }
                 // P term.
                 if pred.abs() > self.config.deadband_ns {
-                    p_corr =
-                        (pred / self.config.mode.kp_inv()).clamp(-CORR_CLAMP_NS, CORR_CLAMP_NS);
+                    p_corr = (pred / self.kp_inv().max(1)).clamp(-CORR_CLAMP_NS, CORR_CLAMP_NS);
                 }
                 // D term (only while locked). `.max(1)` guards `set_d_den(0)` (no_std divide-by-zero).
                 if self.config.mode.use_d() && locked {
@@ -306,7 +358,9 @@ impl PhaseLockLoop {
         // spurious D kick of `(normal − spike) / d_den` on the next good edge.
         if applied {
             self.last_pred = pred;
-            self.last_pd = p_corr + d_corr;
+            // shift the in-flight history (most-recent first) and record this edge's correction.
+            self.pd_hist.copy_within(0..SMITH_MAX - 1, 1);
+            self.pd_hist[0] = p_corr + d_corr;
         }
         PhaseLockLoopUpdate {
             applied,
@@ -356,7 +410,7 @@ impl crate::PhaseController for PhaseLockLoop {
         self.lock_cnt = 0;
         self.reject_cnt = 0;
         self.last_pred = 0;
-        self.last_pd = 0;
+        self.pd_hist = [0; SMITH_MAX];
         self.trim_mppb = init.residual_trim_mppb;
     }
 }

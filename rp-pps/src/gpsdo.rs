@@ -109,6 +109,28 @@ impl PpsGpsdo {
         self.clock.freq_ppb()
     }
 
+    /// Feed a temperature reading (raw sensor units) for the temperature feedforward. Passthrough to
+    /// [`Gnssdo::update_temp`]; call once per edge alongside the frequency discipline.
+    pub fn update_temp(&mut self, temp: i64) {
+        self.clock.update_temp(temp);
+    }
+
+    /// Toggle the temperature feedforward at runtime. Passthrough to [`Gnssdo::set_temp_ff_enable`].
+    pub fn set_temp_ff_enable(&mut self, en: bool) {
+        self.clock.set_temp_ff_enable(en);
+    }
+
+    /// Tune the temperature feedforward at runtime. Passthrough to [`Gnssdo::set_temp_ff_params`].
+    pub fn set_temp_ff_params(&mut self, sm_shift: u32, shift: u32, gain_q8: i64) {
+        self.clock.set_temp_ff_params(sm_shift, shift, gain_q8);
+    }
+
+    /// Tune the matched-lead + residual-observer knobs at runtime. Passthrough to
+    /// [`Gnssdo::set_temp_ff_lag`].
+    pub fn set_temp_ff_lag(&mut self, lag_q8: i64, dlead_shift: u32, obs_shift: u32) {
+        self.clock.set_temp_ff_lag(lag_q8, dlead_shift, obs_shift);
+    }
+
     /// Crystal frequency (milli-ppb) projected one sample ahead — the value to feed the **output
     /// period**. Full mppb resolution (no ppb rounding) and slope-projected, so a temperature-driven
     /// frequency ramp does not leave a standing output-phase error (see
@@ -121,6 +143,20 @@ impl PpsGpsdo {
     /// temperature-ramp proxy). 0 in steady state. For logging.
     pub fn freq_slope_mppb(&self) -> i64 {
         self.clock.clock().freq_slope_mppb()
+    }
+
+    /// α-β frequency **level** (milli-ppb), *without* the temperature-feedforward lead. The temp-FF
+    /// steering contribution is `predicted_freq_mppb() − freq_mppb()`; logging both lets an experiment
+    /// confirm the feedforward is actually active and measure its magnitude.
+    pub fn freq_mppb(&self) -> i64 {
+        self.clock.clock().freq_mppb()
+    }
+
+    /// Learned temperature coefficient `k` (milli-ppb per raw temperature unit), 0 until temperature
+    /// has varied enough for the online regression. For logging/diagnostics of the temperature
+    /// feedforward.
+    pub fn temp_k_mppb_per_unit(&self) -> i64 {
+        self.clock.clock().temp_k_mppb_per_unit()
     }
 
     /// Nanoseconds since the last established epoch (holdover span at `query_ns`).

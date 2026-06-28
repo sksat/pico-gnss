@@ -47,8 +47,8 @@ use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
 use gnssdo::{
-    AlphaBetaBoost, ControlInput, Controller, IntegralRework, PhaseController, PhaseLockLoop,
-    PhaseLockLoopConfig, PpsEvent, snap_to_second_ns,
+    ControlInput, Controller, PhaseController, PhaseLockLoop, PhaseLockLoopConfig, PpsEvent,
+    snap_to_second_ns,
 };
 use rp_pps::embassy::{SteeredPpsOutput, TimedPpsCapture};
 use rp_pps::{NmeaLineAssembler, PpsGpsdo, PpsSteer};
@@ -60,6 +60,9 @@ bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     ADC_IRQ_FIFO => embassy_rp::adc::InterruptHandler;
+    // temp_task の free-running ADC→DMA 転送完了割込 (DMA_CH0 専用)。全 DMA ch は DMA_IRQ_0 を共有するが、
+    // 本 firmware が使う DMA channel は temp_task の 1 本だけ (grep で他に DMA 使用なしを確認済み)。
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>;
 });
 
 /// GPSDO 状態 (rp-pps の一体型 state bundle = gnssdo 規律 + PPS↔NMEA 対応付け)。pps_task が
@@ -123,40 +126,52 @@ const DISTURBED_SHIFT: u32 = 0; // 適応無効: 固定 i_den=128。旧 2 (32<<2
 /// 順に切替え、各セグメントに PRBS を注入すれば、受信を揃えた状態で手法差を同定できる (計測トラップ対策。
 /// hwphase = 出力 vs 同じ受信機なので、固定比較や別 boot 比較では受信交絡が手法差に混ざる)。切替は
 /// start_segment で出力周波数を連続にし観測器/Smith/lock を blank = 公平比較。**本番は false** (固定の本番制御器)。
-const CONTROLLER_SWEEP: bool = false; // 制御器を同一 boot 巡回する比較実験。**production 既定 false** (固定 slot0)。true で巡回。
-const CONTROLLER_SWEEP_EDGES: u32 = 300; // セグメント長 (locked エッジ)。interleave 用に短く = 各手法を多時刻サンプル
-const CONTROLLER_LIST_LEN: usize = 5;
-/// **interleave スケジュール** (de-confound)。固定順巡回だと「どの手法か」が時刻に 1:1 で写り、温度/受信ドリフト
-/// と分離できない。各 cidx を**異なる時刻・順**で複数回サンプルすれば順序↔時刻交絡を破れる。各ラウンドを巡回シフト
-/// した Latin-square 的並び (5 手法 × 5 ラウンド = 各手法が 5 つの異なる時間帯に出る)。全 25 後に繰り返す。
+const CONTROLLER_SWEEP: bool = false; // production: 固定 slot0 (i_den=512)。recal を効かせ ΔC スリップを bound する。
+const CONTROLLER_SWEEP_EDGES: u32 = 1200; // セグメント長 (locked エッジ)。実験D(狭帯域+温度FF, 自然 wander): 最狭 2048 の周期 2π√2048≈285s に対し ≥4 周期/セグメント。wander 統計の安定化に長め。RECAL_EDGES(5000)より小。
+const CONTROLLER_LIST_LEN: usize = 3;
+/// **実験B: 3-way 帯域 (i_den) スイープの interleave スケジュール**。固定順巡回だと「どの帯域か」が時刻に
+/// 1:1 で写り温度/受信ドリフトと分離できない。cidx 0/1/2 を各セグメントで巡回しつつ順序を散らすと、各帯域が
+/// 複数の異なる時間帯に出て cidx↔時刻交絡を破れる。各 cidx 等回数 (9 セグメントで各 3 回)、全 9 後に繰り返す。
 /// analyze_prbs.py は cidx で pool するので、同 cidx の複数セグメントが自動的に束ねられ誤差棒が得られる。
-const SWEEP_SCHEDULE: [usize; 25] = [
-    0, 1, 2, 3, 4, //
-    2, 3, 4, 0, 1, //
-    4, 0, 1, 2, 3, //
-    1, 2, 3, 4, 0, //
-    3, 4, 0, 1, 2, //
+const SWEEP_SCHEDULE: [usize; 9] = [
+    0, 1, 2, //
+    1, 2, 0, //
+    2, 0, 1, //
 ];
-/// idx 番目の制御手法を生成 (巡回・本番初期化の単一の出所)。slot 0 = 現行 firmware の本番チューニングを保つ。
-fn make_controller(idx: usize) -> Controller {
-    match idx % CONTROLLER_LIST_LEN {
-        // 本番: 現行 firmware の PID+Smith チューニング (構造変更で挙動を変えないよう保持)。
-        0 => Controller::Pll(PhaseLockLoop::with_config(PhaseLockLoopConfig {
-            i_den: I_DEN_CALM,
-            calm_ns: CALM_NS,
-            i_den_disturbed_shift: DISTURBED_SHIFT,
-            d_den: D_DEN_TUNED,
-            ..PhaseLockLoopConfig::DEFAULT
-        })),
-        // 本命候補: 固定ゲイン α-β 観測器 + 残差トリガ過渡 boost。
-        1 => Controller::AbBoost(AlphaBetaBoost::new()),
-        // フラグ無し連続積分 (I-enable ゲート廃止 + 積分入力クランプ + back-calc)。
-        2 => Controller::IntegRework(IntegralRework::new()),
-        // ライブラリ既定 PID+Smith (i_den=128/d_den=4。report の結論。比較用)。
-        3 => Controller::Pll(PhaseLockLoop::new()),
-        // 素朴 PID (Smith 無し。過去レポートの型 II)。
-        _ => Controller::Pll(PhaseLockLoop::with_config(PhaseLockLoopConfig::NAIVE_PID)),
+/// idx 番目の制御手法を生成 (巡回・本番初期化の単一の出所)。cidx 1 = 現行 firmware の本番帯域 (i_den=512)。
+
+/// 共通ベース (適応無効・calm_ns 据置) に帯域 (i_den/d_den) と減衰形 (kp_inv/smith_edges) を載せる。
+/// 実験B はこの i_den/d_den を 3 点振り (減衰形は現行 kp auto8/smith1 固定)、帯域そのものの効果を測る。
+fn exp_cfg(i_den: i64, d_den: i64, kp_inv: i64, smith_edges: u32) -> PhaseLockLoopConfig {
+    PhaseLockLoopConfig {
+        i_den,
+        calm_ns: CALM_NS,
+        i_den_disturbed_shift: DISTURBED_SHIFT,
+        d_den,
+        kp_inv,
+        smith_edges,
+        ..PhaseLockLoopConfig::DEFAULT
     }
+}
+
+/// 実験D の 3-way 狭帯域グリッドの **effective** 制御器 config (make_controller と per-segment emit の唯一の真実源)。
+/// `(i_den, d_den, kp_inv, smith_edges)`。減衰形は全 cidx で現行 production (kp_inv=auto8 / smith_edges=1)、
+/// 比 i_den:d_den=32:1 を維持して帯域 (i_den) だけを 512/1024/2048 と狭側へ 3 点振る。kp_inv は exp_cfg(.., 0, 1)
+/// で auto (kp_inv=0→PidSmith で実効 8) なので、emit には実効値 8 を載せる。
+const CTRL_GRID: [(i64, i64, i64, u32); CONTROLLER_LIST_LEN] = [
+    (I_DEN_CALM, D_DEN_TUNED, 8, 1),    // cidx0: 現行 production (対照, i_den=512/d_den=16)
+    (1024, 32, 8, 1),                   // cidx1: 狭帯域 (i_den=1024/d_den=32)
+    (2048, 64, 8, 1),                   // cidx2: 最狭帯域 (i_den=2048/d_den=64)
+];
+
+fn make_controller(idx: usize) -> Controller {
+    // **実験D: 狭帯域 (i_den) スイープ + 温度FF**。減衰形は現行 production (kp auto8/smith1) に固定し、帯域だけを
+    // 3 点 (現行 512 / 狭 1024 / 最狭 2048) 振る。CONTROLLER_SWEEP で各 cidx を interleave しながら巡回し、自然
+    // wander (hwphase std + 低周波共振帯) を帯域ごとに受信交絡なしで比較する (実験A で減衰形は wander を変えないと確定)。
+    // CTRL_GRID が make_controller / per-segment emit の唯一の真実源。exp_cfg(i_den, d_den, 0, 1):
+    // kp_inv=0=auto8 / smith=1 = 現行形。cidx0 (512/16/auto8/se1) は現行 production と bit 一致 (対照)。
+    let (i_den, d_den, _kp_inv_emit, smith) = CTRL_GRID[idx % CONTROLLER_LIST_LEN];
+    Controller::Pll(PhaseLockLoop::with_config(exp_cfg(i_den, d_den, 0, smith)))
 }
 
 /// 受信品質テレメトリ: GPS 間隔ジッタ (直近 RX_JIT_WIN エッジの interval 範囲 = max−min) を hysteresis で
@@ -168,7 +183,7 @@ const RX_JIT_WIN: usize = 8;
 /// hwphase の応答を inj と相互相関すると、受信ノイズ (inj と非相関→平均で落ちる) を分離して**閉ループ伝達**
 /// (共振/実効 damping/帯域) を受信交絡なしに同定できる。制御器を巡回しながら各々に注入すれば、手法ごとの
 /// 復旧応答 h[k] (共振/リンギング) を受信非依存に比較でき、go/no-go の判定軸になる (codex 推奨)。
-const PRBS_INJECT: bool = false; // 各手法に PRBS 注入し h[k] を受信非依存比較する実験。**production 既定 false**。
+const PRBS_INJECT: bool = false; // 実験D(狭帯域+温度FF): 自然 wander を測るので注入なし。**production 既定 false**。
 const PRBS_AMP_NS: i64 = 96; // ±96ns (16ns 捕捉量子化より十分大、lock 窓 1µs より十分小)
 /// 実験: **boost 強制発火 / 遷移回復計測**。PRBS(±96ns)は線形域の定常共振 h[k] しか測れず、ab_boost の売りで
 /// ある遷移回復 (boost) は発火しないため未評価のままになる。そこでロック中、KICK_PERIOD locked エッジ毎に出力
@@ -181,8 +196,33 @@ const KICK_AMP_NS: i64 = 8000; // outlier_ns(3000) 超の明確なステップ�
 const KICK_PERIOD: u32 = 150; // locked エッジ毎に 1 発(セグメント 300 に ~2 発、回復が収まる間隔)
 
 /// 定期 K 再較正の cadence (locked 中の出力エッジ数 ≈ 秒)。実効 K の温度ドリフト (#5 後で ~5ns/min) を
-/// 追従する。5分なら最大 ~25ns 振れ → 2桁ns 維持。短くすると holdover 中断が増える tradeoff。
-const RECAL_EDGES: u32 = 300;
+/// 追従する。短くすると holdover 中断が増える tradeoff。
+/// **実験A 退避**: recal の holdover gap (SM2 を数秒 GPS へ奪う) が PRBS h[k] 窓を汚すので、セグメント長
+/// (CONTROLLER_SWEEP_EDGES=900) より十分大きくして実験中は recal を発火させない。実験後は production の
+/// 300 へ戻す (boot 一発較正で K の初期値は確定済み)。
+const RECAL_EDGES: u32 = 150; // production: ~2.5分毎に ΔC(実効K)再測。dk≈-5tick/300edge のスリップ sawtooth を ~40ns に抑える。
+/// 出力 vs GPS の静残差 (pad/path の GP2-vs-GP4 固定差) を servo 目標へ注入する絶対 anchor (tick, ×16ns)。
+/// recal でスリップを bound した後に **scope で GP4-GP2 を実測**して決める (loopback では測れない絶対量)。
+/// hwphase 計算の k だけに効かせ、raw_lag gate と recal は真 K のまま。0 で無効。サインは scope で確定。
+/// 実測 (recal 有効) GP2-vs-GP4 ≈ +48ns late → +3 tick で出力を進めて中心化。
+const ABS_OFFSET_TICKS: i32 = 3;
+
+/// 温度フィードフォワード (gnssdo の増補型温度モデル) の runtime トグル。**実験A=false** (温度 wander の
+/// 受信非依存 loop-shape を測る段階)。実験B/C で true にして温度FF の効果を測る。boot で
+/// `CLOCK.set_temp_ff_enable` に渡す。
+const TEMP_FF_ENABLE: bool = true; // 実験D(狭帯域+温度FF): 狭ループの追従遅れを die 温度の先行推定で埋める
+/// 温度FF チューニング (実験D)。狭ループ (i_den≥1024, 遅れ>15s) では die 温度がループより進んだ周波数推定を
+/// 与え、ループの追従遅れを埋めて wander を下げる。検証で 61s 平滑温度が水晶周波数を r=0.99 で予測すると判明。
+/// 実験B の温度FF は sm_shift=4(16s)/gain_q8=64 と未チューニングだった。boot で set_temp_ff_enable(true) の直後に
+/// CLOCK.set_temp_ff_params(TEMP_FF_SM_SHIFT, TEMP_FF_SHIFT, TEMP_FF_GAIN_Q8) で渡す。
+const TEMP_FF_SM_SHIFT: u32 = 4; // ADC ノイズ除去の短 EMA。~16s 平滑 (finer 温度なら短めでもノイズが乗りにくい)
+const TEMP_FF_SHIFT: u32 = 7; // 回帰 mean/cov の EMA (~128s)
+const TEMP_FF_GAIN_Q8: i64 = 64; // matched-lead 経路では未使用 (旧 λ haircut。sweep 互換で保持)
+/// matched-lead + 残差 observer の新ノブ (原理的 temp-FF)。die 温度→水晶温度の 1 次ラグ τ を構造的に補償
+/// (Tcrys_hat = die_lp + (τ/Ts)·Δdie_lp)、非熱残差は固定ゲイン observer が吸う。λ haircut は廃止し full 権限。
+const TEMP_FF_LAG_Q8: i64 = 1536; // τ/Ts を Q8 で (≈6s @1Hz)。検証で 61s 平滑が水晶を r≈0.99 で予測
+const TEMP_FF_DLEAD_SHIFT: u32 = 2; // 微分の帯域制限 EMA (α=1/4)
+const RESID_OBS_SHIFT: u32 = 2; // 残差 observer ゲイン K=1/2^shift=0.25
 /// 再較正で取る (c0,c2) 同一エッジ対の数。先頭 1 個は GP4→GP2 切替トランジェントとして捨て、残りで K を測る。
 const RECAL_SAMPLES: u32 = 6;
 /// 再較正サンプルの旧 K 近傍ゲート (tick)。正しい同一エッジ対なら c0-c2 は旧 K から高々 ~数十 tick
@@ -204,23 +244,55 @@ static RECEPTION_BAD: AtomicU32 = AtomicU32::new(0);
 /// 直近の GPS 間隔ジッタ (ns, ログ用)。
 static RECEPTION_JITTER: AtomicU32 = AtomicU32::new(0);
 
-/// RP2040 内蔵温度センサの生 ADC 値 (12bit)。temp_task が ~2s 毎に更新し PPSGEN ログに出す。
-/// ℃ 換算: `27 - (raw*3.3/4096 - 0.706)/0.001721` (データシート式)。水晶/受信機でなく MCU 温度で、
-/// 単発は ±数℃ とノイジー (運用時の傾向監視向け)。**規律コア (gnssdo) には入れない** — これは
-/// example firmware の運用監視機能で、規律ロジックは温度非依存に保つ (HAL/ADC をコアに持ち込まない)。
+/// RP2040 内蔵温度センサの ADC 値を **N 回積算平均した fractional 値** (12bit ADC code を ×TEMP_RAW_SCALE
+/// した固定小数)。temp_task が **DMA free-running の連続背景タスク**として常時更新し (1 block ≈ TEMP_DMA_N
+/// サンプル)、gen_capture_task が温度FF入力として規律コアへ渡し、PPSGEN ログにも出す。**生の 12bit code
+/// に戻すには TEMP_RAW / TEMP_RAW_SCALE** (=×256、生 code に戻すには /256)。重オーバーサンプル
+/// (N=TEMP_DMA_N) で ADC ノイズ (~1-2 LSB) を natural dither にして √N で sub-LSB 分解能を得る
+/// (1/256 LSB ≈ 0.002°C)。℃ 換算は raw code を `27-(code*3.3/4096-0.706)/0.001721`。水晶/受信機でなく
+/// MCU 温度で単発はノイジー。**規律コア (gnssdo) は温度非依存** — 温度の取り込みは firmware 配線で、
+/// 温度FF も runtime トグル (TEMP_FF_ENABLE) で明示的に有効化したときだけ効く。
 static TEMP_RAW: AtomicU32 = AtomicU32::new(0);
+/// TEMP_RAW の固定小数スケール (平均 ADC code をこの倍率で格納)。解析・℃換算は割って戻す。
+/// 256 = 8 fractional bits ≈ 1/256 LSB ≈ 0.002°C (重オーバーサンプルの sub-LSB 分解能を保持)。
+const TEMP_RAW_SCALE: u32 = 256;
+/// temp_task が 1 回の DMA 転送で取る ADC サンプル数 (重オーバーサンプリングの平均窓)。
+/// 16384 で √16384=128 → 量子化ノイズの平均化が ×256 スケールの分解能を裏打ちする。
+/// buf は u16 × 16384 = 32KB (RP2040 RAM 264KB に収まる)。StaticCell で .bss に確保。
+const TEMP_DMA_N: usize = 16384;
 
-/// 内蔵温度センサを定期サンプルして TEMP_RAW に積む (運用時の熱監視。制御には未使用、ログのみ)。
+/// 内蔵温度センサを **DMA free-running の最大レート連続サンプリング**で TEMP_RAW に積む背景タスク。
+/// ADC を最速 (div=0 → ~500kSa/s 連続変換) で回し、**DMA がハードウェアで buf に書く (CPU 負荷ゼロ)**。
+/// task は `adc.read_many(.., div=0, dma).await` で **DMA 完了を await するだけ**で、転送中 (16384 サンプル
+/// ≈ 33ms) は thread executor が PPS 捕捉・NMEA・制御など他タスクを自由に回せる → **starvation 無し**。
+/// 完了したら 16384 サンプルを block-average し TEMP_RAW_SCALE(=256) 倍の fractional 値で格納、即次 DMA
+/// (Timer スリープ不要 = DMA await が手放しになるため)。CPU が触るのは setup と平均ループ (~16384 加算、
+/// 数十µs) だけで ADC duty ~100% でも CPU duty ~0%。旧実装は CPU が 1 サンプルずつ adc.read().await を
+/// N 回回して thread executor を専有し、レートを上げると制御/NMEA を遅らせロックを落としていた
+/// (busy-loop 版で実機 lock 23%)。本実装はその CPU 律速を DMA で根治する。
 #[embassy_executor::task]
 async fn temp_task(
     mut adc: embassy_rp::adc::Adc<'static, embassy_rp::adc::Async>,
     mut ch: embassy_rp::adc::Channel<'static>,
+    mut dma: embassy_rp::dma::Channel<'static>,
 ) {
+    // DMA 転送先。32KB を task の arena スタックに積まず StaticCell で .bss に置く。
+    static BUF: StaticCell<[u16; TEMP_DMA_N]> = StaticCell::new();
+    let buf = BUF.init([0u16; TEMP_DMA_N]);
     loop {
-        if let Ok(raw) = adc.read(&mut ch).await {
-            TEMP_RAW.store(raw as u32, Ordering::Relaxed);
+        // div=0 → ADC 最速連続 (div<96 は 0 と同義)。転送完了まで executor を手放す (CPU 負荷ゼロ)。
+        if adc.read_many(&mut ch, &mut buf[..], 0, &mut dma).await.is_ok() {
+            // 全 N サンプルを積算。1 サンプル 12bit ≤ 4095, N=16384 → sum ≤ 4095*16384 ≈ 67.1M < u32::MAX。
+            let mut sum: u32 = 0;
+            for &s in buf.iter() {
+                sum += (s & 0x0fff) as u32; // ADC FIFO の有効 12bit のみ採る
+            }
+            // 平均 × SCALE = sum*256/N。sum*256 ≤ 67.1M*256 ≈ 17.2e9 が u32 を超えるので u64 で計算。
+            // 結果 ≤ 4095*256 = 1,048,320 は u32 に収まる。生 code に戻すには /256。
+            let scaled = (sum as u64 * TEMP_RAW_SCALE as u64 / TEMP_DMA_N as u64) as u32;
+            TEMP_RAW.store(scaled, Ordering::Relaxed);
         }
-        Timer::after_secs(2).await;
+        // スリープ無し: 次の DMA の await が即座に executor を手放すので、ここで Timer を挟む必要はない。
     }
 }
 
@@ -459,9 +531,26 @@ async fn gen_capture_task(
     // 出力位相の制御器 (gnssdo::Controller)。sub-cycle period 生成 (dither) + period word push は
     // SteeredPpsOutput (rp-pps) が内包するので、ここは freq_mppb と phase_corr を渡すだけ。本番は
     // slot 0 (現行 firmware の PID+Smith チューニング)。CONTROLLER_SWEEP=true で locked 中に巡回する。
-    let mut sweep_idx: usize = 0; // SWEEP_SCHEDULE 内の位置 (0..25)。実 cidx = SWEEP_SCHEDULE[sweep_idx]。
+    let mut sweep_idx: usize = 0; // SWEEP_SCHEDULE 内の位置。実 cidx = SWEEP_SCHEDULE[sweep_idx]。
     let mut controller = make_controller(SWEEP_SCHEDULE[sweep_idx]);
-    let mut edges_since_sweep: u32 = 0;
+    // boot で初期セグメントの effective config を 1 行出す (固定運用=CONTROLLER_SWEEP=false でも解析が
+    // どの制御器 config で走ったか分かるように)。以後の切替は下の CTRLSWEEP 行で出す。
+    {
+        let cidx = SWEEP_SCHEDULE[sweep_idx];
+        let (i_den, d_den, kp_inv, smith) = CTRL_GRID[cidx % CONTROLLER_LIST_LEN];
+        info!(
+            "CTRLSWEEP idx={} name={} forced={} i_den={} d_den={} kp_inv={} smith_edges={}",
+            cidx as u32,
+            controller.name(),
+            0u8,
+            i_den,
+            d_den,
+            kp_inv,
+            smith
+        );
+    }
+    let mut edges_since_sweep: u32 = 0; // セグメント内の **locked** エッジ数 (通常の切替契機)
+    let mut edges_seg_total: u32 = 0; // セグメント内の **総** エッジ数 (非ロック config の force-advance 用)
     let mut edges_since_kick: u32 = 0; // KICK 注入の locked エッジカウンタ
     // 制御器巡回の公平切替に使う、直近に適用した出力周波数 (= pred_mppb + trim_mppb)。次手法へ residual
     // trim = applied_freq − new_pred を渡し、出力周波数を連続にする (再捕捉を比較に混ぜない)。毎エッジ
@@ -511,7 +600,10 @@ async fn gen_capture_task(
         // stage② PIO ハード位相: 出力エッジ と 最新 GPS エッジ の生カウンタ差 (mod 1秒) を ns に。
         // Instant を介さないので executor のウェイクアップ遅延 (~ms) に汚されず 16ns 分解能。
         let c0 = C0_GPS.load(Ordering::Relaxed);
-        let hwphase_ns = rp_pps::loopback_phase_ns(c0, x, k, clk);
+        // 絶対 anchor: 静残差 (pad/path) を servo 目標へ注入し出力ピンを GPS ピンへ寄せる。phase だけ k_eff、
+        // raw_lag gate と recal は真 K (混ぜると同一エッジ対が gate/sample から外れる)。
+        let k_eff = k.wrapping_sub(ABS_OFFSET_TICKS as u32);
+        let hwphase_ns = rp_pps::loopback_phase_ns(c0, x, k_eff, clk);
         // ペアリング診断: fold 前の生 tick 差。正しい隣接エッジ対なら小さい(=真の位相)、ミスペア(欠落/
         // drain/再ロック後に非隣接エッジと対)だと ≈±1秒。fold がそれを隠し ppm×1s 残差にループがロック
         // する (9.5µs バグ族)。|raw_lag| が ~10ms 超なら gross ミスペアとして invalid 化し、loop に渡さない。
@@ -520,14 +612,18 @@ async fn gen_capture_task(
         let max_lag = (clk / 200) as i32; // capture tick ≈ clk/2 なので clk/200 ≈ 10ms
         let paired = raw_lag.unsigned_abs() <= max_lag as u32;
         // 旧手法 (比較用 emit のみ): 出力エッジの UTC 時刻 (Instant 経由) → 秒境界からのズレ。
-        let (pred_mppb, slope_mppb, phase) = CLOCK.lock(|g| {
+        let (pred_mppb, level_mppb, temp_k, slope_mppb, phase) = CLOCK.lock(|g| {
             let g = g.borrow();
             (
                 g.predicted_freq_mppb(),
+                g.freq_mppb(),              // α-β level (温度FF lead を含まない)
+                g.temp_k_mppb_per_unit(),  // 学習した温度係数 (0=未学習)
                 g.freq_slope_mppb(),
                 g.now_from_query_ns(now_local_ns()).map(snap_to_second_ns),
             )
         });
+        // 温度FF の操舵寄与 (predicted − level)。temp_k と併せて温度FF が実際に効いているかの診断。
+        let ff_delta_mppb = pred_mppb - level_mppb;
         // 制御に使う位相: PIO ハード(stage②)。PHASE_USE_HW=false で旧 Instant 測定に切替 (比較計測用)。
         let ctrl = if PHASE_USE_HW {
             hwphase_ns
@@ -545,6 +641,14 @@ async fn gen_capture_task(
             err_ns: ctrl,
             valid,
         });
+        // 温度を規律コアへ連続供給 (自己クロック=連続量という前提)。ロック中の各エッジで最新 fractional
+        // TEMP_RAW を update_temp に渡す (~1Hz、温度FF の EMA は呼び出し回数単位なので PPS 1Hz と整合)。
+        // TEMP_FF_ENABLE=false (実験A) なら model は値の記録/learn のみで predicted_freq は不変。B/C で
+        // enable すると温度の leading 推定が holdover/出力周期に効く。
+        if u.locked {
+            let t = TEMP_RAW.load(Ordering::Relaxed) as i64;
+            CLOCK.lock(|g| g.borrow_mut().update_temp(t));
+        }
         // 周波数 = 水晶推定の 1 サンプル先予測 (mppb, ppb 丸めなし) + 制御器の周波数トリム (milli-ppb)。
         // 温度ランプ中、単一 EMA だと推定が遅れて出力位相が ramp 速度に比例してずれる (offset② のドリフト)。
         // DisciplinedClock の α-β が傾きを先回りするので、出力周期にその予測周波数を入れて定常誤差を抑える。
@@ -582,7 +686,7 @@ async fn gen_capture_task(
             // 互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残す。cidx=制御器インデックス
             // (CONTROLLER_SWEEP の segment 鍵)、state=制御器の内部状態コード (ab_boost の boost 等)。
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
@@ -601,31 +705,51 @@ async fn gen_capture_task(
                 RECEPTION_BAD.load(Ordering::Relaxed),
                 prbs_inj,
                 kick_inj,
-                TEMP_RAW.load(Ordering::Relaxed)
+                TEMP_RAW.load(Ordering::Relaxed),
+                mt3333::DYN_MODE.load(Ordering::Relaxed),
+                temp_k,
+                ff_delta_mppb
             );
         }
         last_x = Some(x);
         // 定期 K 再較正: locked 中、RECAL_EDGES 出力エッジ毎に SM2 を GPS へ戻して実効 K を測り直す。
         // 実効 K は温度で這う (#5 後も ~5ns/min) ので boot 一発較正では追えない。再較正中は holdover。
-        if u.locked {
-            // 実験: 制御器巡回。locked エッジを数え、CONTROLLER_SWEEP_EDGES 毎に次の手法へ切替える (短い
-            // unlock はカウントを進めないだけで segment を跨いで継続)。一定受信下で各手法の hwphase / PRBS
-            // h[k] を比較する。切替は start_segment: 出力周波数が連続になるよう residual trim = 直近適用
-            // 周波数 − 新手法の現 pred を継ぎ、観測器/Smith/lock を blank (再捕捉を比較に混ぜない=公平)。
-            if CONTROLLER_SWEEP {
+        // 実験: 制御器巡回。**全エッジ評価**で切替: (a) locked エッジが CONTROLLER_SWEEP_EDGES に達したら通常
+        // 切替、(b) 総エッジが 3× に達したら **force-advance** — 非ロックの config (発散する対照など) がスイープを
+        // stall させないため。一定受信下で各手法の hwphase / PRBS h[k] を比較する。切替は start_segment: 出力
+        // 周波数が連続になるよう residual trim = 直近適用周波数 − 新手法の現 pred を継ぎ、観測器/Smith/lock を blank。
+        if CONTROLLER_SWEEP {
+            edges_seg_total += 1;
+            if u.locked {
                 edges_since_sweep += 1;
-                if edges_since_sweep >= CONTROLLER_SWEEP_EDGES {
-                    edges_since_sweep = 0;
-                    edges_since_kick = 0; // 新セグメント先頭で kick 位相を揃える
-                    sweep_idx = (sweep_idx + 1) % SWEEP_SCHEDULE.len();
-                    let cidx = SWEEP_SCHEDULE[sweep_idx];
-                    controller = make_controller(cidx);
-                    controller.start_segment(gnssdo::ControlInit {
-                        residual_trim_mppb: last_applied_freq_mppb - pred_mppb,
-                    });
-                    info!("CTRLSWEEP idx={} name={}", cidx as u32, controller.name());
-                }
             }
+            if edges_since_sweep >= CONTROLLER_SWEEP_EDGES
+                || edges_seg_total >= CONTROLLER_SWEEP_EDGES * 3
+            {
+                let forced = edges_since_sweep < CONTROLLER_SWEEP_EDGES;
+                edges_since_sweep = 0;
+                edges_seg_total = 0;
+                edges_since_kick = 0; // 新セグメント先頭で kick 位相を揃える
+                sweep_idx = (sweep_idx + 1) % SWEEP_SCHEDULE.len();
+                let cidx = SWEEP_SCHEDULE[sweep_idx];
+                controller = make_controller(cidx);
+                controller.start_segment(gnssdo::ControlInit {
+                    residual_trim_mppb: last_applied_freq_mppb - pred_mppb,
+                });
+                let (i_den, d_den, kp_inv, smith) = CTRL_GRID[cidx % CONTROLLER_LIST_LEN];
+                info!(
+                    "CTRLSWEEP idx={} name={} forced={} i_den={} d_den={} kp_inv={} smith_edges={}",
+                    cidx as u32,
+                    controller.name(),
+                    forced as u8,
+                    i_den,
+                    d_den,
+                    kp_inv,
+                    smith
+                );
+            }
+        }
+        if u.locked {
             edges_since_recal += 1;
             if edges_since_recal >= RECAL_EDGES {
                 edges_since_recal = 0;
@@ -651,6 +775,15 @@ async fn main(spawner: Spawner) {
         "pico-gnss: start (NMEA on UART0/GP1 @ {} baud, PPS on GP2 via PIO, GPSDO)",
         mt3333::GNSS_BAUD
     );
+
+    // 温度FF の runtime トグルを config の意図どおりに立てる (実験A=false)。gen_capture_task が毎エッジ
+    // update_temp で温度を供給するが、temp_ff_enable が false の間は predicted_freq は不変。
+    CLOCK.lock(|g| {
+        let mut g = g.borrow_mut();
+        g.set_temp_ff_enable(TEMP_FF_ENABLE);
+        g.set_temp_ff_params(TEMP_FF_SM_SHIFT, TEMP_FF_SHIFT, TEMP_FF_GAIN_Q8);
+        g.set_temp_ff_lag(TEMP_FF_LAG_Q8, TEMP_FF_DLEAD_SHIFT, RESID_OBS_SHIFT);
+    });
 
     // PPS on GP2 を PIO0 SM0 で rp-pps の PpsCapture でハードキャプチャ (~16ns 分解能)。
     let Pio {
@@ -777,9 +910,11 @@ async fn main(spawner: Spawner) {
     spawner_high.spawn(gen_capture_task(output, sm2, k, cfg_gp2, cfg_gp4).unwrap());
 
     // 内蔵温度センサ (運用時の熱監視。規律には未使用、PPSGEN ログに temp_raw を出すだけ)。
+    // DMA free-running で最大レート連続サンプリングする。DMA_CH0 は本 firmware 唯一の DMA 利用先。
     let adc = embassy_rp::adc::Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
     let ts = embassy_rp::adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);
-    spawner.spawn(temp_task(adc, ts).unwrap());
+    let temp_dma = embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs);
+    spawner.spawn(temp_task(adc, ts, temp_dma).unwrap());
 
     // UART0: TX=GP0 (モジュール設定送信), RX=GP1 (NMEA 受信)。
     static TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();

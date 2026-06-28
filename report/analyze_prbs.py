@@ -16,7 +16,15 @@ WARMUP = 120  # 切替後に捨てる整定エッジ(手法に共通の固定 wa
 KICK_EXCLUDE = 30  # kick 後に捨てるエッジ数(大振幅の回復過渡で steady h[k] を汚さない。recovery は別解析)
 
 # 制御器インデックス → 名前(firmware の make_controller と対応。表示用)。
-CIDX_NAMES = {0: "pll_prod", 1: "ab_boost", 2: "integ_rework", 3: "pll_smith128", 4: "naive_pid"}
+# firmware の CTRL_GRID と一致させること。実験により grid が違う:
+#   実験A (2-way ABBA): {0:kp8/se1, 1:kp4/se8} @ i_den=512
+#   実験B/B' (3-way 帯域): {0:i_den128, 1:i_den512, 2:i_den1024} @ 現行減衰形
+# 現状は実験B' (帯域×PRBS) の grid:
+CIDX_NAMES = {
+    0: "i_den128_wide",
+    1: "i_den512_cur",
+    2: "i_den1024_narrow",
+}
 
 rows = []  # (hw, inj, cidx, lk, kick)
 for l in open(LOG, errors="ignore"):

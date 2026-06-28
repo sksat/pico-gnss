@@ -11,9 +11,21 @@ use embassy_rp::uart::BufferedUartTx;
 use embassy_time::Timer;
 use embedded_io_async::Write;
 use heapless::String;
+use portable_atomic::{AtomicU32, Ordering};
 
 /// AE-GNSS-EXTANT (GYSFFMANC) のデフォルトボーレート 9600。
 pub const GNSS_BAUD: u32 = 9600;
+
+/// **実験**: dynamic model (PMTK886) を一定間隔で交互切替し、各セグメントの出力位相 (hwphase) を
+/// 受信を揃えた状態で比較する A/B。stationary(886,4) が wander を抑えるか増やすかを実機で決める
+/// (過去レポートの paired A/B は mobile が ~90ns 良かったが本番未採用・要再現)。
+/// **production 既定 false** (OP_MODE を起動時に一度だけ送り固定)。
+pub const DYNMODEL_AB: bool = false; // production 既定。実験後 revert。
+/// 各セグメントの長さ (秒)。切替直後は受信機内部フィルタの過渡があるので解析側で先頭を捨てる。
+const DYNMODEL_AB_SECS: u64 = 360; // 6 分/セグメント
+/// 現在の dynamic model コード (PPSGEN の `dynmode` 欄)。4=stationary(886,4)、0=mobile(886,0)、
+/// 255=未設定。gen_capture_task がこれを読んでログするので、セグメントごとに hwphase を層別できる。
+pub static DYN_MODE: AtomicU32 = AtomicU32::new(255);
 
 /// 運用モード = 受信機の dynamic model (MT3333 PMTK886)。
 /// **この GPSDO は固定 timing 用途**なので既定は `FixedTiming` (stationary)。受信機に
@@ -35,6 +47,23 @@ impl OpMode {
             OpMode::FixedTiming => "PMTK886,4", // stationary
             OpMode::Mobile => "PMTK886,0",      // normal
         }
+    }
+
+    /// `DYN_MODE` 欄に載せるコード (4=stationary, 0=mobile)。
+    const fn code(self) -> u32 {
+        match self {
+            OpMode::FixedTiming => 4,
+            OpMode::Mobile => 0,
+        }
+    }
+}
+
+/// dynmode コード (4=stationary, それ以外=mobile) → PMTK886 コマンド。A/B 実験で使う。
+const fn pmtk886_for(code: u32) -> &'static str {
+    if code == 4 {
+        "PMTK886,4"
+    } else {
+        "PMTK886,0"
     }
 }
 
@@ -80,7 +109,25 @@ pub async fn config_task(mut tx: BufferedUartTx) {
         send_pmtk(&mut tx, cmd).await;
         Timer::after_millis(600).await;
     }
+    // production は OP_MODE 固定。その固定コードを DYN_MODE に記録する (PPSGEN の dynmode 欄が常に有効)。
+    DYN_MODE.store(OP_MODE.code(), Ordering::Relaxed);
     info!("pico-gnss: PMTK config sent ({} cmds)", PMTK_INIT.len());
+    if DYNMODEL_AB {
+        // 実験: dynamic model を **ABBA** で交互送出 (単純交互の周期が環境周期にエイリアスするのを避け、
+        // 各セグメントの平均時刻位置を揃えて slow drift を一次で相殺する)。各セグメント DYNMODEL_AB_SECS。
+        // 解析側は dynmode で層別し、切替直後の過渡を捨て、隣接ペア差 (mobile−stationary) で比較する。
+        const SCHEDULE: [u32; 4] = [4, 0, 0, 4];
+        info!("DYNMODEL A/B: ABBA 886,4/886,0 every {=u64}s", DYNMODEL_AB_SECS);
+        let mut i = 0usize;
+        loop {
+            let code = SCHEDULE[i % SCHEDULE.len()];
+            send_pmtk(&mut tx, pmtk886_for(code)).await;
+            DYN_MODE.store(code, Ordering::Relaxed);
+            info!("DYNMODEL switch dynmode={=u32}", code);
+            Timer::after_secs(DYNMODEL_AB_SECS).await;
+            i += 1;
+        }
+    }
 }
 
 /// FW バージョン応答 ($PMTK705) か。受信機固有の talker 判定をここに集約。

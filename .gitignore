@@ -39,3 +39,4 @@ report/wander-review-spectrum.png
 
 # Claude Code workflow worktrees (transient; never commit)
 /.claude/worktrees/
+.analysis-tmp/

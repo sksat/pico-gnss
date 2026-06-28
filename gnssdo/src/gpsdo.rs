@@ -29,8 +29,8 @@ use crate::pps::{PpsEvent, PpsTracker, PpsTrackerConfig};
 /// the shift amounts have an upper-bound constraint (0..=63), which `NonZero` cannot express, so
 /// they are clamped with `min(63)` at use (to avoid i64 shift overflow).
 ///
-/// (`Debug`/`Default` is the minimum required by [`DisciplinedClock`]'s derive; `Clone`/`PartialEq`
-///  etc. are not added until comparison or cloning is actually needed.)
+/// (`Debug`/`Default` is the minimum required by [`DisciplinedClock`]'s derive; `Clone`/`Copy`/
+///  `PartialEq` etc. are not added until actually needed.)
 #[derive(Debug)]
 pub struct DisciplinedClockConfig {
     /// Post-lock EMA smoothing coefficient alpha = 1/2^`ema_shift` (default 5 ≈ 32-sample time
@@ -93,6 +93,67 @@ pub struct DisciplinedClockConfig {
     /// and decays slowly) leave a stale, wrong feedforward after the shock. Freezing the slope there
     /// keeps the feedforward sane through shocks. The *level* still updates; only the slope is held.
     pub slope_freeze_resid_mppb: i64,
+    /// **Temperature feedforward** of the crystal frequency. When `true`, [`update_temp`] +
+    /// [`predicted_freq_mppb`] use an online-learned model `freq ≈ base + k·(temp − ref)` to predict
+    /// the crystal frequency from temperature with **no EMA lag**, instead of the α-β level. On a bare
+    /// crystal the medium-term (64–300 s) frequency wander — the dominant output-phase wander — is
+    /// largely temperature-driven and ~80 % predictable from the on-chip sensor (verified out-of-sample
+    /// on real logs), so feeding it forward removes the lag-induced wander before the phase loop sees
+    /// it. Default `false` (α-β only; production unchanged until a temp source is wired + validated).
+    pub temp_ff_enable: bool,
+    /// EMA shift for the online temperature↔frequency regression (means + covariance/variance). The
+    /// coefficient `k = cov(temp,freq)/var(temp)` is learned with this smoothing; larger = slower,
+    /// more stable adaptation. Scale-robust (the variance normalizes `k`), so it works regardless of
+    /// the temperature span. Default 7 (≈128-sample). The crystal's temp coefficient is nonlinear, so
+    /// learning it online tracks the local slope.
+    pub temp_ff_shift: u32,
+    /// **Unused in the temperature-feedforward path** (kept only so old sweeps/configs that set it
+    /// still compile). The previous ad-hoc design blended a lead term `λ·k·(temp_sm − temp_lvl)` at
+    /// authority `λ` (Q8, 256 = 1.0) to hedge a noisily-learned `k`. The matched-lead design supersedes
+    /// it: the die→crystal thermal lag is compensated structurally (see
+    /// [`temp_ff_lag_q8`](Self::temp_ff_lag_q8)) so the feedforward runs at full (1.0) authority, and a
+    /// fixed-gain residual observer ([`resid_obs_shift`](Self::resid_obs_shift)) — not a haircut —
+    /// absorbs whatever temperature does not explain. `k` runaway is instead bounded by
+    /// [`temp_k_clamp_mppb`](Self::temp_k_clamp_mppb).
+    pub temp_ff_gain_q8: i64,
+    /// EMA shift that pre-smooths the raw temperature before it enters the regression **and** the
+    /// matched-lead low-pass (`temp_die_lp`). The on-chip sensor is coarsely quantized (≈1 raw step)
+    /// and ADC-noisy; multiplying that noise by the temperature coefficient `k` (tens of ppb/raw) would
+    /// inject step disturbances into the feedforward and, via errors-in-variables, bias `k` low (noise
+    /// inflates `var(temp)`). Smoothing the temperature at a shorter timescale than the long-term mean
+    /// (`temp_ff_shift`) removes the ADC noise while keeping the slow temperature-driven crystal wander
+    /// (64–300 s). Default 4 (≈16-sample); must be `< temp_ff_shift` or the deviation term collapses.
+    pub temp_ff_sm_shift: u32,
+    /// Matched-lead gain `τ/Ts` in Q8 fixed-point (256 = 1.0), default 1536 (≈6.0, i.e. τ≈6 s at the
+    /// 1 s loop rate). The on-chip die sensor leads the crystal by a 1st-order thermal lag τ, so the
+    /// crystal temperature estimate is `Tcrys_hat = die_lp + (τ/Ts)·Δdie_lp` — a discrete lead
+    /// compensator that cancels that lag (and the slow control loop's tracking lag) to first order,
+    /// instead of the previous noisy slope projection. 0 = no lead (low-passed die temperature only).
+    pub temp_ff_lag_q8: i64,
+    /// EMA shift that band-limits the die-temperature derivative feeding the matched lead (default 2 =
+    /// α 1/4). The lead multiplies the per-sample temperature *difference* by `τ/Ts`; differentiating
+    /// raw `temp_die_lp` would amplify residual ADC noise by that factor, so the difference is smoothed
+    /// before it is scaled. 0..=63 (clamped).
+    pub temp_ff_dlead_shift: u32,
+    /// Fixed observer gain `K = 1/2^resid_obs_shift` for the non-thermal residual frequency `r_resid`
+    /// (default 2 = K 0.25). Each locked edge updates `r_resid += (measured − f_ff − r_resid) >> shift`,
+    /// a constant-gain Kalman filter on the part of the frequency the temperature model does not
+    /// explain (crystal aging, supply, the DC offset). The feedforward then predicts `f_ff + r_resid`.
+    /// Smaller shift = faster but jitterier; 0..=63 (clamped).
+    pub resid_obs_shift: u32,
+    /// Loose clamp on the learned temperature coefficient `|k| = |cov/var|` in milli-ppb per **raw**
+    /// temperature unit (default 100 000 = 100 ppb/raw). Replaces the `λ` haircut as the runaway guard:
+    /// with matched-lead + observer the feedforward runs at full authority, so a transiently bad `k`
+    /// (cold-start, near-zero temperature span) must not drive the feedforward wild. The default is far
+    /// above any plausible crystal TC (≈0.5 ppm/°C) so it only catches blow-ups, not normal learning.
+    pub temp_k_clamp_mppb: i64,
+    /// Half-width (raw temperature units, default 64) of the clamp that bounds `Tcrys_hat` to
+    /// `temp_die_lp ± this`. The matched lead can spike if a single ADC glitch slips through the
+    /// derivative band-limit; clamping the crystal-temperature estimate around the low-passed die
+    /// temperature caps that transient. Generous enough not to clip a normal thermal ramp's lead (a few
+    /// raw units), so it is a guard, not a regular limiter. Scale it up with a finer (oversampled)
+    /// temperature source whose raw unit is smaller.
+    pub temp_ff_lead_clamp_raw: i64,
 }
 
 impl DisciplinedClockConfig {
@@ -111,6 +172,15 @@ impl DisciplinedClockConfig {
         pred_lead_samples: 1,
         residual_slope_widen: 8,
         slope_freeze_resid_mppb: 2_000_000,
+        temp_ff_enable: false,
+        temp_ff_shift: 7,
+        temp_ff_sm_shift: 4,
+        temp_ff_gain_q8: 64,
+        temp_ff_lag_q8: 1536,
+        temp_ff_dlead_shift: 2,
+        resid_obs_shift: 2,
+        temp_k_clamp_mppb: 100_000,
+        temp_ff_lead_clamp_raw: 64,
     };
 }
 
@@ -167,6 +237,28 @@ pub struct DisciplinedClock {
     epoch_query_ns: Option<u64>, // query-timebase epoch (for continuous query/holdover)
     epoch_unix_ns: Option<i64>,
     last_query_ns: Option<u64>, // last disciplined query-timebase time (for holdover measurement)
+    // Temperature feedforward (config.temp_ff_enable), state-space form (Ts = 1 s):
+    //   f_ff[k] = k·(Tcrys_hat − temp_ref)   (known input; k = temp_cov/temp_var)
+    //   r_resid = non-thermal residual frequency (random walk; fixed-gain observer)
+    //   output  = f_ff + r_resid
+    // The matched lead estimates the crystal temperature from the die sensor; the online regression
+    // (temp_sm/temp_mt/temp_mf_mppb/temp_cov/temp_var) learns the local TC `k`.
+    temp_now: i64,      // latest temperature reading (raw sensor units), via update_temp
+    temp_have: bool,    // a temperature has been observed
+    temp_sm: i64,       // short EMA of temperature (<<TEMP_FP), ADC-noise removed; regression input
+    temp_mt: i64,       // long EMA of temperature (<<TEMP_FP), the centering mean
+    temp_mf_mppb: i64,  // EMA of measured frequency (milli-ppb)
+    temp_cov: i64,      // EMA of (temp_sm−mt)·(freq−mf)
+    temp_var: i64,      // EMA of (temp_sm−mt)²
+    temp_ref: i64,      // reference temperature (first reading, <<TEMP_FP); f_ff is k·(Tcrys_hat−ref)
+    r_resid: i64,       // non-thermal residual frequency estimate (milli-ppb), observer state
+    // Matched-lead state (die temperature → crystal temperature). Kept separate from temp_sm so the
+    // lead path can later run at a higher rate (e.g. 30 Hz) than the 1 Hz regression; today they share
+    // temp_ff_sm_shift so temp_die_lp mirrors temp_sm.
+    temp_die_lp: i64,   // low-passed die temperature (<<TEMP_FP)
+    temp_die_prev: i64, // previous temp_die_lp, for the per-sample difference
+    temp_dlead: i64,    // band-limited derivative of temp_die_lp (<<TEMP_FP per sample)
+    tcrys_hat: i64,     // estimated crystal temperature (<<TEMP_FP) = die_lp + lead, clamped
 }
 
 /// Remove the integer-second offset and keep only the sub-second residual.
@@ -178,6 +270,11 @@ pub fn snap_to_second_ns(raw: i64) -> i64 {
     let secs = (raw + raw.signum() * 500_000_000) / 1_000_000_000;
     raw - secs * 1_000_000_000
 }
+
+/// Fixed-point fractional bits for the temperature-feedforward EMA states. Temperature is a
+/// small-range integer, so its EMAs are kept in `<<TEMP_FP` units to keep the `>>shift` increment of a
+/// 1-unit change from rounding to zero.
+const TEMP_FP: u32 = 8;
 
 impl DisciplinedClock {
     /// Create with the defaults ([`DisciplinedClockConfig::DEFAULT`]).
@@ -197,6 +294,19 @@ impl DisciplinedClock {
             epoch_query_ns: None,
             epoch_unix_ns: None,
             last_query_ns: None,
+            temp_now: 0,
+            temp_have: false,
+            temp_sm: 0,
+            temp_mt: 0,
+            temp_mf_mppb: 0,
+            temp_cov: 0,
+            temp_var: 0,
+            temp_ref: 0,
+            r_resid: 0,
+            temp_die_lp: 0,
+            temp_die_prev: 0,
+            temp_dlead: 0,
+            tcrys_hat: 0,
         }
     }
 
@@ -279,8 +389,126 @@ impl DisciplinedClock {
             self.freq_slope_mppb = (self.freq_slope_mppb + (resid >> slope_shift))
                 .clamp(-self.config.slope_max_mppb, self.config.slope_max_mppb);
         }
+        // Temperature feedforward (state-space form). Two coupled estimators, both only while locked:
+        //   1. Online regression of the *instantaneous* measured frequency (`measured_mppb`, not the
+        //      smoothed level) on temperature (means + covariance/variance EMAs) learns the local TC
+        //      `k = cov/var`. Regressing the level would only reproduce its EMA lag; regressing the
+        //      instantaneous measurement lets `k` reconstruct the temperature-driven frequency with no
+        //      lag, and PPS jitter, uncorrelated with temperature, averages out of the covariance.
+        //   2. A fixed-gain observer on the *non-thermal* residual `r_resid`: the innovation is the
+        //      measured frequency minus the matched-lead feedforward `f_ff` (evaluated at this edge's
+        //      crystal-temperature estimate) and the current residual. `r_resid` absorbs the part the
+        //      temperature cannot explain (DC offset, aging, supply), so the prediction `f_ff+r_resid`
+        //      tracks the true frequency with no EMA lag.
+        if self.config.temp_ff_enable && self.temp_have && self.is_locked() {
+            // Temperature is a small-range integer; keep its EMA states in fixed-point (`<<TEMP_FP`) so
+            // the `>>shift` EMA increment of a 1-unit temperature change does not round to zero.
+            let s = self.config.temp_ff_shift.min(30);
+            self.temp_mt += (self.temp_sm - self.temp_mt) >> s;
+            self.temp_mf_mppb += (measured_mppb - self.temp_mf_mppb) >> s;
+            let dt = self.temp_sm - self.temp_mt; // smoothed fixed-point temperature residual
+            let df = measured_mppb - self.temp_mf_mppb;
+            self.temp_cov += (dt * df - self.temp_cov) >> s;
+            self.temp_var += (dt * dt - self.temp_var) >> s;
+            // Residual observer: r_resid += K·(measured − f_ff_at_meas − r_resid), K = 1/2^shift.
+            // f_ff uses this edge's crystal-temperature estimate (the measurement time).
+            let f_ff_meas = self.temp_ff_mppb(self.tcrys_hat);
+            let innov = measured_mppb - f_ff_meas - self.r_resid;
+            let obs = self.config.resid_obs_shift.min(63);
+            self.r_resid += innov >> obs;
+        }
         self.samples += 1;
         FreqUpdate::Applied
+    }
+
+    /// Feed a temperature reading (raw sensor units) for the temperature feedforward
+    /// ([`DisciplinedClockConfig::temp_ff_enable`]). Call once per edge alongside
+    /// [`update_freq`](Self::update_freq). The first reading sets the model's reference. No-op for the
+    /// model unless `temp_ff_enable` is set, but always records the latest value.
+    pub fn update_temp(&mut self, temp: i64) {
+        self.temp_now = temp;
+        let t_fp = temp << TEMP_FP; // fixed-point temperature
+        if !self.temp_have {
+            self.temp_sm = t_fp;
+            self.temp_mt = t_fp;
+            self.temp_mf_mppb = self.freq_mppb;
+            // Matched-lead seed: reference and lead state at the first temperature (zero lead/deriv).
+            self.temp_ref = t_fp;
+            self.temp_die_lp = t_fp;
+            self.temp_die_prev = t_fp;
+            self.temp_dlead = 0;
+            self.tcrys_hat = t_fp;
+            self.temp_have = true;
+        } else {
+            // Short EMA to strip the ADC quantization/noise before it is fed forward (×k).
+            let sm = self.config.temp_ff_sm_shift.min(30);
+            self.temp_sm += (t_fp - self.temp_sm) >> sm;
+            // Matched lead: estimate the crystal temperature from the die sensor. Low-pass the die
+            // temperature (same band-limit as the regression input), take its band-limited per-sample
+            // derivative, and advance by τ/Ts to cancel the die→crystal thermal lag (and the slow loop
+            // lag) to first order: Tcrys_hat = die_lp + (τ/Ts)·d(die_lp).
+            self.temp_die_lp += (t_fp - self.temp_die_lp) >> sm;
+            let raw_d = self.temp_die_lp - self.temp_die_prev;
+            self.temp_die_prev = self.temp_die_lp;
+            let dl = self.config.temp_ff_dlead_shift.min(63);
+            self.temp_dlead += (raw_d - self.temp_dlead) >> dl;
+            let lead = (self.config.temp_ff_lag_q8 * self.temp_dlead) >> 8;
+            // Clamp the estimate around the low-passed die temperature to cap a transient glitch spike.
+            let clamp = self.config.temp_ff_lead_clamp_raw << TEMP_FP;
+            self.tcrys_hat =
+                (self.temp_die_lp + lead).clamp(self.temp_die_lp - clamp, self.temp_die_lp + clamp);
+        }
+    }
+
+    /// Matched-lead feedforward `f_ff = k·(Tcrys_hat − temp_ref)` in milli-ppb, with `k = cov/var`
+    /// clamped to the physical range ([`temp_k_clamp_mppb`](DisciplinedClockConfig::temp_k_clamp_mppb)).
+    /// 0 until the temperature has varied (var > 0). `tcrys_hat_fp` is a crystal-temperature estimate
+    /// in `<<TEMP_FP` fixed-point.
+    fn temp_ff_mppb(&self, tcrys_hat_fp: i64) -> i64 {
+        if self.temp_var <= 0 {
+            return 0;
+        }
+        let clamp = self.config.temp_k_clamp_mppb;
+        let k = self.temp_k_mppb_per_unit().clamp(-clamp, clamp); // milli-ppb per raw unit
+        let dt = tcrys_hat_fp - self.temp_ref; // <<TEMP_FP
+        (k as i128 * dt as i128 / (1i128 << TEMP_FP)) as i64
+    }
+
+    /// Toggle the temperature feedforward at runtime (sets [`DisciplinedClockConfig::temp_ff_enable`]).
+    pub fn set_temp_ff_enable(&mut self, en: bool) {
+        self.config.temp_ff_enable = en;
+    }
+
+    /// Tune the temperature feedforward at runtime (sets the three temp-FF knobs in
+    /// [`DisciplinedClockConfig`]): `sm_shift` = short EMA that strips ADC noise from the temperature
+    /// before it is fed forward ([`temp_ff_sm_shift`](DisciplinedClockConfig::temp_ff_sm_shift)),
+    /// `shift` = the regression mean/covariance EMA ([`temp_ff_shift`](DisciplinedClockConfig::temp_ff_shift)),
+    /// `gain_q8` = the lead authority in Q8 ([`temp_ff_gain_q8`](DisciplinedClockConfig::temp_ff_gain_q8)).
+    pub fn set_temp_ff_params(&mut self, sm_shift: u32, shift: u32, gain_q8: i64) {
+        self.config.temp_ff_sm_shift = sm_shift;
+        self.config.temp_ff_shift = shift;
+        self.config.temp_ff_gain_q8 = gain_q8;
+    }
+
+    /// Tune the matched-lead + residual-observer knobs at runtime: `lag_q8` = the lead gain `τ/Ts` in
+    /// Q8 ([`temp_ff_lag_q8`](DisciplinedClockConfig::temp_ff_lag_q8)), `dlead_shift` = the derivative
+    /// band-limit ([`temp_ff_dlead_shift`](DisciplinedClockConfig::temp_ff_dlead_shift)), `obs_shift` =
+    /// the residual observer gain ([`resid_obs_shift`](DisciplinedClockConfig::resid_obs_shift)).
+    pub fn set_temp_ff_lag(&mut self, lag_q8: i64, dlead_shift: u32, obs_shift: u32) {
+        self.config.temp_ff_lag_q8 = lag_q8;
+        self.config.temp_ff_dlead_shift = dlead_shift;
+        self.config.resid_obs_shift = obs_shift;
+    }
+
+    /// Learned temperature coefficient `k = cov(temp,freq)/var(temp)` in milli-ppb per **raw**
+    /// temperature unit, 0 until temperature has varied. For logging/diagnostics. (The internal EMAs
+    /// keep temperature in `<<TEMP_FP` fixed-point; this getter rescales to raw units.)
+    pub fn temp_k_mppb_per_unit(&self) -> i64 {
+        if self.temp_var > 0 {
+            (self.temp_cov << TEMP_FP) / self.temp_var
+        } else {
+            0
+        }
     }
 
     /// Call this when recovering to `Locked` from holdover/Irregular. Holds off the next
@@ -314,6 +542,26 @@ impl DisciplinedClock {
         d - (d as i128 * self.freq_mppb as i128 / 1_000_000_000_000i128) as i64
     }
 
+    /// Like [`corrected`](Self::corrected), but also projects the α-β frequency **slope** across the
+    /// elapsed interval — i.e. assumes the crystal keeps drifting as `level + slope·t` rather than
+    /// freezing at the last level. This matters during **holdover**: the level-only `corrected`
+    /// leaves a *quadratic* phase error (≈½·slope·t²) under a sustained temperature ramp, because the
+    /// frozen level grows staler as the ramp continues. Projecting the slope cancels that to first
+    /// order, turning the holdover endpoint error from O(t²) into O(t). Identical to `corrected` when
+    /// the slope is 0 (steady state), so it is safe to use unconditionally. The output *period*
+    /// already uses [`predicted_freq_mppb`](Self::predicted_freq_mppb) (slope-aware); this brings the
+    /// *time read-out* (`now_from_*`, holdover) to parity.
+    fn corrected_slope(&self, d: i64) -> i64 {
+        // Level term (same as `corrected`): d·level/1e12.
+        let level = (d as i128 * self.freq_mppb as i128 / 1_000_000_000_000i128) as i64;
+        // Slope term: ∫₀ᵈ (slope·(τ/1e9)) / 1e12 dτ = slope·d² / (2·1e9·1e12). The slope is
+        // milli-ppb per *sample* (≈1 s = 1e9 ns), so τ/1e9 converts elapsed ns → samples. i128 keeps
+        // d² (up to ~1e24 for a ~1000 s holdover) from overflowing.
+        let slope_term = (self.freq_slope_mppb as i128 * d as i128 * d as i128
+            / 2_000_000_000_000_000_000_000i128) as i64;
+        d - level - slope_term
+    }
+
     /// Estimated frequency offset (ppb).
     pub fn freq_ppb(&self) -> i64 {
         let half = 500 * self.freq_mppb.signum();
@@ -340,6 +588,15 @@ impl DisciplinedClock {
     /// `freq_slope_mppb`). Reduces to `freq_mppb()` when the slope is 0 (steady state) or
     /// `pred_lead_samples` is 0.
     pub fn predicted_freq_mppb(&self) -> i64 {
+        // Temperature feedforward (state-space): predict the crystal frequency as the matched-lead
+        // feedforward at the *latest* crystal-temperature estimate plus the non-thermal residual,
+        // `f_ff(Tcrys_hat) + r_resid`. The temperature term has no EMA lag (the matched lead cancels the
+        // die→crystal and loop lag), and r_resid carries the directly-measured part temperature cannot
+        // explain (DC offset, aging). Falls back to the α-β projection until temperature has varied
+        // (var>0) or if disabled — that fallback path is bit-identical to production.
+        if self.config.temp_ff_enable && self.temp_have && self.temp_var > 0 {
+            return self.temp_ff_mppb(self.tcrys_hat) + self.r_resid;
+        }
         self.freq_mppb + self.freq_slope_mppb * self.config.pred_lead_samples
     }
 
@@ -354,6 +611,17 @@ impl DisciplinedClock {
         let ep = self.epoch_capture_ns?;
         let eu = self.epoch_unix_ns?;
         Some(eu + self.corrected(capture_ns as i64 - ep as i64))
+    }
+
+    /// Slope-aware variant of [`now_from_capture_ns`](Self::now_from_capture_ns) for **holdover**:
+    /// projects the α-β frequency slope across the elapsed interval (see
+    /// [`corrected_slope`](Self::corrected_slope)). Use during long PPS outages under thermal drift,
+    /// where the level-only read-out accrues a quadratic error. Equals `now_from_capture_ns` in
+    /// steady state (slope 0).
+    pub fn now_from_capture_ns_holdover(&self, capture_ns: u64) -> Option<i64> {
+        let ep = self.epoch_capture_ns?;
+        let eu = self.epoch_unix_ns?;
+        Some(eu + self.corrected_slope(capture_ns as i64 - ep as i64))
     }
 
     /// **query-timebase** local time → disciplined UTC. For continuous query (ticker). Sub-second
@@ -393,6 +661,16 @@ impl DisciplinedClock {
     /// the GPSDO's "how accurate is my disciplined time" self-check. `None` before the epoch is set.
     pub fn prediction_residual_ns(&self, capture_ns: u64, unix_ns: i64) -> Option<i64> {
         self.now_from_capture_ns(capture_ns)
+            .map(|predicted| snap_to_second_ns(predicted - unix_ns))
+    }
+
+    /// Slope-aware variant of [`prediction_residual_ns`](Self::prediction_residual_ns) (holdover):
+    /// the disciplined clock's endpoint error when the frequency slope is projected across the gap.
+    /// Compare against `prediction_residual_ns` (level-only) to quantify the slope feedforward's
+    /// holdover benefit (the holdover-endpoint protocol, which escapes the same-receiver measurement
+    /// trap because the endpoint error grows with the gap while the receiver-PPS noise does not).
+    pub fn prediction_residual_holdover_ns(&self, capture_ns: u64, unix_ns: i64) -> Option<i64> {
+        self.now_from_capture_ns_holdover(capture_ns)
             .map(|predicted| snap_to_second_ns(predicted - unix_ns))
     }
 
@@ -502,6 +780,30 @@ impl Gnssdo {
     /// (the `rp-pps` crate provides them).
     pub fn on_utc(&mut self, capture_ns: u64, query_ns: u64, unix_ns: i64) {
         self.clock.update_epoch(capture_ns, query_ns, unix_ns);
+    }
+
+    /// Feed a temperature reading (raw sensor units) for the temperature feedforward. Passthrough to
+    /// [`DisciplinedClock::update_temp`]; call once per edge alongside the frequency discipline.
+    pub fn update_temp(&mut self, temp: i64) {
+        self.clock.update_temp(temp);
+    }
+
+    /// Toggle the temperature feedforward at runtime. Passthrough to
+    /// [`DisciplinedClock::set_temp_ff_enable`].
+    pub fn set_temp_ff_enable(&mut self, en: bool) {
+        self.clock.set_temp_ff_enable(en);
+    }
+
+    /// Tune the temperature feedforward at runtime. Passthrough to
+    /// [`DisciplinedClock::set_temp_ff_params`].
+    pub fn set_temp_ff_params(&mut self, sm_shift: u32, shift: u32, gain_q8: i64) {
+        self.clock.set_temp_ff_params(sm_shift, shift, gain_q8);
+    }
+
+    /// Tune the matched-lead + residual-observer knobs at runtime. Passthrough to
+    /// [`DisciplinedClock::set_temp_ff_lag`].
+    pub fn set_temp_ff_lag(&mut self, lag_q8: i64, dlead_shift: u32, obs_shift: u32) {
+        self.clock.set_temp_ff_lag(lag_q8, dlead_shift, obs_shift);
     }
 
     /// Disciplined UTC (ns) from a continuously-readable query-timebase local time.
@@ -883,6 +1185,138 @@ mod tests {
     fn now_is_none_before_epoch() {
         let c = DisciplinedClock::new();
         assert_eq!(c.now_from_capture_ns(123), None);
+    }
+
+    #[test]
+    fn temp_ff_holdover_tracks_continuous_temp() {
+        // 自己クロック=水晶周波数は連続量で、温度で常に drift する。温度 FF (matched-lead + 残差 observer)
+        // の本命価値は holdover: PPS が切れて周波数を直測できなくても、温度センサは生きているので、
+        // f_ff = k·(Tcrys_hat − ref) を温度変化に合わせて連続的に動かし、非熱残差 r_resid は凍結して外挿する。
+        // ここでは warmup で k と r_resid を学習 → 周波数更新を止め (holdover) → 温度だけ与え続け、温度 FF の
+        // 予測 (f_ff + r_resid) が「level 凍結」より真の温度駆動周波数に桁で近いことを確認する。
+        let (k_true, f0, tref) = (4000i64, 3_000_000i64, 880i64); // 4 ppb/raw
+        let cfg = DisciplinedClockConfig {
+            temp_ff_enable: true,
+            ..DisciplinedClockConfig::DEFAULT
+        };
+        let mut c = DisciplinedClock::with_config(cfg);
+        let truef = |temp: i64| f0 + k_true * (temp - tref); // mppb
+        // warmup: 定常サイクリング温度で k を学習 (周波数も温度で動く)。
+        let warm = |n: i64| tref + (10.0 * (n as f64 * core::f64::consts::TAU / 60.0).sin()) as i64;
+        for n in 0..1000i64 {
+            let t = warm(n);
+            c.update_temp(t);
+            c.update_freq(1_000_000_000 + truef(t) / 1000);
+        }
+        let frozen_level = c.freq_mppb(); // holdover で凍結される α-β level
+        let base = warm(999);
+        // holdover: 周波数更新を止め、温度だけランプさせて与える (連続量)。
+        let (mut e_ff, mut e_frozen) = (0i64, 0i64);
+        for h in 1..=120i64 {
+            let t = base + h; // 温度が holdover 中に 1 raw/s でランプ
+            c.update_temp(t);
+            let tf = truef(t);
+            e_ff += (c.predicted_freq_mppb() - tf).abs();
+            e_frozen += (frozen_level - tf).abs();
+        }
+        // 温度 FF holdover 外挿は level 凍結より終端で桁違いに良い (>2x)。
+        assert!(
+            e_ff * 2 < e_frozen,
+            "temp-aware holdover should beat frozen level: ff={e_ff}mppb frozen={e_frozen}mppb"
+        );
+        // 学習した係数が真値に収束 (±50%)。
+        let k = c.temp_k_mppb_per_unit();
+        assert!(
+            (k - k_true).abs() < k_true / 2,
+            "learned temp coeff should approach truth: k={k} expected~{k_true}"
+        );
+    }
+
+    #[test]
+    fn temp_ff_disabled_is_unchanged_and_falls_back() {
+        // 既定 (disabled) では update_temp を呼んでも predicted は α-β のまま (production 不変)。
+        // 温度をランプさせても (有効なら f_ff が育つ条件) disabled は α-β path に固定。
+        let mut c = DisciplinedClock::new();
+        // 温度を呼ばない参照クロック (= production)。同じ周波数列を与える。
+        let mut ref_c = DisciplinedClock::new();
+        for n in 0..60i64 {
+            c.update_temp(900 + n); // 温度をランプ
+            c.update_freq(1_000_002_500 + n);
+            ref_c.update_freq(1_000_002_500 + n);
+        }
+        // disabled の predicted は α-β projection そのもの。
+        assert_eq!(
+            c.predicted_freq_mppb(),
+            c.freq_mppb() + c.freq_slope_mppb() * c.config().pred_lead_samples
+        );
+        // update_temp を呼んだ／呼ばないで predicted が bit 一致 (production 完全不変)。
+        assert_eq!(c.predicted_freq_mppb(), ref_c.predicted_freq_mppb());
+        assert_eq!(c.freq_mppb(), ref_c.freq_mppb());
+        assert_eq!(c.temp_k_mppb_per_unit(), 0); // disabled では回帰を回さない
+    }
+
+    #[test]
+    fn corrected_slope_projects_the_frequency_slope() {
+        // 凍結状態を直接与えて slope 項の数学を厳密に固定する。
+        let mut c = DisciplinedClock::new();
+        c.freq_mppb = 0; // level 0 → level 補正を消して slope 項を単離
+        c.freq_slope_mppb = 1000; // +1 ppb/s ランプ (mppb/sample)
+        let d = 100i64 * 1_000_000_000; // 100 s 経過
+        // slope 項 = slope·d²/2e21 = 1000·(1e11)²/2e21 = 1000·1e22/2e21 = 5000 ns。
+        assert_eq!(c.corrected(d), d, "level 0 → level 補正なし");
+        assert_eq!(c.corrected_slope(d), d - 5000, "slope 項 = 5000 ns");
+        // 負の slope は逆符号。
+        c.freq_slope_mppb = -1000;
+        assert_eq!(c.corrected_slope(d), d + 5000);
+    }
+
+    #[test]
+    fn slope_aware_holdover_cuts_ramp_endpoint_error() {
+        // 温度ランプ下の holdover: level-only は O(H²)、slope-aware は O(H)。
+        // 凍結状態を直接与え (tracker 収束を介さず厳密に)、H 秒の holdover 終端誤差を比べる。
+        let f0 = 3000i64; // +3000 ppb 始点
+        let r = 2i64; // +2 ppb/s ランプ
+        let h = 300i64;
+        let mut c = DisciplinedClock::new();
+        c.freq_mppb = f0 * 1000; // level = 始点 (mppb)
+        c.freq_slope_mppb = r * 1000; // slope = ランプ率 (mppb/sample)
+        c.update_epoch(0, 0, 0);
+        // holdover 中、水晶はランプを継続: 秒 k の周波数 = f0 + r·k (ppb)。
+        // local 経過 d = Σ_{k=0}^{H-1}(1e9 + (f0 + r·k)) ns。
+        let mut d = 0i64;
+        for k in 0..h {
+            d += 1_000_000_000 + f0 + r * k;
+        }
+        let unix_end = h * 1_000_000_000; // 真の経過 = H 秒
+        let e_level = c.prediction_residual_ns(d as u64, unix_end).unwrap();
+        let e_slope = c.prediction_residual_holdover_ns(d as u64, unix_end).unwrap();
+        // level-only は ~r·H²/2 ≈ 90µs、slope-aware は O(H) ~数百 ns。10× 以上の改善を回帰固定。
+        assert!(
+            e_level.abs() > 10_000,
+            "level-only holdover error should be large under a ramp: {e_level}ns"
+        );
+        assert!(
+            e_slope.abs() * 10 < e_level.abs(),
+            "slope-aware should cut holdover endpoint error >10x: level={e_level}ns slope={e_slope}ns"
+        );
+    }
+
+    #[test]
+    fn slope_aware_equals_level_when_no_slope() {
+        // 定常 (slope=0) では slope-aware = level-only (無害)。
+        let mut c = DisciplinedClock::new();
+        for _ in 0..40 {
+            c.update_freq(1_000_002_500); // +2500 ppb 一定 → slope 0
+        }
+        assert_eq!(c.freq_slope_mppb(), 0);
+        c.update_epoch(0, 0, 0);
+        let d = 300i64 * (1_000_000_000 + 2500); // 300 s ぶんの local tick
+        let unix = 300i64 * 1_000_000_000;
+        assert_eq!(
+            c.prediction_residual_ns(d as u64, unix),
+            c.prediction_residual_holdover_ns(d as u64, unix),
+            "slope 0 では slope-aware は level-only と一致するべき"
+        );
     }
 
     #[test]
