@@ -215,11 +215,13 @@ raw socket 5555 は生きているが SCPI が **lazy-flush** で厄介:
   **ch2 波形バイトのハッシュで dedup** して 1 PPS=1 フレームにする(offset が連続推移すれば取りこぼし無しの証拠)。
   `:SINGle`/status polling/RECORD モードは raw socket では脆い・不明瞭(polling は *CLS でフレーム消失 or desync、
   DHO804 の RECORD コマンドツリーは要マニュアル)。RUN-grab-dedup が一番素直で確実。
-- **再起動後チェックは起動直後から撮る**。`scope_raw.py convergence <out.gif>` は boot から PLL 引き込みを撮り、
-  **per-frame 自動タイムスケール**で「大オフセット→収束」を可視化する(実測 +36µs→+6ns)。スケールは **1-2-5 ラダーを
-  1フレーム1ノッチずつ**緩やかに動かす(急な decade 飛びは見づらい)。エッジが画面外に出たときだけ素早く widen して
-  見失わない。xinc はクエリせず `sdiv*1e7`(NORMal は ~1000pt/10div)で計算(block 後の `:WAV:FORMat?` 応答と
-  desync しないため)。
+- **再起動後チェックは起動直後から撮る**。`scope_raw.py convergence <out.gif> [dur]` は boot から PLL 引き込みを
+  **毎 PPS**(上の RUN-grab-dedup)で撮り、**per-frame 自動タイムスケール**で「大オフセット→収束」を可視化する
+  (実測 +14〜36µs→±数十ns)。スケールは **1-2-5 ラダーを 1フレーム1ノッチずつ**緩やかに動かす(急な decade 飛びは
+  見づらい)。エッジが画面外なら素早く widen して見失わない。timebase を変えたら **新トリガを1つ待ってから**採用
+  (旧スケールのフレーム取り違え防止)。xinc はクエリせず `sdiv*1e7`(NORMal は ~1000pt/10div)で計算(block 後の
+  `:WAV:FORMat?` 応答と desync しないため)。毎 PPS×長尺はフレーム膨大(600s=600枚)なので既定 ~180s(引き込み+定常、
+  ~80-150枚)、frames は 400 で cap。
 
 ## 他機種への移植
 

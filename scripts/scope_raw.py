@@ -213,53 +213,53 @@ def _step_toward(cur_s, tgt_s):
 
 
 def cmd_convergence(argv):
+    """Post-boot convergence GIF at EVERY PPS (1 frame/s). Combines the every-PPS capture
+    (NORMal RUN + grab back-to-back + ch2-hash dedup) with the gradual per-frame auto
+    timescale (1-2-5 ladder, <=1 notch/frame; widen fast only when the edge is off-screen).
+    Every-PPS x long = huge, so default ~180 s (pull-in + ~90 s steady ~= 150 frames); pass
+    dur to extend (frames cap at 400)."""
+    from io import BytesIO
     from PIL import Image, ImageDraw, ImageFont
     out = argv[0]
-    dur = float(argv[1]) if len(argv) > 1 else 280.0
-    interval = 4.5                                    # denser frames so the 1-notch zoom can follow
-    sc = RawScope(); setup(sc, 5e-6)                 # start wide (5 us/div)
+    dur = float(argv[1]) if len(argv) > 1 else 180.0
+    sc = RawScope(); setup(sc, 5e-6, ch3=False)
+    sc.set_(":TRIGger:SWEep NORMal"); sc.set_(":RUN"); time.sleep(1.2)
     try:
         font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 22)
     except Exception:
         font = ImageFont.load_default()
-
-    def capture(sdiv):
-        """One on-screen triggered frame at sdiv. Only WIDEN (fast) if the edge is off the
-        screen, so we never lose it; never zoom in here -- the gradual zoom is between frames."""
-        for _ in range(8):
-            sc.set_(f":TIMebase:MAIN:SCALe {sdiv:.3e}"); sc.set_(":TIMebase:MAIN:OFFSet 0")
-            sc.set_(":SINGle"); time.sleep(1.4)
-            png = sc.screenshot_png(); b1 = sc.waveform(1)
-            if rising_edge(b1) is None:
-                sc.drain(0.2); continue                 # trigger not fired -> retry
-            e1 = rising_edge(b1); e2 = rising_edge(sc.waveform(2))
-            if e2 is None and sdiv < 1e-5:
-                sdiv = _step_toward(sdiv, 1e-5); continue   # off-screen -> widen one notch & retry
-            off = (e2 - e1) * (sdiv * 1e7) if e2 is not None else None
-            return png, off, sdiv
-        return png, None, sdiv
-
-    from io import BytesIO
-    frames = []; sdiv = 5e-6; t0 = time.time()
-    while time.time() - t0 < dur:
+    frames = []; sdiv = 5e-6; applied = None; last_key = None; t0 = time.time()
+    while time.time() - t0 < dur and len(frames) < 400:
         el = time.time() - t0
-        try:                                          # a transient scope timeout must not kill the run
-            png, off, sdiv = capture(sdiv)
+        try:
+            if applied != sdiv:                         # apply scale only on change (next trigger uses it)
+                sc.set_(f":TIMebase:MAIN:SCALe {sdiv:.3e}"); sc.set_(":TIMebase:MAIN:OFFSet 0"); applied = sdiv
+                sc.drain(0.1); time.sleep(1.1); last_key = None   # let a fresh trigger fill at the new scale
+            b2 = sc.waveform(2); key = hash(bytes(b2))  # cheap read first for dedup
+            if key == last_key:
+                continue                                # same PPS frame, wait for the next trigger
+            last_key = key
+            e2 = rising_edge(b2)
+            if e2 is None:                              # edge off-screen -> widen (gradual) and retry
+                if sdiv < 1e-5:
+                    sdiv = _step_toward(sdiv, 1e-5)
+                continue
+            e1 = rising_edge(sc.waveform(1)); png = sc.screenshot_png()
+            off = (e2 - e1) * (sdiv * 1e7) if e1 is not None else None
             img = Image.open(BytesIO(png)).convert("RGB"); d = ImageDraw.Draw(img)
             if off is not None:
-                txt = f"t={el:5.0f}s   offset={off:+8.1f} ns   {sdiv*1e9:.0f} ns/div"
+                txt = f"t={el:5.0f}s  PPS#{len(frames)+1}  offset={off:+8.1f} ns  {sdiv*1e9:.0f} ns/div"
                 sdiv = _step_toward(sdiv, _pick_sdiv(off))   # gradual: <=1 ladder notch / frame
             else:
-                txt = f"t={el:5.0f}s   offset=off-screen   {sdiv*1e9:.0f} ns/div"
-            d.rectangle([8, 60, 780, 96], fill=(0, 0, 0)); d.text((14, 62), txt, fill=(255, 255, 0), font=font)
+                txt = f"t={el:5.0f}s  PPS#{len(frames)+1}  {sdiv*1e9:.0f} ns/div"
+            d.rectangle([8, 60, 820, 96], fill=(0, 0, 0)); d.text((14, 62), txt, fill=(255, 255, 0), font=font)
             frames.append(img.convert("P", palette=Image.ADAPTIVE)); print(txt, flush=True)
         except Exception as ex:
             print(f"t={el:5.0f}s ERR {ex!r}", flush=True); sc.drain(0.4)
-        time.sleep(interval)
     sc.close()
     if frames:
         frames[0].save(out, save_all=True, append_images=frames[1:], duration=350, loop=0, optimize=True)
-        print(f"GIF saved: {out} ({len(frames)} frames)")
+        print(f"GIF saved: {out} ({len(frames)} PPS frames)")
 
 
 def cmd_wander(argv):
