@@ -195,7 +195,12 @@ raw socket 5555 は生きているが SCPI が **lazy-flush** で厄介:
   `:SINGle` + 固定待ち(>1 PPS 周期 ~1.4s)で独立フレームを1枚。**トリガ発火は ch1(=トリガ源)のエッジ有無で
   検証**(status polling より安全。空フレーム=トリガ未発火を弾ける)。RDELay 等の delay measurement は raw では
   返らないので**波形 download + 自前エッジ検出**。
-- 実装は `scripts/scope_raw.py`(`RawScope` + CLI `phase`/`shot`/`convergence`)。`rigol_vxi11.py` が死んだら此方。
+- 実装は `scripts/scope_raw.py`(`RawScope` + CLI `phase`/`shot`/`convergence`/`wander`)。`rigol_vxi11.py` が死んだら此方。
+- **統合 GIF**: `scripts/scope_combo.py <rtt_log> <out.gif> [dur] [sdiv_ns]` は上段=オシロ波形(毎PPS)、
+  下段=firmware パラメータ時系列(scope offset / hwphase_ns / ppb / temp_raw を毎PPSで成長プロット、現在点●)
+  を1枚に重ねる。scope は RUN-grab-dedup で毎PPS、パラメータは **live RTT ログ(`cargo run` の出力)を tail** して
+  最新 PPSGEN/TIME 値を snapshot し wall-clock で同期(両方 live なので sub-second で揃う)。`cargo run > <rtt_log>`
+  を並走させて使う。y 軸は expanding(縮まない)でアニメのジッタを防ぐ。
 
 ## 波形/スクリーンショットの記録
 
