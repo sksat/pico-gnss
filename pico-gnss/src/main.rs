@@ -420,7 +420,9 @@ async fn naive_pps_out_task(mut out: Output<'static>) {
         OUT_GEN.fetch_add(1, Ordering::Release);
         // 次の立ち上がり時刻 = 今回の deadline + dither 周期 (S1 は水晶推定を適用、S0 は公称)。
         let freq_mppb = if apply_freq(PRECISION_STAGE) {
-            CLOCK.lock(|g| g.borrow().predicted_freq_mppb())
+            // 操舵には clamp 版を使う (fast 熱過渡で predicted が過反応しても出力周期を殴らない)。
+            // raw predicted は holdover/診断のために steering_freq_mppb 内で温存される。
+            CLOCK.lock(|g| g.borrow().steering_freq_mppb())
         } else {
             0
         };
@@ -496,16 +498,19 @@ async fn naive_pps_in_task(mut gps: Input<'static>) {
         }
         // 段共通スキーマの PPSGEN 行 (PIO 経路と同一フィールド列)。非PIO で意味のない制御項は 0。
         // hwphase 欄 = soft open-loop modulo phase、olmod=1 (常に開ループ modulo phase)。
-        let (slope_mppb, temp_k, ff_delta_mppb) = CLOCK.lock(|g| {
+        let (slope_mppb, temp_k, ff_delta_mppb, steer_ff_mppb) = CLOCK.lock(|g| {
             let g = g.borrow();
             (
                 g.freq_slope_mppb(),
                 g.temp_k_mppb_per_unit(),
+                // ff_delta = raw predicted の操舵寄与 (clamp 前、過反応を診断ログに残す)。
                 g.predicted_freq_mppb() - g.freq_mppb(),
+                // steer_ff = 実際に操舵へ渡る clamp 後の FF 偏差 (clamp 発火の A/B 証跡)。
+                g.steering_freq_mppb() - g.freq_mppb(),
             )
         });
         info!(
-            "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={} dith_ticks={}",
+            "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={} dith_ticks={} steer_ff={}",
             count,
             interval_ns,
             interval_ns as i64 - 1_000_000_000,
@@ -532,7 +537,8 @@ async fn naive_pps_in_task(mut gps: Input<'static>) {
             PRECISION_STAGE as u32,
             recal_eff(PRECISION_STAGE),
             abs_off(PRECISION_STAGE),
-            NAIVE_DITH_TICKS.load(Ordering::Relaxed) // dith_ticks: 実適用 dither 周期 (sigma-delta 証跡)
+            NAIVE_DITH_TICKS.load(Ordering::Relaxed), // dith_ticks: 実適用 dither 周期 (sigma-delta 証跡)
+            steer_ff_mppb // steer_ff: clamp 後の操舵 FF 偏差 (steering − level)
         );
     }
 }
@@ -885,18 +891,21 @@ async fn gen_capture_task(
         let drop_on_mispair = phase_servo(PRECISION_STAGE);
         let olmod = !phase_servo(PRECISION_STAGE);
         // 旧手法 (比較用 emit のみ): 出力エッジの UTC 時刻 (Instant 経由) → 秒境界からのズレ。
-        let (pred_mppb, level_mppb, temp_k, slope_mppb, phase) = CLOCK.lock(|g| {
+        let (pred_mppb, steer_mppb, level_mppb, temp_k, slope_mppb, phase) = CLOCK.lock(|g| {
             let g = g.borrow();
             (
-                g.predicted_freq_mppb(),
-                g.freq_mppb(),            // α-β level (温度FF lead を含まない)
+                g.predicted_freq_mppb(), // raw (holdover/診断用、clamp なし)
+                g.steering_freq_mppb(),  // clamp 後 (出力周期の操舵に使う)
+                g.freq_mppb(),           // α-β level (温度FF lead を含まない)
                 g.temp_k_mppb_per_unit(), // 学習した温度係数 (0=未学習)
                 g.freq_slope_mppb(),
                 g.now_from_query_ns(now_local_ns()).map(snap_to_second_ns),
             )
         });
         // 温度FF の操舵寄与 (predicted − level)。temp_k と併せて温度FF が実際に効いているかの診断。
+        // ff_delta は raw predicted の寄与 (clamp 前、過反応を残す)、steer_ff は実操舵の clamp 後寄与。
         let ff_delta_mppb = pred_mppb - level_mppb;
+        let steer_ff_mppb = steer_mppb - level_mppb;
         // 制御に使う位相: PIO ハード(stage②)。PHASE_USE_HW=false で旧 Instant 測定に切替 (比較計測用)。
         let ctrl = if PHASE_USE_HW {
             hwphase_ns
@@ -933,10 +942,12 @@ async fn gen_capture_task(
         // 位相補正は dither が cycle に変換して引く。
         // 開窓 (exp_hold): 位相補正なし。周波数は EXP_HOLD_TRIM=true なら学習済みトリムを保持 (pred + 保持 trim)、
         // false なら pred のみ (補正を丸ごと捨てる)。閉窓/本番は通常どおり制御器のトリム + 位相。
+        // 操舵には clamp 版 (steer_mppb) を使う。fast 熱過渡で raw predicted が過反応しても出力周期を
+        // 殴らない。raw predicted は holdover/診断 (ff_delta) のために pred_mppb として温存している。
         let freq_mppb = if exp_hold {
-            pred_mppb + if EXP_HOLD_TRIM { exp_held_trim } else { 0 }
+            steer_mppb + if EXP_HOLD_TRIM { exp_held_trim } else { 0 }
         } else {
-            pred_mppb + u.trim_mppb
+            steer_mppb + u.trim_mppb
         };
         last_applied_freq_mppb = freq_mppb; // 制御器巡回の公平切替用 (次手法へ residual trim を継ぐ)
         // PRBS 自己同定: ロック中、出力位相に既知の ±PRBS_AMP_NS 擬似ランダム外乱を注入(plant 入力)。ループは
@@ -973,7 +984,7 @@ async fn gen_capture_task(
             // **末尾 append-only** (PLAN 採用#10): prefix と既存項は byte 不変。olmod=S2 開ループ modulo
             // phase 列フラグ、stage/recal_eff/abs_off = この段の実効設定 (ログが一次情報・採用#3/#4)。
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={} dith_ticks={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={} dith_ticks={} steer_ff={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
@@ -1000,7 +1011,8 @@ async fn gen_capture_task(
                 PRECISION_STAGE as u32,
                 recal_eff(PRECISION_STAGE),
                 abs_off(PRECISION_STAGE),
-                0u32 // dith_ticks: PIO 経路は dither 不使用 (両経路スキーマ一致のため 0)
+                0u32, // dith_ticks: PIO 経路は dither 不使用 (両経路スキーマ一致のため 0)
+                steer_ff_mppb // steer_ff: clamp 後の操舵 FF 偏差 (steering − level)
             );
         }
         last_x = Some(x);
@@ -1026,7 +1038,10 @@ async fn gen_capture_task(
                 let cidx = SWEEP_SCHEDULE[sweep_idx];
                 controller = make_controller(cidx);
                 controller.start_segment(gnssdo::ControlInit {
-                    residual_trim_mppb: last_applied_freq_mppb - pred_mppb,
+                    // 出力基準は clamp 版 steer_mppb なので継ぎ目の連続性も steer 基準で取る。
+                    // pred_mppb 基準だと clamp 発火中に (pred−steer) の差分が次セグメント初期 trim へ
+                    // ステップ混入する (sweep 時のみ顕在)。
+                    residual_trim_mppb: last_applied_freq_mppb - steer_mppb,
                 });
                 let (i_den, d_den, kp_inv, smith) = CTRL_GRID[cidx % CONTROLLER_LIST_LEN];
                 info!(

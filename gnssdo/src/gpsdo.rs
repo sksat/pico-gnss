@@ -154,6 +154,21 @@ pub struct DisciplinedClockConfig {
     /// raw units), so it is a guard, not a regular limiter. Scale it up with a finer (oversampled)
     /// temperature source whose raw unit is smaller.
     pub temp_ff_lead_clamp_raw: i64,
+    /// Clamp (milli-ppb, default 100 000 = 100 ppb) on the feedforward **deviation** handed to the
+    /// output steering — `steering_freq_mppb() = freq_mppb + clamp(predicted − freq_mppb, ±this)`.
+    /// In a fast thermal transient the feedforward `predicted` over-reacts (on hardware ≈ −1300 ppb
+    /// while the settled change was ≈ −0.8 ppb), which would slam the output period; bounding the
+    /// steered deviation to a physically plausible range absorbs that spike. It does **not** touch
+    /// [`predicted_freq_mppb`](DisciplinedClock::predicted_freq_mppb) (holdover keeps the raw value).
+    /// The legitimate feedforward is small (α-β slope `slope_max·pred_lead` = 5 ppb; the matched-lead
+    /// caps at ~41 ppb in the host model with k=4 ppb/raw), so 100 ppb leaves normal operation
+    /// untouched.
+    ///
+    /// The 100-ppb default is **provisional**: the host model internally clamps the matched-lead FF and
+    /// does **not** reproduce the hardware −1300 ppb over-reaction (likely the `r_resid` observer
+    /// spiking on die↔crystal model mismatch during fast heating), so the bound and its actual effect
+    /// must be tuned and validated on hardware, not from the host plant.
+    pub steer_ff_bound_mppb: i64,
 }
 
 impl DisciplinedClockConfig {
@@ -181,6 +196,7 @@ impl DisciplinedClockConfig {
         resid_obs_shift: 2,
         temp_k_clamp_mppb: 100_000,
         temp_ff_lead_clamp_raw: 64,
+        steer_ff_bound_mppb: 100_000,
     };
 }
 
@@ -598,6 +614,29 @@ impl DisciplinedClock {
             return self.temp_ff_mppb(self.tcrys_hat) + self.r_resid;
         }
         self.freq_mppb + self.freq_slope_mppb * self.config.pred_lead_samples
+    }
+
+    /// Frequency (milli-ppb) to feed the **output period steering** — the same as
+    /// [`predicted_freq_mppb`](Self::predicted_freq_mppb) but with the feedforward *deviation* from the
+    /// α-β level bounded to ±[`steer_ff_bound_mppb`](DisciplinedClockConfig::steer_ff_bound_mppb).
+    /// `predicted` itself is left raw; only the value handed to the steering is clamped, so a fast
+    /// thermal transient where the temperature feedforward `predicted` over-reacts cannot slam the
+    /// output period. On hardware a fast hand-heating step drove the matched-lead `predicted` deviation
+    /// to ≈ −1300 ppb while the settled crystal change was only ≈ −0.8 ppb (a ~1700× over-reaction),
+    /// kicking the output phase by several µs.
+    ///
+    /// Holdover does **not** go through this getter: the time read-out
+    /// ([`now_from_capture_ns_holdover`](Self::now_from_capture_ns_holdover) and `corrected_slope`)
+    /// extrapolates from `freq_mppb`/`freq_slope_mppb` directly, so its slope-aware projection is
+    /// untouched. The clamp is dormant in normal operation: the α-β-only deviation is ≤
+    /// `slope_max·pred_lead` (= 5 ppb), and the matched-lead feedforward caps at ~41 ppb in the host
+    /// model, both inside the 100-ppb bound, so this is bit-identical to
+    /// `predicted_freq_mppb` until a fast transient pushes the deviation past the bound.
+    pub fn steering_freq_mppb(&self) -> i64 {
+        let raw = self.predicted_freq_mppb();
+        let delta = raw - self.freq_mppb;
+        self.freq_mppb
+            + delta.clamp(-self.config.steer_ff_bound_mppb, self.config.steer_ff_bound_mppb)
     }
 
     /// Whether enough samples have been seen to lock the frequency.
@@ -1253,6 +1292,139 @@ mod tests {
         assert_eq!(c.predicted_freq_mppb(), ref_c.predicted_freq_mppb());
         assert_eq!(c.freq_mppb(), ref_c.freq_mppb());
         assert_eq!(c.temp_k_mppb_per_unit(), 0); // disabled では回帰を回さない
+    }
+
+    #[test]
+    fn steering_clamp_bounds_feedforward_on_fast_thermal_transient() {
+        // 速い熱過渡では温度FF (matched-lead) が過反応し、predicted_freq_mppb が物理的にありえない量
+        // 振れる (実機で実変化の ~1700 倍 = −1300 ppb)。steering_freq_mppb は predicted の生値を
+        // holdover 用にそのまま残しつつ、**操舵に渡す FF 偏差** (steering − level) を ±steer_ff_bound_mppb
+        // に bound する。ここでは warmup で k・r_resid を学習 → 周波数直測を止め (holdover) → die 温度を
+        // 速くランプさせ、predicted は大きく振れてよいが steering の FF 偏差が常に bound 内に収まることを確認。
+        let (k_true, f0, tref) = (4000i64, 3_000_000i64, 880i64); // 4 ppb/raw
+        // 機構を示すため bound を明示的に小さく取る。host モデルは matched-lead FF を内部で ~41 ppb に
+        // clamp してしまい hardware の −1300 ppb を再現しないので、default(100 ppb)では legitimate FF が
+        // bound を超えず clamp 発火を示せない。小 bound で「偏差が bound を超える状況で steering が飽和する」
+        // 機構を検証する (実機での効果は別途オシロで検証)。
+        let cfg = DisciplinedClockConfig {
+            temp_ff_enable: true,
+            steer_ff_bound_mppb: 5_000,
+            ..DisciplinedClockConfig::DEFAULT
+        };
+        let bound = cfg.steer_ff_bound_mppb;
+        let mut c = DisciplinedClock::with_config(cfg);
+        let truef = |temp: i64| f0 + k_true * (temp - tref); // mppb
+        // warmup: 定常サイクリング温度で k と r_resid を学習。
+        let warm = |n: i64| tref + (10.0 * (n as f64 * core::f64::consts::TAU / 60.0).sin()) as i64;
+        for n in 0..1000i64 {
+            let t = warm(n);
+            c.update_temp(t);
+            c.update_freq(1_000_000_000 + truef(t) / 1000);
+        }
+        let level = c.freq_mppb(); // holdover 中は α-β level が凍結される
+        let base = warm(999);
+        // holdover: 周波数直測を止め、die 温度だけ速くランプさせる。matched-lead の微分項が跳ね、
+        // f_ff = k·(Tcrys_hat − ref) が過反応 → predicted が bound を大きく超える。
+        let mut saw_overreaction = false;
+        for h in 1..=40i64 {
+            let t = base + 4 * h; // +4 raw/sample の急ランプ
+            c.update_temp(t);
+            let predicted = c.predicted_freq_mppb();
+            let steering = c.steering_freq_mppb();
+            // raw predicted は holdover 用に大きく振れてよい。
+            if (predicted - c.freq_mppb()).abs() > bound {
+                saw_overreaction = true;
+                // 飽和時は steering が level±bound に張り付くこと。単なる |·|≤bound は clamp 定義上
+                // 恒真で、FF を 0 に潰す退化実装 (steering=level) も通ってしまうので符号付きで固定する。
+                let expect = c.freq_mppb() + if predicted > c.freq_mppb() { bound } else { -bound };
+                assert_eq!(
+                    steering, expect,
+                    "saturated steering must sit at level±bound, not collapse to level"
+                );
+            }
+            // 操舵に渡す FF 偏差は必ず ±bound 内。
+            assert!(
+                (steering - c.freq_mppb()).abs() <= bound,
+                "steering FF must be clamped: steering−level={} bound={}",
+                steering - c.freq_mppb(),
+                bound
+            );
+        }
+        // この過渡で実際に clamp が必要 (predicted が bound を超える) だったことを確認 = clamp が発火。
+        assert!(
+            saw_overreaction,
+            "fast transient should push predicted beyond the bound so the clamp actually engages"
+        );
+        // holdover では α-β level は動かない (clamp は steering にだけ作用、level/predicted は不変)。
+        assert_eq!(c.freq_mppb(), level);
+    }
+
+    #[test]
+    fn steering_equals_predicted_on_gentle_ramp() {
+        // 緩やかな温度ドリフト相当の周波数ランプ (~2 ppb/s) では、操舵に渡る FF 偏差 (α-β slope·pred_lead =
+        // 数 ppb) は bound (100 ppb) 内に収まるので clamp は発火せず、steering == predicted。従来の slope/温度
+        // FF 効果 (offset② 補正) を壊さないことの回帰。
+        let mut c = DisciplinedClock::new();
+        let f0 = 3_000_000i64;
+        let r = 2_000i64; // +2 ppb/s ランプ
+        let mut n = 0i64;
+        for _ in 0..80 {
+            c.update_freq(1_000_000_000 + (f0 + r * n) / 1000);
+            n += 1;
+            if c.is_locked() {
+                let predicted = c.predicted_freq_mppb();
+                let steering = c.steering_freq_mppb();
+                // 緩いランプの FF 偏差は bound 内 (clamp は発火しない)。
+                assert!(
+                    (predicted - c.freq_mppb()).abs() <= c.config().steer_ff_bound_mppb,
+                    "gentle-ramp FF should stay within the bound (clamp must not fire): delta={}",
+                    predicted - c.freq_mppb()
+                );
+                // 発火しない → steering は predicted と完全一致。
+                assert_eq!(steering, predicted, "no clamp ⇒ steering equals predicted");
+            }
+        }
+    }
+
+    #[test]
+    fn steering_dormant_on_gentle_ramp_with_temp_ff() {
+        // production 経路 (temp_ff_enable=true) でも、緩やかな温度ランプでは matched-lead の FF 偏差が
+        // bound (100 ppb) 内に収まり clamp は dormant のまま (steering==predicted)。温度FF 本来の効果を
+        // 壊していないことの回帰 (test2 は temp_ff off の α-β 経路しか見ておらず production 経路に穴があった)。
+        let (k_true, f0, tref) = (4000i64, 3_000_000i64, 880i64); // 4 ppb/raw
+        let cfg = DisciplinedClockConfig {
+            temp_ff_enable: true,
+            ..DisciplinedClockConfig::DEFAULT
+        };
+        let bound = cfg.steer_ff_bound_mppb;
+        let mut c = DisciplinedClock::with_config(cfg);
+        let truef = |temp: i64| f0 + k_true * (temp - tref);
+        let warm = |n: i64| tref + (10.0 * (n as f64 * core::f64::consts::TAU / 60.0).sin()) as i64;
+        for n in 0..1000i64 {
+            let t = warm(n);
+            c.update_temp(t);
+            c.update_freq(1_000_000_000 + truef(t) / 1000);
+        }
+        // 緩やかなランプ (8 サンプルに 1 raw = 0.125 raw/sample)。lock を保ったまま温度と周波数を更新。
+        let base = warm(999);
+        let mut checked = 0;
+        for h in 1..=200i64 {
+            let t = base + h / 8;
+            c.update_temp(t);
+            c.update_freq(1_000_000_000 + truef(t) / 1000);
+            let predicted = c.predicted_freq_mppb();
+            let steering = c.steering_freq_mppb();
+            // 緩ランプの matched-lead FF 偏差は bound 内 → clamp は dormant。
+            assert!(
+                (predicted - c.freq_mppb()).abs() <= bound,
+                "gentle ramp (temp-ff on) FF should stay within bound: delta={} bound={}",
+                predicted - c.freq_mppb(),
+                bound
+            );
+            assert_eq!(steering, predicted, "temp-ff gentle ramp: clamp must stay dormant");
+            checked += 1;
+        }
+        assert!(checked > 0);
     }
 
     #[test]

@@ -232,9 +232,26 @@ peak/℃ と ∫|hwphase|/℃ の中央値は ON が OFF より約 30〜40% 小�
 復帰時間に至っては ON と OFF でほぼ差がない。
 したがって「temp-FF が過渡を約 30〜40% 緩和する」とは言い切れず、緩和の傾向を示唆するにとどまる。
 
-機構としては、ダイ温度センサが水晶の温度に対して遅い proxy であることが効いていると考えられる。
-feedforward は速い水晶の周波数変化を完全には先読みできないので、過渡を消しきれない。
-確定には、on/off を交互に各 10 回以上、加熱レート (dT/dt) を揃え、できれば固定ヒータと水晶近傍の外付け温度センサで測る必要がある。
+機構は、ダイ温度センサが遅いからではない。
+むしろ逆で、ON の過渡を 1 サンプルずつ追うと、出力周期に渡している予測周波数 `predicted_freq_mppb` (temp-FF 有効時は matched-lead 温度予測 `temp_ff_mppb(tcrys_hat)` と非熱残差 observer `r_resid` の和) が過大に振れている。
+ダイ温度が速く跳ねると feedforward が −1300 ppb まで膨らんだ。
+ところが整定後の実際の水晶周波数変化は −0.773 ppb で、feedforward は実変化の約 1700 倍に過反応していた (下図、ON=stage 5 の ff_delta)。
+
+![feedforward が実周波数変化の約 1700 倍に過反応する](precision-figs/fig9-overreact.png)
+
+どの項が膨らんだかは host モデルで切り分けた。
+host で同等の温度ステップを与えると matched-lead FF はレートによらず内部 clamp で約 41 ppb 止まりで、−1300 ppb には届かない。
+つまり実機の −1300 ppb の大半は matched-lead ではなく、`r_resid` observer が die↔crystal のモデル不整合に対し大きな innovation で跳ねた分と見られる。
+いずれにせよ過反応は feedforward 側で、temp-FF を切った OFF (stage 4) では予測偏差が α-β の `slope_max·pred_lead` = 5 ppb 上限にとどまり −1300 ppb には到達しえない。
+OFF の過渡は feedforward の過反応ではなく、水晶周波数が実際に動いた分をループが追う固有の応答である。
+ON と OFF が近い大きさに見えたのは別々の機構が偶然そろっただけで、ハンド加熱のばらつきもあって分離できていない。
+
+これは hardware の限界ではなく、ON の feedforward を妥当な範囲へ bound すれば firmware で抑えられる見込みがある。
+出力操舵へ渡す feedforward 偏差を ±100 ppb に clamp する `steering_freq_mppb` を実装した (matched-lead と r_resid の和をまとめて bound する。holdover の時刻外挿は raw の `freq_mppb`/`freq_slope_mppb` を使い続けるので影響せず、host で holdover 無回帰を確認済み)。
+**重要な留保**: host モデルは実機の −1300 ppb を再現しない (matched-lead を 41 ppb で内部 clamp してしまう) ので、この clamp が実機で過渡を実際に縮めるか、bound 100 ppb が適切かは **host では検証できず、オシロでの実機検証が必須**である (CLAUDE.md の信頼順)。
+また 100 ppb では過渡を 1300→100 ppb に約 13 倍抑えるにとどまり、≤100ns まで詰めるにはより狭い bound (正当な FF を切る恐れ) か、r_resid observer の innovation clamp / ダイ温度の低域通過といった一段深い対策が要る。
+検証は clamp 版 (新) と unclamped (旧データ) を同じ加熱レートで比べ、過渡中に `steer_ff` が ±100 ppb に張り付くこと (clamp 発火) と、scope での過渡ピークが縮むことを確認する必要がある。
+on/off の効果量そのものの確定には、加熱レート (dT/dt) を揃えた計測も要る。
 
 なおこの過渡は、能動的に数℃を秒で与えるという過酷な外乱でのものである。
 通常運用の緩やかな室温ドリフトでは、ほかの節のとおり ≤100ns が保たれる。

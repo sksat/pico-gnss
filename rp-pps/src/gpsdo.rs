@@ -139,6 +139,17 @@ impl PpsGpsdo {
         self.clock.clock().predicted_freq_mppb()
     }
 
+    /// Crystal frequency (milli-ppb) to feed the **output period steering**: like
+    /// [`predicted_freq_mppb`](Self::predicted_freq_mppb) but with the feedforward deviation from the
+    /// α-β level bounded to ±[`steer_ff_bound_mppb`](gnssdo::DisciplinedClockConfig::steer_ff_bound_mppb)
+    /// so a fast thermal transient where the matched-lead `predicted` over-reacts cannot slam the
+    /// output period. `predicted_freq_mppb` is left raw for holdover; only steering is clamped. Steady
+    /// operation (deviation ≤ 5 ppb) is bit-identical to `predicted_freq_mppb`. Passthrough to
+    /// [`DisciplinedClock::steering_freq_mppb`](gnssdo::DisciplinedClock::steering_freq_mppb).
+    pub fn steering_freq_mppb(&self) -> i64 {
+        self.clock.clock().steering_freq_mppb()
+    }
+
     /// Tracked frequency slope (milli-ppb per sample): how fast the crystal offset is drifting (a
     /// temperature-ramp proxy). 0 in steady state. For logging.
     pub fn freq_slope_mppb(&self) -> i64 {
