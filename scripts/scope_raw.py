@@ -133,6 +133,11 @@ def rising_edge(w):
 
 
 def setup(sc, sdiv, ch3=False):
+    # プローブ比をスクリプト側で毎回明示設定する。reboot で ×1 にリセットされ ch ごとにスケールがズレる
+    # (ch2 の ×10 出力が 1/10 表示になりエッジが小さすぎて測定 clip する) ため。
+    # この rig の既定: ch1=GPS-R PPS ×1, ch2=GP4 出力 ×10, ch3=GP2 ×1。env SCOPE_PROBE{1,2,3} で上書き可。
+    p1 = os.environ.get("SCOPE_PROBE1", "1"); p2 = os.environ.get("SCOPE_PROBE2", "10"); p3 = os.environ.get("SCOPE_PROBE3", "1")
+    sc.set_(f":CHANnel1:PROBe {p1}"); sc.set_(f":CHANnel2:PROBe {p2}"); sc.set_(f":CHANnel3:PROBe {p3}")
     sc.set_(":CHANnel1:DISPlay ON"); sc.set_(":CHANnel1:SCALe 1"); sc.set_(":CHANnel1:OFFSet -1.5")
     sc.set_(":CHANnel2:DISPlay ON"); sc.set_(":CHANnel2:SCALe 1"); sc.set_(":CHANnel2:OFFSet -1.5")
     sc.set_(":CHANnel3:DISPlay " + ("ON" if ch3 else "OFF"))

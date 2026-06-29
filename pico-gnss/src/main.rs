@@ -151,6 +151,11 @@ static OUT_SUBSEC_NS: AtomicU32 = AtomicU32::new(0);
 /// 非PIO 素朴出力の世代カウンタ (軽量)。0 = まだ 1 度も出力していない (soft hwphase を載せない判定に使う)。
 /// fold 指標は秒内なので ±1 秒の帰属誤りに不変 → C0_GEN 相当の同秒ペアリングは不要 (PLAN 採用#5)。
 static OUT_GEN: AtomicU32 = AtomicU32::new(0);
+/// 非PIO 素朴出力が**実際に**次エッジへ適用した dither 周期 (embassy tick)。`naive_pps_out_task` が
+/// `NaivePeriodDither::next_ticks` の出力を毎エッジ store、`naive_pps_in_task` が PPSGEN に `dith_ticks`
+/// として載せる。S1 はここが公称 (=tick_hz) を中心に sigma-delta で ±1 tick 揺れ、そのヒストグラムが
+/// sub-tick 平均周波数を実機で行っている直接証跡になる。S0 (apply_freq=false) は公称固定 (= dither 不活性)。
+static NAIVE_DITH_TICKS: AtomicU32 = AtomicU32::new(0);
 
 /// 位相制御の測定源。true=PIO ハード位相 (stage②, 本番)。false=旧 Instant 測定 (比較計測用)。
 const PHASE_USE_HW: bool = true;
@@ -420,6 +425,8 @@ async fn naive_pps_out_task(mut out: Output<'static>) {
             0
         };
         let period_ticks = dither.next_ticks(tick_hz, freq_mppb) as u64;
+        // dither 実働の直接証跡: 実際に次エッジへ適用した周期を publish (PPSGEN の dith_ticks)。
+        NAIVE_DITH_TICKS.store(period_ticks as u32, Ordering::Relaxed);
         next_rise += Duration::from_ticks(period_ticks);
         // パルス幅 (立ち下がりの時刻精度は不問: 規律対象は立ち上がりエッジ)。
         Timer::after(Duration::from_ticks(pulse_ticks)).await;
@@ -498,7 +505,7 @@ async fn naive_pps_in_task(mut gps: Input<'static>) {
             )
         });
         info!(
-            "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={}",
+            "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={} dith_ticks={}",
             count,
             interval_ns,
             interval_ns as i64 - 1_000_000_000,
@@ -524,7 +531,8 @@ async fn naive_pps_in_task(mut gps: Input<'static>) {
             1u8, // olmod: naive は常に開ループ modulo phase
             PRECISION_STAGE as u32,
             recal_eff(PRECISION_STAGE),
-            abs_off(PRECISION_STAGE)
+            abs_off(PRECISION_STAGE),
+            NAIVE_DITH_TICKS.load(Ordering::Relaxed) // dith_ticks: 実適用 dither 周期 (sigma-delta 証跡)
         );
     }
 }
@@ -965,7 +973,7 @@ async fn gen_capture_task(
             // **末尾 append-only** (PLAN 採用#10): prefix と既存項は byte 不変。olmod=S2 開ループ modulo
             // phase 列フラグ、stage/recal_eff/abs_off = この段の実効設定 (ログが一次情報・採用#3/#4)。
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={} dith_ticks={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
@@ -991,7 +999,8 @@ async fn gen_capture_task(
                 olmod as u8,
                 PRECISION_STAGE as u32,
                 recal_eff(PRECISION_STAGE),
-                abs_off(PRECISION_STAGE)
+                abs_off(PRECISION_STAGE),
+                0u32 // dith_ticks: PIO 経路は dither 不使用 (両経路スキーマ一致のため 0)
             );
         }
         last_x = Some(x);
@@ -1133,6 +1142,8 @@ async fn main(spawner: Spawner) {
 
     // boot 設定行 (採用#4): 文書はこの 1 行を一次情報にする (コメントの古い結論に依拠しない)。新規
     // PPSCFG 行なので既存 regex 非干渉。i_den/d_den/smith は production slot0 (CTRL_GRID[SWEEP_SCHEDULE[0]])。
+    // 補足: PPSGEN 末尾の dith_ticks は naive 出力が実適用した dither 周期 (embassy tick)。S1 は公称±1 tick
+    // で揺れ、そのヒストグラムが sigma-delta の sub-tick 平均周波数の実機証跡。S0/PIO 経路は固定値 (不活性=0/公称)。
     {
         let cfg0 = CTRL_GRID[SWEEP_SCHEDULE[0] % CONTROLLER_LIST_LEN];
         let ctrl_name: &str = if !use_pio(PRECISION_STAGE) {
