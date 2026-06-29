@@ -246,12 +246,22 @@ host で同等の温度ステップを与えると matched-lead FF はレート�
 OFF の過渡は feedforward の過反応ではなく、水晶周波数が実際に動いた分をループが追う固有の応答である。
 ON と OFF が近い大きさに見えたのは別々の機構が偶然そろっただけで、ハンド加熱のばらつきもあって分離できていない。
 
-これは hardware の限界ではなく、ON の feedforward を妥当な範囲へ bound すれば firmware で抑えられる見込みがある。
+これは hardware の限界ではなく、feedforward を妥当な範囲へ bound すれば firmware で抑えられる。
 出力操舵へ渡す feedforward 偏差を ±100 ppb に clamp する `steering_freq_mppb` を実装した (matched-lead と r_resid の和をまとめて bound する。holdover の時刻外挿は raw の `freq_mppb`/`freq_slope_mppb` を使い続けるので影響せず、host で holdover 無回帰を確認済み)。
-**重要な留保**: host モデルは実機の −1300 ppb を再現しない (matched-lead を 41 ppb で内部 clamp してしまう) ので、この clamp が実機で過渡を実際に縮めるか、bound 100 ppb が適切かは **host では検証できず、オシロでの実機検証が必須**である (CLAUDE.md の信頼順)。
-また 100 ppb では過渡を 1300→100 ppb に約 13 倍抑えるにとどまり、≤100ns まで詰めるにはより狭い bound (正当な FF を切る恐れ) か、r_resid observer の innovation clamp / ダイ温度の低域通過といった一段深い対策が要る。
-検証は clamp 版 (新) と unclamped (旧データ) を同じ加熱レートで比べ、過渡中に `steer_ff` が ±100 ppb に張り付くこと (clamp 発火) と、scope での過渡ピークが縮むことを確認する必要がある。
-on/off の効果量そのものの確定には、加熱レート (dT/dt) を揃えた計測も要る。
+
+clamp 版を焼いて実機で検証した (加熱レートを揃えた ~1.1℃/10s の加熱を複数回)。
+過渡中に診断ログ `steer_ff` が ±100 ppb に張り付き、clamp が発火していることを直接確認した。
+hwphase 過渡ピークは unclamped の中央値 3085 ns/℃ (worst 5573) から clamped の中央値 400 ns/℃ (397 / 400 / 558、低分散) へ落ちた。
+
+![steering clamp の加熱 A/B。過渡 peak/℃ が中央値で ~8 倍縮む](precision-figs/fig10-clamp-ab.png)
+
+clamp は worst-case の過反応スパイク (絶対値で約 6 µs) を、加熱を跨いで一貫した ~500 ns 級へ抑える (中央値で ~8 倍、worst-case で ~14 倍)。
+boot 収束の過反応 (raw feedforward が −1621 ppb まで振れる別の局面) でも、overshoot が −2992 ns から −1264 ns へ ~2.4 倍縮み、同じ機構が効くことを確認した。
+ここまでは firmware の hwphase での比較である (加熱過渡は ~40s と速くオシロの位相測定に乗せにくい。整定状態で hwphase がオシロと一致することは S4 で確認済み)。
+
+残る ~500 ns は feedforward の過反応ではなく、水晶周波数が実際に動いた分をループが追う固有の応答である。
+≤100ns まで詰めるにはこの固有応答を縮める必要があり、bound をさらに狭めると正当な FF (host で ~41 ppb) を切る恐れがあるので、r_resid observer の innovation clamp かダイ温度の低域通過、あるいはより速いループ補正といった一段深い対策が要る。
+on/off の効果量そのものの確定には、加熱レート (dT/dt) を揃えた on/off 交互の反復も要る。
 
 なおこの過渡は、能動的に数℃を秒で与えるという過酷な外乱でのものである。
 通常運用の緩やかな室温ドリフトでは、ほかの節のとおり ≤100ns が保たれる。
