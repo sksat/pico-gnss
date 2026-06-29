@@ -61,7 +61,7 @@ built from within `pico-gnss/` (where its `.cargo/config.toml` selects the
 - **Wiring**: UART0 RX = GP1 (module TX), UART0 TX = GP0 (module RX), PPS = GP2.
   Common ground is required.
 
-## Results (measured on hardware, RP2040 @ 125 MHz)
+## Results (RP2040 @ 125 MHz)
 
 ![evaluation report](report/report-en.png)
 
@@ -73,8 +73,12 @@ with `uv run webapp/plot_report.py`:
 - **B** — time-correction residual σ ≈ tens of ns, **inside the receiver's ±10 ns 1PPS spec**.
 - **C** — PPS jitter fits within a few 16 ns capture-quantization steps (PIO hardware capture,
   ~10–16 ns; vs ~9 µs for a software GPIO-interrupt approach).
-- **D** — the disciplined PPS output is phase-locked to the UTC second to **σ ~35–48 ns**
-  (Smith-predictor servo; the old software servo was ±1.4 ms).
+- **D** — the disciplined PPS output tracks the GPS second to **σ ~35–50 ns in short,
+  good-reception windows**, but the wander is **reception-limited** — ~150 ns over minutes,
+  σ ~200–250 ns beyond ~10 min. The absolute output-vs-GPS offset is centered to **≤100 ns
+  and reproducible across reboots** (Smith-predictor servo + loopback self-calibration; the
+  old software servo was ±1.4 ms). See [`report/REPORT.md`](report/REPORT.md) for the
+  window-dependence and the receiver-limited floor.
 
 Before/after — phase *measurement* precision (Instant ±ms → PIO 16 ns) and the resulting
 output phase:

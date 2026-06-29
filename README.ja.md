@@ -71,8 +71,10 @@ embedded 専用で、`pico-gnss/`(その `.cargo/config.toml` が `thumbv6m-none
 - **B** — 時刻補正残差 σ ≈ 数十 ns で、**受信機の ±10 ns 1PPS 仕様の内側**。
 - **C** — PPS ジッタは 16 ns 捕捉量子化の数段階に収まる (PIO ハード捕捉、~10–16 ns。
   ソフト GPIO 割込方式の ~9 µs に対して)。
-- **D** — 規律 PPS 出力は UTC 秒境界に **σ ~35–48 ns** で位相ロック (Smith 予測子サーボ。
-  旧ソフトサーボは ±1.4 ms)。
+- **D** — 規律 PPS 出力は GPS 秒境界に **短窓・良受信で σ ~35–50 ns**。ただし wander は
+  **受信律速**で、数分で ~150 ns、~10 分超で σ ~200–250 ns。出力 vs GPS の絶対オフセットは
+  **≤100 ns に中心化・再起動再現性あり** (Smith 予測子サーボ + ループバック自己較正。旧ソフト
+  サーボは ±1.4 ms)。窓依存と受信律速の床は [`report/REPORT.md`](report/REPORT.md) を参照。
 
 before/after — 位相の「測定」精度 (Instant ±ms → PIO 16 ns) と、その結果の出力位相:
 
