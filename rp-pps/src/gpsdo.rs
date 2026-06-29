@@ -216,6 +216,41 @@ mod tests {
     }
 
     #[test]
+    fn on_pps_edge_ignores_raw_counter() {
+        // The software (non-PIO) path feeds TimedEdge { raw: 0, .. }: on_pps_edge must depend only on
+        // edge_ns / interval_ns, never the raw down-counter. Drive two clocks with identical timing
+        // but different (and zero) raw values and require identical discipline.
+        let mut a = PpsGpsdo::new();
+        let mut b = PpsGpsdo::new();
+        for i in 0..10u64 {
+            let edge_ns = (i + 1) * 1_000_000_000;
+            let raw_b = 0x1234_5678u32.wrapping_add((i as u32).wrapping_mul(0x9E37_79B9));
+            a.on_pps_edge(
+                TimedEdge {
+                    raw: 0,
+                    interval_ns: 1_000_000_000,
+                    edge_ns,
+                },
+                edge_ns,
+            );
+            b.on_pps_edge(
+                TimedEdge {
+                    raw: raw_b,
+                    interval_ns: 1_000_000_000,
+                    edge_ns,
+                },
+                edge_ns,
+            );
+        }
+        assert_eq!(a.freq_ppb(), b.freq_ppb());
+        assert_eq!(a.predicted_freq_mppb(), b.predicted_freq_mppb());
+        assert_eq!(
+            a.now_from_query_ns(10_000_000_000),
+            b.now_from_query_ns(10_000_000_000)
+        );
+    }
+
+    #[test]
     fn non_rmc_is_ignored() {
         let mut g = PpsGpsdo::new();
         g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);

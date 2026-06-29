@@ -31,6 +31,7 @@ use panic_probe as _;
 use embassy_executor::{InterruptExecutor, Spawner};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::clk_sys_freq;
+use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::interrupt;
 use embassy_rp::interrupt::{InterruptExt, Priority};
 use embassy_rp::peripherals::{PIO0, UART0};
@@ -47,11 +48,11 @@ use portable_atomic::{AtomicU32, Ordering};
 use static_cell::StaticCell;
 
 use gnssdo::{
-    ControlInput, Controller, PhaseController, PhaseLockLoop, PhaseLockLoopConfig, PpsEvent,
-    snap_to_second_ns,
+    ControlInput, Controller, OpenLoopFf, PhaseController, PhaseLockLoop, PhaseLockLoopConfig,
+    PpsEvent, snap_to_second_ns,
 };
 use rp_pps::embassy::{SteeredPpsOutput, TimedPpsCapture};
-use rp_pps::{NmeaLineAssembler, PpsGpsdo, PpsSteer};
+use rp_pps::{NaivePeriodDither, NmeaLineAssembler, PpsGpsdo, PpsSteer, TimedEdge, fold_phase_ns};
 
 /// 受信機固有レイヤ (MT3333/GYSFFMANC の PMTK 設定・ボーレート)。別受信機ならここだけ差し替え。
 mod mt3333;
@@ -70,6 +71,86 @@ bind_interrupts!(struct Irqs {
 /// 分類/Locked のみ規律/復帰 quarantine、NMEA ペアリングと fresh-once、残差診断は PpsGpsdo が内包する。
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<PpsGpsdo>> =
     BlockingMutex::new(RefCell::new(PpsGpsdo::new()));
+
+/// **精度向上アークの単一ノブ (唯一の真実源)**。0..=5 を選ぶと派生ゲート (use_pio/apply_freq/
+/// phase_servo/recal_on/temp_ff) が段を構成する。**5 = production (出荷既定)** で、現出荷ファームと
+/// bit 一致することを下の const assert が機械保証する (計測 workflow が段ごとに一時変更する)。
+/// - S0: naive 自走 (規律なし)。S1: soft 周波数規律 (+dither)。S2: 全 PIO I/O + loopback, 開ループFF。
+/// - S3: PLL 閉ループ (Smith 内包)。S4: recal + ABS_OFFSET。S5: 温度FF = production。
+const PRECISION_STAGE: u8 = 5;
+// 上限ガード: stage>5 だと全ゲートが production 相当 (>=N) に倒れる一方、下の override-sentinel 強制は
+// `!=5`/`==5` ゲートなので外れてしまい、override 付きで production 相当を焼けてしまう。それを禁止する。
+const _: () = assert!(PRECISION_STAGE <= 5);
+const fn use_pio(s: u8) -> bool {
+    s >= 2
+}
+const fn apply_freq(s: u8) -> bool {
+    s >= 1
+}
+const fn phase_servo(s: u8) -> bool {
+    s >= 3
+}
+const fn recal_on(s: u8) -> bool {
+    s >= 4
+}
+const fn temp_ff(s: u8) -> bool {
+    s >= 5
+}
+
+/// substage override (センチネル=未指定→stage 既定)。S4a は ABS_OFFSET を 0 で焼いて scope で符号を確定
+/// してから確定 tick で再焼きする (chicken/egg をノブで解消)。S4b は recal off を巨大値で焼く。
+/// **production では必ず両方センチネル** (下の const assert が保証)。
+const ABS_OFFSET_OVERRIDE: i32 = i32::MIN; // i32::MIN=未指定
+const RECAL_EDGES_OVERRIDE: u32 = u32::MAX; // u32::MAX=未指定
+const fn abs_off(s: u8) -> i32 {
+    if ABS_OFFSET_OVERRIDE != i32::MIN {
+        ABS_OFFSET_OVERRIDE
+    } else if recal_on(s) {
+        ABS_OFFSET_TICKS
+    } else {
+        0
+    }
+}
+const fn recal_eff(s: u8) -> u32 {
+    if RECAL_EDGES_OVERRIDE != u32::MAX {
+        RECAL_EDGES_OVERRIDE
+    } else if recal_on(s) {
+        RECAL_EDGES
+    } else {
+        u32::MAX // 実質 off (この閾値に達することはない)
+    }
+}
+
+// production 不変の静的証明。const assert が通る =「PRECISION_STAGE=5 で焼けば現出荷ファームと
+// 挙動同一」を機械保証する (cargo build が通れば成立)。ゲート梯子 (override 非依存) は全段で恒真。
+const _: () = assert!(use_pio(5) && apply_freq(5) && phase_servo(5) && recal_on(5) && temp_ff(5));
+const _: () = assert!(temp_ff(5) == TEMP_FF_ENABLE);
+// override 依存の不変は **production (stage 5) のときだけ** 課す: stage 5 では override は必ず未指定
+// (sentinel) で abs_off/recal_eff は出荷リテラルに簡約。stage != 5 (計測) では override を許す
+// (S4a/S4b の chicken/egg をノブで解消する採用#3 のため)。これで「stage 5 で焼く=出荷 bit 一致」を
+// 保ちつつ、計測 workflow が ABS_OFFSET_OVERRIDE=0 等を立てて焼ける (PLAN 2.1 の無ゲート版だと
+// 計画 4 の S4a 手順自体がコンパイル不能になるため、ここはゲートを足す逸脱)。
+const _: () = assert!(
+    PRECISION_STAGE != 5 || (ABS_OFFSET_OVERRIDE == i32::MIN && RECAL_EDGES_OVERRIDE == u32::MAX)
+);
+const _: () = assert!(
+    PRECISION_STAGE != 5 || (abs_off(5) == ABS_OFFSET_TICKS && recal_eff(5) == RECAL_EDGES)
+);
+// ラダー走行中 (stage != 5) は実験 harness と排他: 段切替えと別系統の実験フラグを同時に立てない。
+const _: () = assert!(
+    PRECISION_STAGE == 5 || !(CONTROLLER_SWEEP || PRBS_INJECT || KICK_INJECT || INTERMITTENT_EXP)
+);
+
+/// 非PIO 素朴経路 (S0/S1) の出力 1PPS の high 幅 (ms)。PIO 経路の `PPS_PULSE_NS` (100ms) と同じ
+/// 慣習。立ち上がりエッジが規律対象で幅は時刻中立 (返り周期から引いて low 待ちにする)。
+const NAIVE_PPS_PULSE_MS: u64 = 100;
+
+/// 非PIO 素朴出力 (S0/S1) の立ち上がりエッジの**秒内位相** (ns, 0..1e9)。`naive_pps_out_task` が
+/// 毎エッジ store し、`naive_pps_in_task` が GPS エッジの秒内位相と fold して soft hwphase を作る。
+static OUT_SUBSEC_NS: AtomicU32 = AtomicU32::new(0);
+/// 非PIO 素朴出力の世代カウンタ (軽量)。0 = まだ 1 度も出力していない (soft hwphase を載せない判定に使う)。
+/// fold 指標は秒内なので ±1 秒の帰属誤りに不変 → C0_GEN 相当の同秒ペアリングは不要 (PLAN 採用#5)。
+static OUT_GEN: AtomicU32 = AtomicU32::new(0);
 
 /// 位相制御の測定源。true=PIO ハード位相 (stage②, 本番)。false=旧 Instant 測定 (比較計測用)。
 const PHASE_USE_HW: bool = true;
@@ -159,9 +240,9 @@ fn exp_cfg(i_den: i64, d_den: i64, kp_inv: i64, smith_edges: u32) -> PhaseLockLo
 /// 比 i_den:d_den=32:1 を維持して帯域 (i_den) だけを 512/1024/2048 と狭側へ 3 点振る。kp_inv は exp_cfg(.., 0, 1)
 /// で auto (kp_inv=0→PidSmith で実効 8) なので、emit には実効値 8 を載せる。
 const CTRL_GRID: [(i64, i64, i64, u32); CONTROLLER_LIST_LEN] = [
-    (I_DEN_CALM, D_DEN_TUNED, 8, 1),    // cidx0: 現行 production (対照, i_den=512/d_den=16)
-    (1024, 32, 8, 1),                   // cidx1: 狭帯域 (i_den=1024/d_den=32)
-    (2048, 64, 8, 1),                   // cidx2: 最狭帯域 (i_den=2048/d_den=64)
+    (I_DEN_CALM, D_DEN_TUNED, 8, 1), // cidx0: 現行 production (対照, i_den=512/d_den=16)
+    (1024, 32, 8, 1),                // cidx1: 狭帯域 (i_den=1024/d_den=32)
+    (2048, 64, 8, 1),                // cidx2: 最狭帯域 (i_den=2048/d_den=64)
 ];
 
 fn make_controller(idx: usize) -> Controller {
@@ -293,7 +374,11 @@ async fn temp_task(
     let buf = BUF.init([0u16; TEMP_DMA_N]);
     loop {
         // div=0 → ADC 最速連続 (div<96 は 0 と同義)。転送完了まで executor を手放す (CPU 負荷ゼロ)。
-        if adc.read_many(&mut ch, &mut buf[..], 0, &mut dma).await.is_ok() {
+        if adc
+            .read_many(&mut ch, &mut buf[..], 0, &mut dma)
+            .await
+            .is_ok()
+        {
             // 全 N サンプルを積算。1 サンプル 12bit ≤ 4095, N=16384 → sum ≤ 4095*16384 ≈ 67.1M < u32::MAX。
             let mut sum: u32 = 0;
             for &s in buf.iter() {
@@ -308,6 +393,141 @@ async fn temp_task(
     }
 }
 
+/// 非PIO 素朴 1PPS 出力タスク (S0/S1)。`Timer::after` で GP3 をトグルする。`apply_freq` なら
+/// `NaivePeriodDither` で水晶推定 (`predicted_freq_mppb`) を embassy-tick 周期へ一次 sigma-delta で
+/// 適用 (S1)、さもなくば公称 1Hz で自走 (S0)。立ち上がり時刻の秒内位相を `OUT_SUBSEC_NS` に publish。
+/// 出力エッジの瞬時 jitter は M0+ の soft scheduling (~µs) 律速 = この経路が見せたい計測下限
+/// (dither は **平均**周波数を sub-tick へ細かくするが、瞬時 jitter は別物)。
+#[embassy_executor::task]
+async fn naive_pps_out_task(mut out: Output<'static>) {
+    let tick_hz = Duration::from_secs(1).as_ticks() as u32;
+    let pulse_ticks = Duration::from_millis(NAIVE_PPS_PULSE_MS).as_ticks();
+    let mut dither = NaivePeriodDither::new();
+    // 立ち上がりを **絶対 deadline** で打つ。相対 Timer::after だと毎周期に executor の wake/lock
+    // overhead (~1 tick) が平均周期へ累積し、dither の sub-tick 解像を系統バイアスで汚す。絶対 deadline
+    // なら overhead は各エッジの jitter に留まり (見せたい soft 下限そのもの)、平均周期 = dither になる。
+    let mut next_rise = Instant::now();
+    loop {
+        Timer::at(next_rise).await;
+        out.set_high();
+        let edge_ns = now_local_ns();
+        OUT_SUBSEC_NS.store((edge_ns % 1_000_000_000) as u32, Ordering::Relaxed);
+        OUT_GEN.fetch_add(1, Ordering::Release);
+        // 次の立ち上がり時刻 = 今回の deadline + dither 周期 (S1 は水晶推定を適用、S0 は公称)。
+        let freq_mppb = if apply_freq(PRECISION_STAGE) {
+            CLOCK.lock(|g| g.borrow().predicted_freq_mppb())
+        } else {
+            0
+        };
+        let period_ticks = dither.next_ticks(tick_hz, freq_mppb) as u64;
+        next_rise += Duration::from_ticks(period_ticks);
+        // パルス幅 (立ち下がりの時刻精度は不問: 規律対象は立ち上がりエッジ)。
+        Timer::after(Duration::from_ticks(pulse_ticks)).await;
+        out.set_low();
+    }
+}
+
+/// 非PIO 素朴 1PPS 入力タスク (S0/S1)。GP2 の GPS 1PPS を GPIO 割込 + Instant で soft 捕捉
+/// (~9µs 下限 = M0+ critical-section 全 IRQ マスク)。連続エッジ差から interval を作り、production と
+/// **同一の** `on_pps_edge` (raw 非参照を host テストで確認済) へ縮退 TimedEdge を渡して水晶 ppb を
+/// 規律コアに食わせる (S0=推定のみ・周期不適用 / S1=周期へ適用)。出力 vs GPS の開ループ modulo phase を
+/// `fold_phase_ns` で作り hwphase 欄に soft err として載せ、段共通スキーマの PPS/PPSGEN 行で出す。
+#[embassy_executor::task]
+async fn naive_pps_in_task(mut gps: Input<'static>) {
+    let mut count: u32 = 0;
+    let mut last_edge_ns: Option<u64> = None;
+    loop {
+        gps.wait_for_rising_edge().await;
+        let edge_ns = now_local_ns();
+        let interval_ns = match last_edge_ns {
+            Some(prev) => edge_ns.saturating_sub(prev),
+            None => 0,
+        };
+        last_edge_ns = Some(edge_ns);
+        // production と同一の規律経路。capture==query の縮退 (両者 Instant)、raw=0 (非参照)。
+        let step = CLOCK.lock(|g| {
+            g.borrow_mut().on_pps_edge(
+                TimedEdge {
+                    raw: 0,
+                    interval_ns,
+                    edge_ns,
+                },
+                edge_ns,
+            )
+        });
+        count += 1;
+        // soft 開ループ modulo phase (出力 vs この GPS エッジ)。出力が 1 度も出ていなければ載せない。
+        // fold は秒内なので出力/入力の ±1 秒帰属誤りに不変 (PLAN 採用#5、同秒ペアリング不要)。
+        let out_gen = OUT_GEN.load(Ordering::Acquire);
+        let soft_err = if out_gen > 0 {
+            fold_phase_ns(
+                OUT_SUBSEC_NS.load(Ordering::Acquire) as i64,
+                (edge_ns % 1_000_000_000) as i64,
+            )
+        } else {
+            0
+        };
+        let (state, missed): (&str, u32) = match step.event {
+            PpsEvent::First => ("First", 0),
+            PpsEvent::Locked { .. } => ("Locked", 0),
+            PpsEvent::Irregular { missed, .. } => ("Irregular", missed),
+            PpsEvent::NonMonotonic { .. } => ("NonMono", 0),
+        };
+        let freq = step.freq.map_or("none", |fu| fu.as_str());
+        info!(
+            "PPS count={} interval_us={} interval_ns={} state={=str} missed={} freq={}",
+            count,
+            interval_ns / 1000,
+            interval_ns,
+            state,
+            missed,
+            freq
+        );
+        // 最初のエッジは interval が無い (規律も phase も意味がない) のでスキップ。
+        if interval_ns == 0 {
+            continue;
+        }
+        // 段共通スキーマの PPSGEN 行 (PIO 経路と同一フィールド列)。非PIO で意味のない制御項は 0。
+        // hwphase 欄 = soft open-loop modulo phase、olmod=1 (常に開ループ modulo phase)。
+        let (slope_mppb, temp_k, ff_delta_mppb) = CLOCK.lock(|g| {
+            let g = g.borrow();
+            (
+                g.freq_slope_mppb(),
+                g.temp_k_mppb_per_unit(),
+                g.predicted_freq_mppb() - g.freq_mppb(),
+            )
+        });
+        info!(
+            "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={}",
+            count,
+            interval_ns,
+            interval_ns as i64 - 1_000_000_000,
+            0i64,     // phase_ns: 非PIO に Instant ベースの出力位相測定はない
+            soft_err, // hwphase_ns: soft 開ループ modulo phase
+            0i64,     // trim_ppb
+            0u32,     // cidx
+            0i64,     // p_ns
+            0i64,     // d_ns
+            0i64,     // trim_mppb
+            slope_mppb,
+            0i32, // raw_lag
+            0u8,  // lk (位相ロックなし)
+            0u8,  // state
+            0u32, // jit
+            0u32, // rxbad
+            0i64, // inj_ns
+            0i64, // kick_ns
+            TEMP_RAW.load(Ordering::Relaxed),
+            mt3333::DYN_MODE.load(Ordering::Relaxed),
+            temp_k,
+            ff_delta_mppb,
+            1u8, // olmod: naive は常に開ループ modulo phase
+            PRECISION_STAGE as u32,
+            recal_eff(PRECISION_STAGE),
+            abs_off(PRECISION_STAGE)
+        );
+    }
+}
 
 /// gen_capture_task 用の高優先度割込エグゼキュータ。ループバックエッジ→Instant 読みの
 /// ウェイクアップ遅延 (thread executor だと UART 処理等で ~ms) を ~µs に下げ、位相測定を精密化する。
@@ -361,7 +581,11 @@ async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
                 let jit = hi - lo;
                 RECEPTION_JITTER.store(jit.clamp(0, u32::MAX as i64) as u32, Ordering::Relaxed);
                 let was_bad = RECEPTION_BAD.load(Ordering::Relaxed) != 0;
-                let now_bad = if was_bad { jit > RX_JIT_LO_NS } else { jit > RX_JIT_HI_NS };
+                let now_bad = if was_bad {
+                    jit > RX_JIT_LO_NS
+                } else {
+                    jit > RX_JIT_HI_NS
+                };
                 RECEPTION_BAD.store(now_bad as u32, Ordering::Relaxed);
             }
         }
@@ -494,7 +718,11 @@ async fn recal_k(
     }
     let spread = hi as i64 - lo as i64;
     if spread > 2 {
-        warn!("PHASE_K recal reject: spread={} n={}", spread, samples.len());
+        warn!(
+            "PHASE_K recal reject: spread={} n={}",
+            spread,
+            samples.len()
+        );
         return k;
     }
     let Some(nk) = rp_pps::calibrate_loopback_offset(samples.iter().copied()) else {
@@ -552,7 +780,13 @@ async fn gen_capture_task(
     // SteeredPpsOutput (rp-pps) が内包するので、ここは freq_mppb と phase_corr を渡すだけ。本番は
     // slot 0 (現行 firmware の PID+Smith チューニング)。CONTROLLER_SWEEP=true で locked 中に巡回する。
     let mut sweep_idx: usize = 0; // SWEEP_SCHEDULE 内の位置。実 cidx = SWEEP_SCHEDULE[sweep_idx]。
-    let mut controller = make_controller(SWEEP_SCHEDULE[sweep_idx]);
+    // 段ゲート: S3+ は production の PLL (slot0)、S2 は開ループFF (周波数FFのみ・位相補正なし)。
+    // S5 では phase_servo(5)=true → 現行と bit 一致 (const assert で保証)。
+    let mut controller = if phase_servo(PRECISION_STAGE) {
+        make_controller(SWEEP_SCHEDULE[sweep_idx])
+    } else {
+        Controller::OpenLoop(OpenLoopFf::new())
+    };
     // boot で初期セグメントの effective config を 1 行出す (固定運用=CONTROLLER_SWEEP=false でも解析が
     // どの制御器 config で走ったか分かるように)。以後の切替は下の CTRLSWEEP 行で出す。
     {
@@ -586,7 +820,10 @@ async fn gen_capture_task(
         // (オシロで実害 ~9.5µs=3×ppm×1s を確認)。最新エッジを使えば現 GPS と正しく対になる。
         let (x, dropped) = rp_pps::latest_capture(x0, || sm.rx().try_pull());
         if dropped > 0 {
-            warn!("PPSGEN drained {} stale output edge(s) (loop lagged)", dropped);
+            warn!(
+                "PPSGEN drained {} stale output edge(s) (loop lagged)",
+                dropped
+            );
         }
         // 出力は GPS より僅かに先行しうる。x[N] で起きた時点でまだ pps_task が GPS[N] を store して
         // いないと C0_GPS は GPS[N-1] のまま → x[N] を GPS[N-1] と対にして +ppm×1s (≈3.3µs) のスパイクに
@@ -614,7 +851,8 @@ async fn gen_capture_task(
         // 再較正で測った K (k_target) へ毎エッジ最大 RECAL_K_SLEW_TICKS だけ slew。段差で適用すると
         // 累積ドリフトを loop が急補正し snap するので、ramp 化して滑らかに追従させる。
         if k != k_target {
-            let diff = (k_target.wrapping_sub(k) as i32).clamp(-RECAL_K_SLEW_TICKS, RECAL_K_SLEW_TICKS);
+            let diff =
+                (k_target.wrapping_sub(k) as i32).clamp(-RECAL_K_SLEW_TICKS, RECAL_K_SLEW_TICKS);
             k = k.wrapping_add(diff as u32);
         }
         // stage② PIO ハード位相: 出力エッジ と 最新 GPS エッジ の生カウンタ差 (mod 1秒) を ns に。
@@ -622,7 +860,8 @@ async fn gen_capture_task(
         let c0 = C0_GPS.load(Ordering::Relaxed);
         // 絶対 anchor: 静残差 (pad/path) を servo 目標へ注入し出力ピンを GPS ピンへ寄せる。phase だけ k_eff、
         // raw_lag gate と recal は真 K (混ぜると同一エッジ対が gate/sample から外れる)。
-        let k_eff = k.wrapping_sub(ABS_OFFSET_TICKS as u32);
+        // 段ゲート: S4+ のみ ABS_OFFSET を適用 (S4a は ABS_OFFSET_OVERRIDE=0 で焼いて scope で符号確定)。
+        let k_eff = k.wrapping_sub(abs_off(PRECISION_STAGE) as u32);
         let hwphase_ns = rp_pps::loopback_phase_ns(c0, x, k_eff, clk);
         // ペアリング診断: fold 前の生 tick 差。正しい隣接エッジ対なら小さい(=真の位相)、ミスペア(欠落/
         // drain/再ロック後に非隣接エッジと対)だと ≈±1秒。fold がそれを隠し ppm×1s 残差にループがロック
@@ -631,13 +870,19 @@ async fn gen_capture_task(
         let raw_lag = rp_pps::loopback_raw_lag_ticks(c0, x, k);
         let max_lag = (clk / 200) as i32; // capture tick ≈ clk/2 なので clk/200 ≈ 10ms
         let paired = raw_lag.unsigned_abs() <= max_lag as u32;
+        // 段ゲート (採用#2): S3+ (位相サーボ) のみミスペアを棄却する。S2 (開ループFF) は paired=false でも
+        // hwphase をログし続ける。olmod=1 は「この hwphase 行が開ループ modulo phase」(=サーボ不在で
+        // 拘束されていない) ことを表し、S2 の**全行**で立つ (paired か否かは別途 raw_lag が示す)。S5 では
+        // phase_servo=true ゆえ olmod は常に 0。
+        let drop_on_mispair = phase_servo(PRECISION_STAGE);
+        let olmod = !phase_servo(PRECISION_STAGE);
         // 旧手法 (比較用 emit のみ): 出力エッジの UTC 時刻 (Instant 経由) → 秒境界からのズレ。
         let (pred_mppb, level_mppb, temp_k, slope_mppb, phase) = CLOCK.lock(|g| {
             let g = g.borrow();
             (
                 g.predicted_freq_mppb(),
-                g.freq_mppb(),              // α-β level (温度FF lead を含まない)
-                g.temp_k_mppb_per_unit(),  // 学習した温度係数 (0=未学習)
+                g.freq_mppb(),            // α-β level (温度FF lead を含まない)
+                g.temp_k_mppb_per_unit(), // 学習した温度係数 (0=未学習)
                 g.freq_slope_mppb(),
                 g.now_from_query_ns(now_local_ns()).map(snap_to_second_ns),
             )
@@ -652,13 +897,15 @@ async fn gen_capture_task(
         };
         // valid = この位相サンプルが信用できるか (GPS 新鮮 + 間隔健全 + 隣接エッジ対)。!valid は holdover
         // ホールド。paired=false (gross ミスペア) は fold が隠す ppm×1s 残差を避けるため捨てる。
-        if !paired {
+        if drop_on_mispair && !paired {
             warn!("PPSGEN mispair raw_lag={} ticks (>~10ms) -> drop", raw_lag);
         }
         // 間欠実験の開窓中は制御器を hold (valid=false) して windup を避け、出力は周波数FFのみにする。
         // hwphase は上で計算済みなので、開ループのドリフトはログ/scope に出る (適用しないだけ)。
         let exp_hold = INTERMITTENT_EXP && exp_open;
-        let valid = fresh && sane && c0 != 0 && paired && !exp_hold;
+        // S3+ は paired を valid 条件に含める (ミスペア棄却)。S2 は含めない (開ループFF は err を使わないので
+        // 無害、hwphase は modulo phase 列として残す)。S5 では drop_on_mispair=true で現行と同一。
+        let valid = fresh && sane && c0 != 0 && (!drop_on_mispair || paired) && !exp_hold;
         // 選択中の制御器に位相誤差を渡す (gnssdo::Controller。本番=slot0、CONTROLLER_SWEEP 中は巡回)。
         let u = controller.step(ControlInput {
             err_ns: ctrl,
@@ -715,8 +962,10 @@ async fn gen_capture_task(
             // 制御信号を全部出力 → ホストでプラント同定 + 制御器比較 + 項別比較ができる。
             // 互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残す。cidx=制御器インデックス
             // (CONTROLLER_SWEEP の segment 鍵)、state=制御器の内部状態コード (ab_boost の boost 等)。
+            // **末尾 append-only** (PLAN 採用#10): prefix と既存項は byte 不変。olmod=S2 開ループ modulo
+            // phase 列フラグ、stage/recal_eff/abs_off = この段の実効設定 (ログが一次情報・採用#3/#4)。
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
@@ -738,7 +987,11 @@ async fn gen_capture_task(
                 TEMP_RAW.load(Ordering::Relaxed),
                 mt3333::DYN_MODE.load(Ordering::Relaxed),
                 temp_k,
-                ff_delta_mppb
+                ff_delta_mppb,
+                olmod as u8,
+                PRECISION_STAGE as u32,
+                recal_eff(PRECISION_STAGE),
+                abs_off(PRECISION_STAGE)
             );
         }
         last_x = Some(x);
@@ -792,8 +1045,15 @@ async fn gen_capture_task(
                     exp_open = true;
                     exp_edges_in_mode = 0;
                     // 保持トリム = 閉窓平均。瞬時値はノイズ/位相応答を含み過補正するため平均で steady 値を取る。
-                    exp_held_trim = if exp_trim_n > 0 { exp_trim_sum / exp_trim_n as i64 } else { u.trim_mppb };
-                    info!("LOOPEXP open toff={} held_trim={}", EXP_TOFF_SCHEDULE[exp_toff_idx], exp_held_trim);
+                    exp_held_trim = if exp_trim_n > 0 {
+                        exp_trim_sum / exp_trim_n as i64
+                    } else {
+                        u.trim_mppb
+                    };
+                    info!(
+                        "LOOPEXP open toff={} held_trim={}",
+                        EXP_TOFF_SCHEDULE[exp_toff_idx], exp_held_trim
+                    );
                 } else if exp_open && exp_edges_in_mode >= EXP_TOFF_SCHEDULE[exp_toff_idx] {
                     exp_open = false;
                     exp_edges_in_mode = 0;
@@ -802,7 +1062,15 @@ async fn gen_capture_task(
                     exp_toff_idx = (exp_toff_idx + 1) % EXP_TOFF_SCHEDULE.len();
                     info!("LOOPEXP closed recal");
                     // 開窓では実効 K を放置したので、閉じる入口で測り直す (間欠運用の作法)。
-                    k_target = recal_k(&mut sm, &mut output, &cfg_gp2, &cfg_gp4, k_target, last_period).await;
+                    k_target = recal_k(
+                        &mut sm,
+                        &mut output,
+                        &cfg_gp2,
+                        &cfg_gp4,
+                        k_target,
+                        last_period,
+                    )
+                    .await;
                     last_x = None;
                     last_gen = C0_GEN.load(Ordering::Acquire);
                 }
@@ -811,12 +1079,25 @@ async fn gen_capture_task(
             }
         } else if u.locked {
             edges_since_recal += 1;
-            if edges_since_recal >= RECAL_EDGES {
+            // 段ゲート: S4+ のみ recal を駆動 (recal_eff=RECAL_EDGES)。S2/S3 は recal_eff=u32::MAX で
+            // 実質 off (この閾値に達することはない → holdover gap なし)。S5 では現行と同一 (const assert)。
+            if edges_since_recal >= recal_eff(PRECISION_STAGE) {
                 edges_since_recal = 0;
-                info!("PHASE_K recal start (after {} locked edges)", RECAL_EDGES);
+                info!(
+                    "PHASE_K recal start (after {} locked edges)",
+                    recal_eff(PRECISION_STAGE)
+                );
                 // 測定値は k_target へ。実際の k は通常ループで毎エッジ slew して寄せる (段差回避)。
                 // dk cap は前回測定値 (k_target) 比で評価 (measured-to-measured の真ドリフト)。
-                k_target = recal_k(&mut sm, &mut output, &cfg_gp2, &cfg_gp4, k_target, last_period).await;
+                k_target = recal_k(
+                    &mut sm,
+                    &mut output,
+                    &cfg_gp2,
+                    &cfg_gp4,
+                    k_target,
+                    last_period,
+                )
+                .await;
                 last_x = None; // GP4 捕捉が再較正の gap を跨ぐので次の interval は無効化
                 last_gen = C0_GEN.load(Ordering::Acquire); // 復帰直後の偽 fresh ジャンプを避ける
             }
@@ -836,138 +1117,185 @@ async fn main(spawner: Spawner) {
         mt3333::GNSS_BAUD
     );
 
-    // 温度FF の runtime トグルを config の意図どおりに立てる (実験A=false)。gen_capture_task が毎エッジ
-    // update_temp で温度を供給するが、temp_ff_enable が false の間は predicted_freq は不変。
+    // 温度FF の runtime トグルは段ゲート (temp_ff(stage))。S5=production で TEMP_FF_ENABLE と一致
+    // (const assert で保証)。gen_capture_task / naive 経路が毎エッジ update_temp で温度を供給するが、
+    // temp_ff_enable が false の間は predicted_freq は不変。
     CLOCK.lock(|g| {
         let mut g = g.borrow_mut();
-        g.set_temp_ff_enable(TEMP_FF_ENABLE);
+        g.set_temp_ff_enable(temp_ff(PRECISION_STAGE));
         g.set_temp_ff_params(TEMP_FF_SM_SHIFT, TEMP_FF_SHIFT, TEMP_FF_GAIN_Q8);
         g.set_temp_ff_lag(TEMP_FF_LAG_Q8, TEMP_FF_DLEAD_SHIFT, RESID_OBS_SHIFT);
     });
 
-    // PPS on GP2 を PIO0 SM0 で rp-pps の PpsCapture でハードキャプチャ (~16ns 分解能)。
-    let Pio {
-        mut common,
-        sm0,
-        sm1,
-        mut sm2,
-        ..
-    } = Pio::new(p.PIO0, Irqs);
-    let mut capture = TimedPpsCapture::new(&mut common, sm0, p.PIN_2, clk_sys_freq());
+    // 高優先度割込エグゼキュータは分岐の外で 1 回だけ起動する (PIO 経路 / naive 経路の双方がここへ spawn)。
+    interrupt::SWI_IRQ_0.set_priority(Priority::P0);
+    let spawner_high = EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0);
 
-    // stage②: SM2 (ループバック位相計測。rp-pps 外の実験機能) は capture と GP2 を共有して生カウンタ差
-    // K=C0−C2 を較正する。embassy の set_jmp_pin は &Pin を要求し GP2 は一度しか make できないので、
-    // capture.jmp_pin() で GP2 Pin を借り、capture プログラムをもう一枚 load する。
-    let lb_loaded = common.load_program(&rp_pps::pps_capture_program());
-    let lb_pin = common.make_pio_pin(p.PIN_4);
-    sm2.set_pin_dirs(PioDirection::In, &[&lb_pin]);
-    let mut cfg_gp2 = PioConfig::default();
-    cfg_gp2.use_program(&lb_loaded, &[]);
-    cfg_gp2.set_jmp_pin(capture.capture().jmp_pin()); // SM0 と同じ GP2 を捕捉 (fine tier へ escape)
-    sm2.set_config(&cfg_gp2);
-    sm2.set_enable(true);
-    // K 較正: 較正前に両 SM の RX FIFO を drain → 次エッジから c0/c2 が同一 GP2 エッジになることを保証。
-    // (古い値が残り c0/c2 が 1 エッジずれると、loopback の fold は公称秒 (62.5M tick) なので K に
-    //  「実秒ぶんの tick」が混じり、mean が 水晶 ppm × 1s ≈ 数µs だけ boot ごとにずれる。)
-    // 健全性検査: 同一エッジなら全 diff(c0−c2) が ~一定 (spread ≤ 1 tick)。混入があれば再 drain/retry。
-    // PPS は fix 後のみ出るので各 30s 待ち、出なければ打ち切り。
-    let mut k: u32 = 0;
-    let mut k_n = 0usize;
-    let mut k_clean = false;
-    for attempt in 0..4u32 {
+    // boot 設定行 (採用#4): 文書はこの 1 行を一次情報にする (コメントの古い結論に依拠しない)。新規
+    // PPSCFG 行なので既存 regex 非干渉。i_den/d_den/smith は production slot0 (CTRL_GRID[SWEEP_SCHEDULE[0]])。
+    {
+        let cfg0 = CTRL_GRID[SWEEP_SCHEDULE[0] % CONTROLLER_LIST_LEN];
+        let ctrl_name: &str = if !use_pio(PRECISION_STAGE) {
+            "naive"
+        } else if phase_servo(PRECISION_STAGE) {
+            "pll"
+        } else {
+            "open_loop"
+        };
+        let exp_flags: u8 = (CONTROLLER_SWEEP as u8)
+            | ((PRBS_INJECT as u8) << 1)
+            | ((KICK_INJECT as u8) << 2)
+            | ((INTERMITTENT_EXP as u8) << 3);
+        info!(
+            "PPSCFG stage={} use_pio={} apply_freq={} phase_servo={} recal_eff={} abs_off={} temp_ff={} ctrl={=str} i_den={} d_den={} smith={} phase_use_hw={} exp_flags={}",
+            PRECISION_STAGE as u32,
+            use_pio(PRECISION_STAGE) as u8,
+            apply_freq(PRECISION_STAGE) as u8,
+            phase_servo(PRECISION_STAGE) as u8,
+            recal_eff(PRECISION_STAGE),
+            abs_off(PRECISION_STAGE),
+            temp_ff(PRECISION_STAGE) as u8,
+            ctrl_name,
+            cfg0.0,
+            cfg0.1,
+            cfg0.3,
+            PHASE_USE_HW as u8,
+            exp_flags
+        );
+    }
+
+    if use_pio(PRECISION_STAGE) {
+        // PPS on GP2 を PIO0 SM0 で rp-pps の PpsCapture でハードキャプチャ (~16ns 分解能)。
+        let Pio {
+            mut common,
+            sm0,
+            sm1,
+            mut sm2,
+            ..
+        } = Pio::new(p.PIO0, Irqs);
+        let mut capture = TimedPpsCapture::new(&mut common, sm0, p.PIN_2, clk_sys_freq());
+
+        // stage②: SM2 (ループバック位相計測。rp-pps 外の実験機能) は capture と GP2 を共有して生カウンタ差
+        // K=C0−C2 を較正する。embassy の set_jmp_pin は &Pin を要求し GP2 は一度しか make できないので、
+        // capture.jmp_pin() で GP2 Pin を借り、capture プログラムをもう一枚 load する。
+        let lb_loaded = common.load_program(&rp_pps::pps_capture_program());
+        let lb_pin = common.make_pio_pin(p.PIN_4);
+        sm2.set_pin_dirs(PioDirection::In, &[&lb_pin]);
+        let mut cfg_gp2 = PioConfig::default();
+        cfg_gp2.use_program(&lb_loaded, &[]);
+        cfg_gp2.set_jmp_pin(capture.capture().jmp_pin()); // SM0 と同じ GP2 を捕捉 (fine tier へ escape)
+        sm2.set_config(&cfg_gp2);
+        sm2.set_enable(true);
+        // K 較正: 較正前に両 SM の RX FIFO を drain → 次エッジから c0/c2 が同一 GP2 エッジになることを保証。
+        // (古い値が残り c0/c2 が 1 エッジずれると、loopback の fold は公称秒 (62.5M tick) なので K に
+        //  「実秒ぶんの tick」が混じり、mean が 水晶 ppm × 1s ≈ 数µs だけ boot ごとにずれる。)
+        // 健全性検査: 同一エッジなら全 diff(c0−c2) が ~一定 (spread ≤ 1 tick)。混入があれば再 drain/retry。
+        // PPS は fix 後のみ出るので各 30s 待ち、出なければ打ち切り。
+        let mut k: u32 = 0;
+        let mut k_n = 0usize;
+        let mut k_clean = false;
+        for attempt in 0..4u32 {
+            while capture.capture_mut().try_read().is_some() {}
+            while sm2.rx().try_pull().is_some() {}
+            let mut samples: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
+            for _ in 0..6u32 {
+                match with_timeout(Duration::from_secs(30), async {
+                    let c0 = capture.capture_mut().wait_edge().await; // 較正は生カウンタ (fine tier へ escape)
+                    let c2 = sm2.rx().wait_pull().await;
+                    (c0, c2)
+                })
+                .await
+                {
+                    Ok(pair) => {
+                        let _ = samples.push(pair);
+                    }
+                    Err(_) => break,
+                }
+            }
+            if samples.is_empty() {
+                break; // PPS が来ない (no fix) → 打ち切り
+            }
+            let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+            for (c0, c2) in samples.iter() {
+                let d = c0.wrapping_sub(*c2) as i32;
+                lo = lo.min(d);
+                hi = hi.max(d);
+            }
+            let spread = hi as i64 - lo as i64;
+            if let Some(kk) = rp_pps::calibrate_loopback_offset(samples.iter().copied()) {
+                k = kk; // 最良 (=最新) 候補。clean なら採用、不一致なら次 attempt で上書き。
+                k_n = samples.len();
+            }
+            info!(
+                "PHASE_K attempt={} n={} diff_lo={} diff_hi={} spread={} k={}",
+                attempt,
+                samples.len(),
+                lo,
+                hi,
+                spread,
+                k as i32
+            );
+            if samples.len() >= 3 && spread <= 1 {
+                k_clean = true;
+                break; // 同一エッジ確定
+            }
+            // 不一致 = 別エッジ混入 → 再 drain して取り直し
+        }
+        if k_clean {
+            info!("PHASE_K calibrated k={} (n={})", k as i32, k_n);
+        } else if k_n > 0 {
+            warn!(
+                "PHASE_K not clean (retries exhausted), using k={} (n={})",
+                k as i32, k_n
+            );
+        } else {
+            warn!("PHASE_K calibration failed (no PPS)");
+        }
+        // K 検証: SM2 を GP2 のまま数エッジ、loopback_phase が ~0 を確認 (数µs 出るなら K 不良)。
         while capture.capture_mut().try_read().is_some() {}
         while sm2.rx().try_pull().is_some() {}
-        let mut samples: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
-        for _ in 0..6u32 {
-            match with_timeout(Duration::from_secs(30), async {
-                let c0 = capture.capture_mut().wait_edge().await; // 較正は生カウンタ (fine tier へ escape)
+        for _ in 0..3u32 {
+            if let Ok((c0, c2)) = with_timeout(Duration::from_secs(30), async {
+                let c0 = capture.capture_mut().wait_edge().await;
                 let c2 = sm2.rx().wait_pull().await;
                 (c0, c2)
             })
             .await
             {
-                Ok(pair) => {
-                    let _ = samples.push(pair);
-                }
-                Err(_) => break,
+                info!(
+                    "PHASE_K verify phase_ns={}",
+                    rp_pps::loopback_phase_ns(c0, c2, k, clk_sys_freq())
+                );
             }
         }
-        if samples.is_empty() {
-            break; // PPS が来ない (no fix) → 打ち切り
-        }
-        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
-        for (c0, c2) in samples.iter() {
-            let d = c0.wrapping_sub(*c2) as i32;
-            lo = lo.min(d);
-            hi = hi.max(d);
-        }
-        let spread = hi as i64 - lo as i64;
-        if let Some(kk) = rp_pps::calibrate_loopback_offset(samples.iter().copied()) {
-            k = kk; // 最良 (=最新) 候補。clean なら採用、不一致なら次 attempt で上書き。
-            k_n = samples.len();
-        }
-        info!(
-            "PHASE_K attempt={} n={} diff_lo={} diff_hi={} spread={} k={}",
-            attempt,
-            samples.len(),
-            lo,
-            hi,
-            spread,
-            k as i32
-        );
-        if samples.len() >= 3 && spread <= 1 {
-            k_clean = true;
-            break; // 同一エッジ確定
-        }
-        // 不一致 = 別エッジ混入 → 再 drain して取り直し
-    }
-    if k_clean {
-        info!("PHASE_K calibrated k={} (n={})", k as i32, k_n);
-    } else if k_n > 0 {
-        warn!(
-            "PHASE_K not clean (retries exhausted), using k={} (n={})",
-            k as i32, k_n
-        );
+
+        // SM2 を GP4 (ループバック) に切替。set_config は X を触らないので K は有効のまま。
+        let mut cfg_gp4 = PioConfig::default();
+        cfg_gp4.use_program(&lb_loaded, &[]);
+        cfg_gp4.set_jmp_pin(&lb_pin);
+        sm2.set_config(&cfg_gp4);
+
+        // SM1: 規律 PPS 生成を GP3 へ (rp-pps の SteeredPpsOutput)。初期周期 = ppb=0 の 1Hz (内部で
+        // output_period_cycles)。周期は gen_capture_task が毎エッジ set_next_period で操舵する
+        // (dither+period word 計算は rp-pps、servo=PLL は firmware 側に残す)。high 幅 100ms = GPS
+        // モジュール/GPSDO の一般的な 1PPS 幅 (外部機器へ配れる; 規律対象は立ち上がりエッジで幅に不依存)。
+        const PPS_PULSE_NS: u32 = 100_000_000; // 100 ms
+        let output = SteeredPpsOutput::new(&mut common, sm1, p.PIN_3, clk_sys_freq(), PPS_PULSE_NS);
+
+        // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
+        spawner_high.spawn(pps_task(capture).unwrap());
+        spawner_high.spawn(gen_capture_task(output, sm2, k, cfg_gp2, cfg_gp4).unwrap());
     } else {
-        warn!("PHASE_K calibration failed (no PPS)");
-    }
-    // K 検証: SM2 を GP2 のまま数エッジ、loopback_phase が ~0 を確認 (数µs 出るなら K 不良)。
-    while capture.capture_mut().try_read().is_some() {}
-    while sm2.rx().try_pull().is_some() {}
-    for _ in 0..3u32 {
-        if let Ok((c0, c2)) = with_timeout(Duration::from_secs(30), async {
-            let c0 = capture.capture_mut().wait_edge().await;
-            let c2 = sm2.rx().wait_pull().await;
-            (c0, c2)
-        })
-        .await
-        {
-            info!(
-                "PHASE_K verify phase_ns={}",
-                rp_pps::loopback_phase_ns(c0, c2, k, clk_sys_freq())
-            );
-        }
+        // 非PIO 素朴経路 (S0/S1): PIO0 は未消費。GP2=GPS soft 割込、GP3=Ticker トグル、GP4 放置。
+        // CLOCK (規律コア) は production と同一、front-end (TimedEdge を作る部分) だけが違う。
+        let gps_in = Input::new(p.PIN_2, Pull::None);
+        let pps_out = Output::new(p.PIN_3, Level::Low);
+        spawner_high.spawn(naive_pps_in_task(gps_in).unwrap());
+        spawner_high.spawn(naive_pps_out_task(pps_out).unwrap());
     }
 
-    // SM2 を GP4 (ループバック) に切替。set_config は X を触らないので K は有効のまま。
-    let mut cfg_gp4 = PioConfig::default();
-    cfg_gp4.use_program(&lb_loaded, &[]);
-    cfg_gp4.set_jmp_pin(&lb_pin);
-    sm2.set_config(&cfg_gp4);
-
-    // SM1: 規律 PPS 生成を GP3 へ (rp-pps の SteeredPpsOutput)。初期周期 = ppb=0 の 1Hz (内部で
-    // output_period_cycles)。周期は gen_capture_task が毎エッジ set_next_period で操舵する
-    // (dither+period word 計算は rp-pps、servo=PLL は firmware 側に残す)。high 幅 100ms = GPS
-    // モジュール/GPSDO の一般的な 1PPS 幅 (外部機器へ配れる; 規律対象は立ち上がりエッジで幅に不依存)。
-    const PPS_PULSE_NS: u32 = 100_000_000; // 100 ms
-    let output = SteeredPpsOutput::new(&mut common, sm1, p.PIN_3, clk_sys_freq(), PPS_PULSE_NS);
-
-    // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
-    interrupt::SWI_IRQ_0.set_priority(Priority::P0);
-    let spawner_high = EXECUTOR_HIGH.start(interrupt::SWI_IRQ_0);
-    spawner_high.spawn(pps_task(capture).unwrap());
+    // 規律 UTC 出力タスクは両経路共通 (CLOCK をどちらの front-end が養っても動く)。
     spawner.spawn(time_task().unwrap());
-    spawner_high.spawn(gen_capture_task(output, sm2, k, cfg_gp2, cfg_gp4).unwrap());
 
     // 内蔵温度センサ (運用時の熱監視。規律には未使用、PPSGEN ログに temp_raw を出すだけ)。
     // DMA free-running で最大レート連続サンプリングする。DMA_CH0 は本 firmware 唯一の DMA 利用先。

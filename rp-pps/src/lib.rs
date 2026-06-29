@@ -294,6 +294,26 @@ pub fn loopback_phase_ns(
     (ticks * CAPTURE_CYCLES_PER_TICK as i128 * 1_000_000_000 / clk_hz as i128) as i64
 }
 
+/// Fold a sub-second phase difference `out_ns - ref_ns` into `(-½ s, +½ s]` nanoseconds.
+///
+/// The software (non-PIO) 1PPS path measures the output edge's sub-second position against the
+/// reference (GPS) edge's, both on the same local timebase. Either timestamp can be mis-attributed
+/// to an adjacent UTC second (a ±1 s output/input race), but the folded sub-second phase is
+/// invariant to adding or removing whole seconds from *either* argument — so this internal phase
+/// metric needs no same-second pairing (the `C0_GEN`-style coordination the PIO path uses). The
+/// upper bound is closed and the lower bound open, matching [`loopback_phase_ticks`]'s half-second
+/// fold convention (so `+½ s` reads as a lead, never as `−½ s`).
+pub fn fold_phase_ns(out_ns: i64, ref_ns: i64) -> i64 {
+    const SEC: i64 = 1_000_000_000;
+    let mut d = (out_ns - ref_ns) % SEC;
+    if d > SEC / 2 {
+        d -= SEC;
+    } else if d <= -SEC / 2 {
+        d += SEC;
+    }
+    d
+}
+
 /// Calibrate the constant counter offset between two capture state machines from samples of the
 /// **same** edge captured on both — `(reference_capture, output_capture)` pairs — as the mean of
 /// `reference − output` in ticks. `None` if there are no samples. Run once at start-up with both
@@ -399,6 +419,43 @@ impl OutputPeriodDither {
         let period = clk - OUTPUT_OVERHEAD_CYCLES as i64 - high_cycles as i64 + freq_cycles
             - phase_corr_ns * clk / 1_000_000_000;
         period as u32
+    }
+}
+
+/// Sigma-delta period generator for the **software (non-PIO) 1PPS path**, in embassy-time ticks.
+///
+/// The naive output task toggles a GPIO with `Timer::after`, whose quantum is one embassy tick (1 µs
+/// on the RP2040). Rounding the per-edge frequency steering to whole ticks would quantize the output
+/// frequency to ~1 tick / 1 s = 1 ppm (1000 ppb at a 1 MHz tick) — far coarser than the crystal
+/// estimate, so the *average* drift would still be steered only in 1000 ppb steps. This carries the
+/// fractional tick across edges (first-order sigma-delta, the embassy-tick twin of
+/// [`OutputPeriodDither`]) so the average period resolves sub-tick.
+///
+/// It steers **frequency only** and returns the full rising-to-rising period; the high-pulse width is
+/// the caller's (subtract it from the returned period for the low-phase wait), matching how the PIO
+/// program accounts the pulse separately from the disciplined rising edge.
+#[derive(Debug, Default)]
+pub struct NaivePeriodDither {
+    frac_acc: i64, // carried fractional ticks, scaled by 1e12
+}
+
+impl NaivePeriodDither {
+    /// Create a generator (fraction accumulator starts at 0).
+    pub const fn new() -> Self {
+        Self { frac_acc: 0 }
+    }
+
+    /// Next full rising-to-rising period, in embassy-time ticks, for a total frequency offset
+    /// `freq_mppb` (milli-ppb; *lengthen* the period to compensate a fast crystal — the same sign as
+    /// [`output_period_cycles_ppb`]). The nominal period is `tick_hz` ticks (one second); the
+    /// fractional steering tick is carried so the average frequency resolves below one tick.
+    pub fn next_ticks(&mut self, tick_hz: u32, freq_mppb: i64) -> u32 {
+        let t = tick_hz as i64;
+        // Accumulate tick_hz * freq at 1e12 scale (milli-ppb = ppb*1000, ppb = 1e-9), carry the frac.
+        self.frac_acc += t * freq_mppb;
+        let freq_ticks = self.frac_acc.div_euclid(1_000_000_000_000);
+        self.frac_acc = self.frac_acc.rem_euclid(1_000_000_000_000);
+        (t + freq_ticks) as u32
     }
 }
 
@@ -605,6 +662,73 @@ mod tests {
         // negative phase_corr lengthens.
         let mut d2 = OutputPeriodDither::new();
         assert_eq!(d2.next_period(125_000_000, 0, -8, 0), 124_999_994);
+    }
+
+    #[test]
+    fn naive_dither_matches_whole_tick_steering() {
+        let mut d = NaivePeriodDither::new();
+        // 0 ppb -> nominal one-second period (tick_hz ticks); +1000 ppb at 1 MHz tick -> +1 tick.
+        assert_eq!(d.next_ticks(1_000_000, 0), 1_000_000);
+        assert_eq!(d.next_ticks(1_000_000, 1_000_000), 1_000_001);
+    }
+
+    #[test]
+    fn naive_dither_resolves_sub_tick_on_average() {
+        let mut d = NaivePeriodDither::new();
+        // 500 ppb at a 1 MHz tick = half a tick/s: the fraction carries, alternating +0,+1,+0,+1.
+        assert_eq!(d.next_ticks(1_000_000, 500_000), 1_000_000);
+        assert_eq!(d.next_ticks(1_000_000, 500_000), 1_000_001);
+        assert_eq!(d.next_ticks(1_000_000, 500_000), 1_000_000);
+        assert_eq!(d.next_ticks(1_000_000, 500_000), 1_000_001);
+    }
+
+    #[test]
+    fn naive_dither_negative_freq_shortens_period() {
+        let mut d = NaivePeriodDither::new();
+        // -1000 ppb at a 1 MHz tick -> -1 tick (a slow crystal needs a shorter wait).
+        assert_eq!(d.next_ticks(1_000_000, -1_000_000), 999_999);
+    }
+
+    #[test]
+    fn naive_dither_averages_below_one_tick_quantum() {
+        // The dropped integer-µs alternative rounds the per-edge steering to whole ticks: at a 1 MHz
+        // tick, 250 ppb rounds to 0 every edge (a 1000 ppb = 1-tick quantum), losing all sub-quantum
+        // steering. The sigma-delta recovers it: 0.25 tick/s accumulates with no loss over many edges.
+        let per_edge_whole = 1_000_000i64 * 250_000 / 1_000_000_000_000; // integer round = 0
+        assert_eq!(per_edge_whole, 0);
+        let mut d = NaivePeriodDither::new();
+        let n = 4000i64;
+        let mut excess = 0i64;
+        for _ in 0..n {
+            excess += d.next_ticks(1_000_000, 250_000) as i64 - 1_000_000;
+        }
+        assert_eq!(excess, n / 4); // 0.25 tick/s carried exactly
+    }
+
+    #[test]
+    fn fold_phase_ns_is_invariant_to_whole_seconds() {
+        // The sub-second phase is unchanged by adding/removing whole seconds from EITHER timestamp,
+        // so the naive path's possible ±1 s mis-attribution does not move the internal phase metric.
+        const SEC: i64 = 1_000_000_000;
+        assert_eq!(fold_phase_ns(1_700_000_300, 1_700_000_000), 300);
+        for ks in [-3i64, -1, 0, 2, 5] {
+            for js in [-2i64, 0, 1, 4] {
+                assert_eq!(
+                    fold_phase_ns(1_700_000_300 + ks * SEC, 1_700_000_000 + js * SEC),
+                    300
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fold_phase_ns_folds_to_half_second_window() {
+        const SEC: i64 = 1_000_000_000;
+        // 0.9 s lead folds to -0.1 s (closer to the next second).
+        assert_eq!(fold_phase_ns(900_000_000, 0), -100_000_000);
+        // exactly +½ s stays +½ s (closed upper bound); -½ s maps to +½ s (open lower bound).
+        assert_eq!(fold_phase_ns(SEC / 2, 0), SEC / 2);
+        assert_eq!(fold_phase_ns(-SEC / 2, 0), SEC / 2);
     }
 
     #[test]
