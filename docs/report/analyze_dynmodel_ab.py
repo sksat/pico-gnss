@@ -6,7 +6,7 @@ firmware の `DYNMODEL_AB=true` で 6 分 ABBA 交互送出した capture を解
 hwphase σ を比べる (slow drift を一次相殺)。受信統制 (slope_mppb=純受信ノイズ proxy, jit, rxbad) も
 セグメントごとに出す。座標は出さない (PPSGEN に座標は無い)。
 
-  uv run report/analyze_dynmodel_ab.py logs/pps-dynmodel-ab.log [discard_s] [outlier_ns]
+  uv run docs/report/analyze_dynmodel_ab.py logs/pps-dynmodel-ab.log [discard_s] [outlier_ns]
 """
 import sys
 import statistics as st

@@ -35,7 +35,7 @@ marker and the NMEA lat/lon.)*
 | [`rp-pps/`](rp-pps/) | **RP2040/RP2350 PIO + receiver I/O** (crate `rp-pps`). Hardware PPS edge-capture & steerable 1PPS output, NMEA framing/parsing, PPS↔UTC-second pairing — produces the timestamps + epoch `gnssdo` consumes. HAL-agnostic core (host-testable) + embassy-rp / rp2040-hal backends. |
 | [`pico-gnss/`](pico-gnss/) | RP2040 firmware (embassy-rp). PIO hardware PPS capture, clock discipline, disciplined PPS output. Embedded-only; wires `gnssdo` + `rp-pps`. |
 | [`webapp/`](webapp/) | Real-time dashboard (React 19 + Vite + TypeScript), fed from the firmware's defmt/RTT output via a zero-dependency Node bridge. |
-| [`report/`](report/) | On-hardware evaluation logs and figures. |
+| [`docs/report/`](docs/report/) | On-hardware evaluation logs and figures. |
 | [`NOTES.md`](NOTES.md) | Design decisions and hard-won gotchas. |
 
 ## Quick start
@@ -63,9 +63,9 @@ built from within `pico-gnss/` (where its `.cargo/config.toml` selects the
 
 ## Results (RP2040 @ 125 MHz)
 
-![evaluation report](report/report-en.png)
+![evaluation report](docs/report/report-en.png)
 
-Generated from a real on-device log ([`sample-capture.log`](report/sample-capture.log), ~227 s)
+Generated from a real on-device log ([`sample-capture.log`](docs/report/sample-capture.log), ~227 s)
 with `uv run webapp/plot_report.py`:
 
 - **A** — the GPSDO learns the crystal drift (~+2.5 ppm) at boot and then holds it at the
@@ -80,22 +80,22 @@ with `uv run webapp/plot_report.py`:
   (temperature-correlated) rather than the receiver (only a small ~13–18 ns floor is
   receiver-limited). The absolute output-vs-GPS offset is centered to **≤100 ns and
   reproducible across reboots** (Smith-predictor servo + loopback self-calibration; the old
-  software servo was ±1.4 ms). See [`report/REPORT.md`](report/REPORT.md) for the limits.
+  software servo was ±1.4 ms). See [`docs/report/REPORT.md`](docs/report/REPORT.md) for the limits.
 
 Before/after — phase *measurement* precision (Instant ±ms → PIO 16 ns) and the resulting
 output phase:
 
-![before/after](report/compare-en.png)
+![before/after](docs/report/compare-en.png)
 
 Independently cross-checked on an oscilloscope against the GPS reference (GPS edge at screen
 center = 0; the disciplined output leads it by a small, steerable offset):
 
-![oscilloscope: disciplined 1PPS vs GPS PPS](report/scope-pps-small.png)
+![oscilloscope: disciplined 1PPS vs GPS PPS](docs/report/scope-pps-small.png)
 
 The whole pull-in from boot, one frame per PPS: the output PPS converging onto the GPS edge
 (top, auto-zooming scope) alongside the firmware's internal state — offset/hwphase, time
 error, crystal ppb, and temperature with its feed-forward contribution:
 
-![GPSDO pull-in from boot — scope + parameters, per-PPS](report/combo-gpsdo-fromboot.gif)
+![GPSDO pull-in from boot — scope + parameters, per-PPS](docs/report/combo-gpsdo-fromboot.gif)
 
-See [`report/REPORT.md`](report/REPORT.md) for the full methodology and figures (Japanese).
+See [`docs/report/REPORT.md`](docs/report/REPORT.md) for the full methodology and figures (Japanese).

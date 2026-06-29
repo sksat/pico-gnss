@@ -11,7 +11,7 @@ wander がどの帯にあるかが「ループを緩めれば削れるか」の�
 
 NMEA の座標は一切読まない (PPS/PPSGEN/TIME/GSA の数値フィールドのみ)。GSA は DOP のみで座標を含まない。
 
-  uv run report/analyze_wander.py logs/pps-review.log [out_prefix]
+  uv run docs/report/analyze_wander.py logs/pps-review.log [out_prefix]
 """
 import re
 import sys
@@ -20,7 +20,7 @@ import numpy as np
 from scipy.signal import lombscargle
 
 LOG = sys.argv[1] if len(sys.argv) > 1 else "logs/pps-review.log"
-PREFIX = sys.argv[2] if len(sys.argv) > 2 else "report/wander"
+PREFIX = sys.argv[2] if len(sys.argv) > 2 else "docs/report/wander"
 
 TS = re.compile(r"^(\d+\.\d+)\s")
 

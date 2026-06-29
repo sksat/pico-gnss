@@ -446,7 +446,7 @@ def make_figure(rows, series_on, series_off, idens, sd_on, sd_off,
     ax.grid(alpha=0.3)
 
     fig.tight_layout()
-    out = f"{REPO}/report/sim_actuator_dither.png"
+    out = f"{REPO}/docs/report/sim_actuator_dither.png"
     fig.savefig(out, dpi=110)
     print(f"\nsaved figure: {out}")
 

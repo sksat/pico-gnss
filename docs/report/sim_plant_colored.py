@@ -24,7 +24,7 @@ Exact plant (integer math, Rust truncate-toward-zero division, all i64):
 
   model_hwphase[n] = theta_out[n] - theta_ref[n]   (what firmware/scope MEASURE)
 
-The PhaseLockLoop control law is the validated port from report/sim_resonance.py
+The PhaseLockLoop control law is the validated port from docs/report/sim_resonance.py
 (byte-for-byte equal to gnssdo/src/pll.rs in the prior workflow).
 
 CALIBRATION DISCIPLINE: theta_ref amplitude is calibrated ONCE at i_den=32 to hit
@@ -379,7 +379,7 @@ def make_figure(rows, series_by_iden, fw, sc, sigma_rw, sigma_w, peaks):
     ax.grid(alpha=0.3)
 
     fig.tight_layout()
-    out = f"{REPO}/report/sim_plant_colored.png"
+    out = f"{REPO}/docs/report/sim_plant_colored.png"
     fig.savefig(out, dpi=110)
     print(f"\nsaved figure: {out}")
 

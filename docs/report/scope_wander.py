@@ -12,7 +12,7 @@ verify/debug, tuning is on hwphase.
   NOTE: CH1 is a direct (1x) tap. Forcing CH1 to 10x clips the 3.3V signal off the screen top
   (raw bytes rail -> a bogus ~5.8V readout); the edge timing still works but the voltage is garbage.
 
-  RIGOL_HOST=<ip> python3 report/scope_wander.py <N> <out.log> [tag]
+  RIGOL_HOST=<ip> python3 docs/report/scope_wander.py <N> <out.log> [tag]
 
 out.log columns:  t_s   offset_ns      (t_s = seconds since capture start)
 """

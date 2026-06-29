@@ -12,7 +12,7 @@ ctrl_eval.evaluate() の共通プラント(16ns 量子化 + colored 受信ノイ
 指標は steady_rms(静定 σ)/ resonance_peak(共振)/ reacq / lock / step 応答 / drift_rms。
 小さいほど良い(resonance_peak は 1 に近いほど良い)。座標等は一切扱わない host 専用。
 
-  python3 report/ctrl_more.py
+  python3 docs/report/ctrl_more.py
 """
 import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

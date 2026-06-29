@@ -57,9 +57,9 @@ GPS-R PPS が基準で、出力位相は独立計器であるオシロで実測�
 - 素の `cargo test` と `cargo build` は host で動くコア (`default-members = gnssdo, rp-pps`) だけを対象にする。単一テストは `cargo test -p gnssdo <name>`。
 - firmware は `cd pico-gnss && cargo build --release` で建てる (target `thumbv6m-none-eabi` と linker は `.cargo/config` に設定済み)。
 - 実機フラッシュは `cargo build --release && cargo run --release` とする。`;` でなく `&&` にするのは、ビルド失敗時に古いバイナリを焼かないため。runner は probe-rs。
-- **ログ・成果物は 1 試行 = 1 サブディレクトリにまとめる。** `logs/<YYYYMMDD>-<topic>/` を切り、その試行の RTT ログ・オシロのモニタ出力・スクショ・GIF・解析の中間生成物を全部そこに入れる (例: `logs/20260629-precision-scope/pps-boot1.log`, `.../conv.gif`)。`logs/` 配下は丸ごと gitignore (`/logs/*`、README だけ追跡) なので中で自由に散らかしてよい。**その試行専用の単発スクリプト**もそのサブディレクトリに置いてよい。**真に再利用可能なスクリプトだけ** repo top の `scripts/` に昇格させる (env で機器 IP を受け、引数で入出力パスを取る形に整える)。`report/` に置くのはマスク済みの結論・図だけ。
+- **ログ・成果物は 1 試行 = 1 サブディレクトリにまとめる。** `logs/<YYYYMMDD>-<topic>/` を切り、その試行の RTT ログ・オシロのモニタ出力・スクショ・GIF・解析の中間生成物を全部そこに入れる (例: `logs/20260629-precision-scope/pps-boot1.log`, `.../conv.gif`)。`logs/` 配下は丸ごと gitignore (`/logs/*`、README だけ追跡) なので中で自由に散らかしてよい。**その試行専用の単発スクリプト**もそのサブディレクトリに置いてよい。**真に再利用可能なスクリプトだけ** repo top の `scripts/` に昇格させる (env で機器 IP を受け、引数で入出力パスを取る形に整える)。`docs/report/` に置くのはマスク済みの結論・図だけ。
 - `#[ignore]` のモデル検証、実ログ replay、掃引テストは手動で走らせる。`cargo test -p gnssdo --test thermal_plant -- --ignored <name> --nocapture` のように呼び、replay は `GNSSDO_REPLAY_LOG=` などの env を渡す。
 - RTT に何も出ないときは `DEFMT_LOG` を疑う。未設定だと `info!` や `warn!` がコンパイル時に消えるためで、`.cargo/config` で `info` に設定済み。
-- 実験ログやその解析結果に出る位置座標は、**commit せず、使う前にマスクする**。生の RTT ログ (`logs/*.log`) は gitignore 済みで、`report/` にはマスク済みの結論や図だけを置く。
+- 実験ログやその解析結果に出る位置座標は、**commit せず、使う前にマスクする**。生の RTT ログ (`logs/*.log`) は gitignore 済みで、`docs/report/` にはマスク済みの結論や図だけを置く。
 - 機器の所在を直書きしない。オシロや受信機の IP は env (`RIGOL_HOST` など) で渡す。
 - オシロでのタイミングと位相の計測は、レシピと落とし穴を oscilloscope-timing skill にまとめてある (新しい罠を踏んだら追記しておくとよい)。

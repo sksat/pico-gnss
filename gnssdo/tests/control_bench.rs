@@ -1,13 +1,13 @@
 //! Host plant-model comparison of the selectable [`PhaseController`]s — the mechanism for verifying
 //! control methods on a model (the user-requested "plant model で host 検証できる仕組み").
 //!
-//! It mirrors `report/ctrl_eval.py`'s plant so the **Rust library is the single source of truth**:
+//! It mirrors `docs/report/ctrl_eval.py`'s plant so the **Rust library is the single source of truth**:
 //! each method is exercised through the same `PhaseController` trait, so a difference in the table is
 //! a difference in the *method*, not in a re-implementation. Two measurement regimes are modelled —
 //! `pio` (≈16 ns hardware capture) and `no-pio` (≈µs-scale GPIO capture + jitter) — so the historical
 //! loopback/PIO-less configurations are comparable too.
 //!
-//! IMPORTANT (the measurement trap, see `report/REPORT.md`): the model is crude and, on hardware, the
+//! IMPORTANT (the measurement trap, see `docs/report/REPORT.md`): the model is crude and, on hardware, the
 //! loop measures output-vs-**the same receiver**, so a steady-state improvement here is NOT proof of
 //! a true-UTC improvement. This harness ranks *dynamics* (lock, reacquire, step, drift) and flags
 //! gross regressions; the reception-independent go/no-go is the hardware PRBS `h[k]` (separate).

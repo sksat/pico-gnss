@@ -9,7 +9,7 @@
 lk=1 かつ |hw|<5µs の clean サンプルで集計する。同一 i_den の全セグメントを束ねて sd と周期を出し、
 セグメント毎 sd も併記して受信ゆらぎの効きを見る。
 
-  uv run report/analyze_sweep.py logs/pps-idensweep.log
+  uv run docs/report/analyze_sweep.py logs/pps-idensweep.log
 """
 import re, sys, math
 import numpy as np

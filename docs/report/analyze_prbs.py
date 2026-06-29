@@ -6,7 +6,7 @@
 h[k] のリンギング(負へオーバーシュート→振動)= ループの実効 under-damping=潰せる共振。config(i_den)別に
 比べ、firmware loop にまだ制御可能な共振が残っているかを受信交絡なしに判定する。座標(NMEA)は読み捨て。
 
-  python3 report/analyze_prbs.py logs/pps-prbs.log
+  python3 docs/report/analyze_prbs.py logs/pps-prbs.log
 """
 import re, sys, statistics
 

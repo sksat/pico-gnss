@@ -6,7 +6,7 @@
 HDOP 低・|hwphase| 小 が QWIN 秒続いたら発火し、同じディレクトリの defmatch.py を実行、
 結果を保存して終了 (= 親プロセスに通知)。
 
-  RIGOL_HOST=<scope-ip> python3 report/good_watch.py
+  RIGOL_HOST=<scope-ip> python3 docs/report/good_watch.py
 env:
   GNSS_LOG        firmware の defmt ログ (default /tmp/pps-flash.log)
   DEFMATCH_RESULT 結果保存先 (default /tmp/defmatch-result.txt)

@@ -3,7 +3,7 @@
 capturing valid edges? Screenshots the display and scans timebases to find the output-vs-GPS
 offset so the capture window can be set right. Read-only on the device; only changes scope view.
 
-  RIGOL_HOST=<ip> python3 report/scope_debug.py
+  RIGOL_HOST=<ip> python3 docs/report/scope_debug.py
 """
 import os, sys, statistics
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
@@ -44,6 +44,6 @@ with Rigol() as s:
               f"edges_ok={len(offs)}/8 CH1swing~{int(statistics.mean(sw1)) if sw1 else 0} "
               f"CH2swing~{int(statistics.mean(sw2)) if sw2 else 0} offset={m}")
     s.send(":TIMebase:MAIN:SCALe 1e-6")
-    n = s.screenshot("report/scope-debug-iden128.png")
-    print(f"screenshot report/scope-debug-iden128.png ({n} bytes)")
+    n = s.screenshot("docs/report/scope-debug-iden128.png")
+    print(f"screenshot docs/report/scope-debug-iden128.png ({n} bytes)")
     print("errors:", s.drain_errors())

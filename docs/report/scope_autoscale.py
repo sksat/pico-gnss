@@ -8,7 +8,7 @@
 ちょうどよい s/div を選ぶ。CH1=1×(GPS 直結)/CH2=10×(プローブ)も毎回ここで正す。
 
 使い方:
-  python report/scope_autoscale.py [mode] [N]
+  python docs/report/scope_autoscale.py [mode] [N]
     mode = live   (既定) … wander を画面内に保ちつつ最大ズーム。NORM ライブ観測向け
            single        … 瞬時 offset を解像するズーム(:SINGle の静止画向け。ライブだと wander で外れる)
            <s/div>       … 明示指定(例 20e-9)
@@ -188,7 +188,7 @@ def main():
                 break
         s.screenshot(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scope-autoscale.png"))
         s.send(":RUN")  # 最後はライブ(NORM)へ戻す
-        print("保存: report/scope-autoscale.png  errors:", s.drain_errors())
+        print("保存: docs/report/scope-autoscale.png  errors:", s.drain_errors())
 
 
 if __name__ == "__main__":

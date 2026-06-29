@@ -51,7 +51,7 @@ uv run plot_ctrl.py ctrl5.log out.png                  # 実機の制御構成 P
 ```
 測位精度 (CEP/R95/2DRMS)・PPS ジッタ・GPSDO 安定度・時刻補正残差 (snap 済)・規律 PPS 出力ジッタ・
 位相同期の収束・holdover 誤差・衛星/C/N0 を出す。±1ms フィルタ・snap は firmware と揃えてある。
-生成例は [../report/REPORT.md](../report/REPORT.md)。
+生成例は [../docs/report/REPORT.md](../docs/report/REPORT.md)。
 
 ## firmware が出す行 (server がパース)
 ```

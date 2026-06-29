@@ -8,7 +8,7 @@ boost 発火(state=1)を制御器(cidx)ごとに集計する。kick は固定ス
 
 座標保護: PPSGEN 行のみ解析。NMEA/座標は一切読まない・出さない。
 
-  python3 report/analyze_kick_recovery.py logs/pps-ctrlsweep-prbs.log
+  python3 docs/report/analyze_kick_recovery.py logs/pps-ctrlsweep-prbs.log
 """
 import re, sys, statistics
 

@@ -634,7 +634,7 @@ def make_figures(rows, fw, kp_rows, fixed_rows, d_rows):
     ax.grid(alpha=0.3)
 
     fig.tight_layout()
-    out = "/home/sksat/prog/pico-gnss-rs/report/sim_resonance.png"
+    out = "/home/sksat/prog/pico-gnss-rs/docs/report/sim_resonance.png"
     fig.savefig(out, dpi=110)
     print(f"\nsaved figure: {out}")
 

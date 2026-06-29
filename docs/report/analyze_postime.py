@@ -10,7 +10,7 @@ hwphase / ドリフト推定 slope / 操舵 trim の遅い成分が相関する�
 **座標保護**: 緯度経度高度の絶対値は一切出力しない。出すのは平均からの偏差(meter)・相関係数・遅延構造だけ。
 NMEA(GGA)と PPSGEN を行頭の RTT タイムスタンプで対応づける。
 
-  python3 report/analyze_postime.py logs/pps-prod-clean.log
+  python3 docs/report/analyze_postime.py logs/pps-prod-clean.log
 """
 import re, sys, math
 import numpy as np

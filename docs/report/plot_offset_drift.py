@@ -8,7 +8,7 @@ longmon-result.log の各 "measure #N" 行から (firmware時刻, GP3-GPS offset
 ppb が無い旧形式行は firmware ログ (pps-flash.log の TIME 行) から近傍 ppb を補完する。
 左: offset vs 経過時間、右: offset vs ppb(temp proxy) + 線形 fit (ns/ppb)。
 
-  uv run report/plot_offset_drift.py [longmon-result.log] [pps-flash.log] [out.png]
+  uv run docs/report/plot_offset_drift.py [longmon-result.log] [pps-flash.log] [out.png]
 """
 import bisect
 import re
@@ -21,7 +21,7 @@ import numpy as np
 
 RESULT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/longmon-result.log"
 FWLOG = sys.argv[2] if len(sys.argv) > 2 else "/tmp/pps-flash.log"
-OUT = sys.argv[3] if len(sys.argv) > 3 else "report/offset-drift.png"
+OUT = sys.argv[3] if len(sys.argv) > 3 else "docs/report/offset-drift.png"
 
 MRE = re.compile(r"\[t=(\d+)\] measure #\d+:.*?offset=(-?\d+)ns")
 PRE = re.compile(r"ppb=(-?\d+)")

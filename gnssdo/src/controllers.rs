@@ -2,7 +2,7 @@
 //! candidate output-phase methods can all be selected and compared under matched conditions (see
 //! [`control`](crate::control) for why a common abstraction matters — the measurement trap).
 //!
-//! - [`OpenLoopFf`]: the **loopback-less** configuration from `report/REPORT.md` ("ループバック無しの
+//! - [`OpenLoopFf`]: the **loopback-less** configuration from `docs/report/REPORT.md` ("ループバック無しの
 //!   構成"). With no hardware loopback there is no honest output-vs-reference phase to close, so the
 //!   phase servo is dropped and the output rides the crystal feedforward open-loop. Represented here
 //!   as a controller that emits no phase correction and only holds a residual trim.
@@ -100,7 +100,7 @@ impl PhaseController for Controller {
 // OpenLoopFf — the loopback-less / open-loop configuration.
 // ---------------------------------------------------------------------------------------------
 
-/// Open-loop feedforward: **no phase servo**. Models the loopback-less build (`report/REPORT.md`'s
+/// Open-loop feedforward: **no phase servo**. Models the loopback-less build (`docs/report/REPORT.md`'s
 /// "ループバック無しの構成"), where without the hardware loopback there is no honest output phase to
 /// close, so the output rides the crystal feedforward and any fixed offset is burned, not measured.
 ///

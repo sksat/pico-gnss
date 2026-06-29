@@ -9,7 +9,7 @@ firmware ログ (PPSGEN の hwphase_ns / lk, TIME の ppb) を読み、上段に
 締まり、ランプ区間で揺れが増える様子と、落ち着き具合を見る用。hwphase は実出力 vs GPS の真値 (scope の
 プローブスキューは乗らない)。
 
-  uv run report/plot_wander.py [pps-review.log] [out.png] [rolling_window_s]
+  uv run docs/report/plot_wander.py [pps-review.log] [out.png] [rolling_window_s]
 """
 import re
 import sys
@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 LOG = sys.argv[1] if len(sys.argv) > 1 else "/tmp/pps-review.log"
-OUT = sys.argv[2] if len(sys.argv) > 2 else "report/offset-wander-settle.png"
+OUT = sys.argv[2] if len(sys.argv) > 2 else "docs/report/offset-wander-settle.png"
 WIN_S = float(sys.argv[3]) if len(sys.argv) > 3 else 30.0
 
 gen_t, gen_hw, gen_lk, ppb_t, ppb_v = [], [], [], [], []

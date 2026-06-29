@@ -6,7 +6,7 @@ scope ログ (scope_logger.py 出力: wall_time offset_ns) を、firmware ログ
 (各 PPSGEN 行の RTT 時刻 + dynmode) に wall↔RTT 橋で対応づけ、scope offset を mobile/stationary に層別。
 切替直後を捨て、隣接ペア (mobile−stationary) で scope σ を比べる。座標は読まない。
 
-  uv run report/analyze_scope_ab.py logs/pps-dynmodel-ab.log logs/scope-dynmodel-ab.log [discard_s]
+  uv run docs/report/analyze_scope_ab.py logs/pps-dynmodel-ab.log logs/scope-dynmodel-ab.log [discard_s]
 """
 import re
 import sys

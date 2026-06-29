@@ -10,7 +10,7 @@ gap = offset2 - hwphase を時間軸で並べる。gap は firmware に見えな
 gap の絶対値 ~50ns 分は ×1/×10 スコーププローブのスキュー等の計測セットアップ固有オフセットで、
 firmware の値でも実出力オフセットでもない (実際の出力 vs GPS は hwphase=~0 中心)。ここで見るのは傾き。
 
-  uv run report/plot_recal.py <no-recal offset.log> <recal offset.log> [recal_times_csv] [out.png]
+  uv run docs/report/plot_recal.py <no-recal offset.log> <recal offset.log> [recal_times_csv] [out.png]
 """
 import re
 import sys
@@ -23,7 +23,7 @@ import numpy as np
 NORECAL = sys.argv[1] if len(sys.argv) > 1 else "/tmp/offset-gate5.log"
 RECAL = sys.argv[2] if len(sys.argv) > 2 else "/tmp/offset-slew.log"
 RECAL_TS = [float(x) for x in sys.argv[3].split(",")] if len(sys.argv) > 3 and sys.argv[3] else []
-OUT = sys.argv[4] if len(sys.argv) > 4 else "report/offset-recal.png"
+OUT = sys.argv[4] if len(sys.argv) > 4 else "docs/report/offset-recal.png"
 
 
 def load(path):

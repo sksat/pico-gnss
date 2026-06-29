@@ -29,7 +29,7 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 import os
 _here = os.path.dirname(os.path.abspath(__file__))
-path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_here, "../report/pid-capture.log")
+path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_here, "../docs/report/pid-capture.log")
 out = sys.argv[2] if len(sys.argv) > 2 else "tune.png"
 D = 2  # ループ遅れ (smart-friend 推定 d≈2)
 

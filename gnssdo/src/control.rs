@@ -3,7 +3,7 @@
 //!
 //! Why an abstraction at all: the loop measures output-vs-**the same receiver** (`hwphase`), so a
 //! steady-state "closer to UTC" claim can't be verified without an external reference (the
-//! *measurement trap*; see `report/REPORT.md`). What *can* be verified reception-independently is the
+//! *measurement trap*; see `docs/report/REPORT.md`). What *can* be verified reception-independently is the
 //! closed-loop response, by cycling controllers in one boot and injecting a known PRBS into each.
 //! That comparison is only fair if every controller is the *same kind of object* on the *same plant
 //! input*. Hence this trait: each controller is a pure phase servo that consumes a measured phase
@@ -72,7 +72,7 @@ pub struct ControlOutput {
 /// **continuous** across the switch: it hands the next controller the residual trim that keeps
 /// `feedforward + trim` unchanged, and every per-edge history (Smith / derivative / observer / boost
 /// / lock counter) is blanked. The first post-switch `pcorr_ns` then starts from 0, so there is no
-/// spurious derivative kick. See `report/REPORT.md`'s cross-controller comparison protocol.
+/// spurious derivative kick. See `docs/report/REPORT.md`'s cross-controller comparison protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ControlInit {
     /// Initial residual frequency trim (milli-ppb) = `applied_freq − new_feedforward`, so the output

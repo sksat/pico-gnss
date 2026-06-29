@@ -5,7 +5,7 @@
 共振ディップ(autocorr 最深負)を出し、受信交絡を避けるため **1 cycle(128,256,512 が時間的に隣接)内の
 比** も併記する。座標を含む NMEA 行は読み捨て(PPSGEN のみ解析、座標は一切出力しない)。
 
-  python3 report/analyze_sweep_slim.py logs/pps-sweep-dden4.log
+  python3 docs/report/analyze_sweep_slim.py logs/pps-sweep-dden4.log
 """
 import re, sys, math, statistics
 

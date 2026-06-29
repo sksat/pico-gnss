@@ -33,7 +33,7 @@ holdover・スカイプロット / C/N₀・測位 fix。(位置はプライバ�
 | [`rp-pps/`](rp-pps/) | **RP2040/RP2350 PIO + 受信機 I/O** (crate `rp-pps`)。PPS エッジのハード捕捉・操舵可能な 1PPS 出力、NMEA フレーミング/パース、PPS↔UTC 秒の対応付け — `gnssdo` が消費する timestamp と epoch を生産。HAL 非依存コア (host テスト可) + embassy-rp / rp2040-hal backend。 |
 | [`pico-gnss/`](pico-gnss/) | RP2040 firmware (embassy-rp)。PIO ハード PPS 捕捉、クロック規律、規律 PPS 出力。embedded 専用で `gnssdo` + `rp-pps` を配線。 |
 | [`webapp/`](webapp/) | リアルタイムダッシュボード (React 19 + Vite + TypeScript)。firmware の defmt/RTT 出力を依存ゼロの Node ブリッジ経由で表示。 |
-| [`report/`](report/) | 実機評価のログと図。 |
+| [`docs/report/`](docs/report/) | 実機評価のログと図。 |
 | [`NOTES.md`](NOTES.md) | 設計判断とハマった罠の記録。 |
 
 ## クイックスタート
@@ -61,9 +61,9 @@ embedded 専用で、`pico-gnss/`(その `.cargo/config.toml` が `thumbv6m-none
 
 ## 実機評価結果 (RP2040 @ 125 MHz)
 
-![evaluation report](report/report.png)
+![evaluation report](docs/report/report.png)
 
-実機ログ ([`sample-capture.log`](report/sample-capture.log), ~227s) から
+実機ログ ([`sample-capture.log`](docs/report/sample-capture.log), ~227s) から
 `uv run webapp/plot_report.py` で生成:
 
 - **A** — GPSDO が起動時に水晶ドリフト (~+2.5 ppm) を学習し、その後 ppb 級で保持する。
@@ -76,19 +76,19 @@ embedded 専用で、`pico-gnss/`(その `.cargo/config.toml` が `thumbv6m-none
   外部基準なしには分離できないが、データはむしろ水晶/発振器側 (温度相関) で受信機ではない
   (受信律速なのは極小の ~13–18 ns 下限のみ)。出力 vs GPS の絶対オフセットは **≤100 ns に中心化・
   再起動再現性あり** (Smith 予測子サーボ + ループバック自己較正。旧ソフトサーボは ±1.4 ms)。
-  窓依存と限界は [`report/REPORT.md`](report/REPORT.md) を参照。
+  窓依存と限界は [`docs/report/REPORT.md`](docs/report/REPORT.md) を参照。
 
 before/after — 位相の「測定」精度 (Instant ±ms → PIO 16 ns) と、その結果の出力位相:
 
-![before/after](report/compare.png)
+![before/after](docs/report/compare.png)
 
 規律 1PPS をオシロで GPS 基準と独立検証 (GPS エッジを画面中央=0 に; 生成側はわずかに早く、量は操舵可能):
 
-![オシロ: 規律 1PPS vs GPS PPS](report/scope-pps-small.png)
+![オシロ: 規律 1PPS vs GPS PPS](docs/report/scope-pps-small.png)
 
 起動からの引き込み全体を毎 PPS で: 出力 PPS が GPS エッジへ収束する様子 (上段, auto-zoom するオシロ) と、
 firmware の内部状態 — offset/hwphase・時刻誤差・水晶 ppb・温度とその feed-forward 寄与 — を同時に:
 
-![起動からの GPSDO 引き込み — オシロ + パラメータ, 毎PPS](report/combo-gpsdo-fromboot.gif)
+![起動からの GPSDO 引き込み — オシロ + パラメータ, 毎PPS](docs/report/combo-gpsdo-fromboot.gif)
 
-手法の詳細・全図は [`report/REPORT.md`](report/REPORT.md) を参照。
+手法の詳細・全図は [`docs/report/REPORT.md`](docs/report/REPORT.md) を参照。
