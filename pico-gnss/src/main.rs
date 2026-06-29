@@ -207,6 +207,18 @@ const RECAL_EDGES: u32 = 150; // production: ~2.5分毎に ΔC(実効K)再測。
 /// 実測 (recal 有効) GP2-vs-GP4 ≈ +48ns late → +3 tick で出力を進めて中心化。
 const ABS_OFFSET_TICKS: i32 = 3;
 
+/// **実験: 間欠ループバック特性化**。ループバックを常時でなく間欠で使う設計 (普段は SM を別用途に空ける) に
+/// したとき、出力位相がどう振る舞うかを実機で測る。閉窓 (通常の位相ループ + 窓入口で K 再較正) と
+/// 開窓 (周波数FFのみ = `predicted_freq`、位相補正と recal を停止) を交互に回し、開窓中も hwphase は
+/// 捕捉し続けてログ (適用しないだけ) → 開ループの位相ドリフトが hwphase と scope の両方に出る。
+/// 開窓長 `EXP_TOFF_SCHEDULE` を巡回掃引し、「開窓時間 → 最大オフセット偏差」を得る。false で production。
+const INTERMITTENT_EXP: bool = false;
+const EXP_TON_EDGES: u32 = 30; // 閉窓 (locked edges≈秒): 入口の K 再較正 + ループ整定に十分
+const EXP_TOFF_SCHEDULE: [u32; 4] = [30, 60, 120, 300]; // 開窓長 (locked edges≈秒) を巡回
+/// 開窓の出力周波数: true=学習済みトリムを保持 (pred + 閉窓最後の trim。現実的な間欠設計) /
+/// false=素朴 (pred のみ。ループ補正を丸ごと捨てる最悪ケース)。両者を比較して間欠化の特性差を測る。
+const EXP_HOLD_TRIM: bool = true;
+
 /// 温度フィードフォワード (gnssdo の増補型温度モデル) の runtime トグル。**実験A=false** (温度 wander の
 /// 受信非依存 loop-shape を測る段階)。実験B/C で true にして温度FF の効果を測る。boot で
 /// `CLOCK.set_temp_ff_enable` に渡す。
@@ -528,6 +540,14 @@ async fn gen_capture_task(
     // recal_k に渡る (再較正はループ末尾＝周期語確定後にしか発火しない) ので、初期値は不要。
     let mut last_period: u32;
     let mut edges_since_recal: u32 = 0;
+    // 間欠ループバック実験の状態。exp_open=開窓(周波数FFのみ)、edges_in_mode=現窓の経過 locked edges、
+    // toff_idx=EXP_TOFF_SCHEDULE 内の位置 (開窓ごとに巡回)。
+    let mut exp_open = false;
+    let mut exp_edges_in_mode: u32 = 0;
+    let mut exp_toff_idx: usize = 0;
+    let mut exp_held_trim: i64 = 0; // 開窓で保持する周波数補正 (閉窓トリムの平均 = steady integrator)
+    let mut exp_trim_sum: i64 = 0; // 閉窓中のトリム積算 (平均用)
+    let mut exp_trim_n: u32 = 0;
     // 出力位相の制御器 (gnssdo::Controller)。sub-cycle period 生成 (dither) + period word push は
     // SteeredPpsOutput (rp-pps) が内包するので、ここは freq_mppb と phase_corr を渡すだけ。本番は
     // slot 0 (現行 firmware の PID+Smith チューニング)。CONTROLLER_SWEEP=true で locked 中に巡回する。
@@ -635,7 +655,10 @@ async fn gen_capture_task(
         if !paired {
             warn!("PPSGEN mispair raw_lag={} ticks (>~10ms) -> drop", raw_lag);
         }
-        let valid = fresh && sane && c0 != 0 && paired;
+        // 間欠実験の開窓中は制御器を hold (valid=false) して windup を避け、出力は周波数FFのみにする。
+        // hwphase は上で計算済みなので、開ループのドリフトはログ/scope に出る (適用しないだけ)。
+        let exp_hold = INTERMITTENT_EXP && exp_open;
+        let valid = fresh && sane && c0 != 0 && paired && !exp_hold;
         // 選択中の制御器に位相誤差を渡す (gnssdo::Controller。本番=slot0、CONTROLLER_SWEEP 中は巡回)。
         let u = controller.step(ControlInput {
             err_ns: ctrl,
@@ -653,7 +676,13 @@ async fn gen_capture_task(
         // 温度ランプ中、単一 EMA だと推定が遅れて出力位相が ramp 速度に比例してずれる (offset② のドリフト)。
         // DisciplinedClock の α-β が傾きを先回りするので、出力周期にその予測周波数を入れて定常誤差を抑える。
         // 位相補正は dither が cycle に変換して引く。
-        let freq_mppb = pred_mppb + u.trim_mppb;
+        // 開窓 (exp_hold): 位相補正なし。周波数は EXP_HOLD_TRIM=true なら学習済みトリムを保持 (pred + 保持 trim)、
+        // false なら pred のみ (補正を丸ごと捨てる)。閉窓/本番は通常どおり制御器のトリム + 位相。
+        let freq_mppb = if exp_hold {
+            pred_mppb + if EXP_HOLD_TRIM { exp_held_trim } else { 0 }
+        } else {
+            pred_mppb + u.trim_mppb
+        };
         last_applied_freq_mppb = freq_mppb; // 制御器巡回の公平切替用 (次手法へ residual trim を継ぐ)
         // PRBS 自己同定: ロック中、出力位相に既知の ±PRBS_AMP_NS 擬似ランダム外乱を注入(plant 入力)。ループは
         // これを hwphase 経由で見て打ち消すので、inj と hwphase の相互相関で閉ループ伝達(共振)が受信交絡なしに出る。
@@ -679,7 +708,8 @@ async fn gen_capture_task(
             0
         };
         // 周期語を保持: 再較正中の holdover 生 push に再利用 (dither はこの通常経路でのみ前進)。
-        last_period = output.set_next_period(freq_mppb, u.pcorr_ns + prbs_inj + kick_inj);
+        let pcorr_ns = if exp_hold { 0 } else { u.pcorr_ns };
+        last_period = output.set_next_period(freq_mppb, pcorr_ns + prbs_inj + kick_inj);
         if let Some(iv) = interval_ns {
             count += 1;
             // 制御信号を全部出力 → ホストでプラント同定 + 制御器比較 + 項別比較ができる。
@@ -749,7 +779,37 @@ async fn gen_capture_task(
                 );
             }
         }
-        if u.locked {
+        if INTERMITTENT_EXP {
+            // 間欠ループバック実験: 閉窓 (EXP_TON_EDGES) ↔ 開窓 (EXP_TOFF_SCHEDULE[idx]) を巡回。
+            // 開窓中は recal を止め周波数FFのみ (上の exp_hold)。窓入口 (開→閉) で K を測り直す。
+            if u.locked {
+                exp_edges_in_mode += 1;
+                if !exp_open {
+                    exp_trim_sum += u.trim_mppb; // 閉窓のトリムを平均用に蓄積 (steady 周波数補正)
+                    exp_trim_n += 1;
+                }
+                if !exp_open && exp_edges_in_mode >= EXP_TON_EDGES {
+                    exp_open = true;
+                    exp_edges_in_mode = 0;
+                    // 保持トリム = 閉窓平均。瞬時値はノイズ/位相応答を含み過補正するため平均で steady 値を取る。
+                    exp_held_trim = if exp_trim_n > 0 { exp_trim_sum / exp_trim_n as i64 } else { u.trim_mppb };
+                    info!("LOOPEXP open toff={} held_trim={}", EXP_TOFF_SCHEDULE[exp_toff_idx], exp_held_trim);
+                } else if exp_open && exp_edges_in_mode >= EXP_TOFF_SCHEDULE[exp_toff_idx] {
+                    exp_open = false;
+                    exp_edges_in_mode = 0;
+                    exp_trim_sum = 0;
+                    exp_trim_n = 0; // 次の閉窓で平均を取り直す
+                    exp_toff_idx = (exp_toff_idx + 1) % EXP_TOFF_SCHEDULE.len();
+                    info!("LOOPEXP closed recal");
+                    // 開窓では実効 K を放置したので、閉じる入口で測り直す (間欠運用の作法)。
+                    k_target = recal_k(&mut sm, &mut output, &cfg_gp2, &cfg_gp4, k_target, last_period).await;
+                    last_x = None;
+                    last_gen = C0_GEN.load(Ordering::Acquire);
+                }
+            } else {
+                exp_edges_in_mode = 0;
+            }
+        } else if u.locked {
             edges_since_recal += 1;
             if edges_since_recal >= RECAL_EDGES {
                 edges_since_recal = 0;
