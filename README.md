@@ -74,11 +74,13 @@ with `uv run webapp/plot_report.py`:
 - **C** — PPS jitter fits within a few 16 ns capture-quantization steps (PIO hardware capture,
   ~10–16 ns; vs ~9 µs for a software GPIO-interrupt approach).
 - **D** — the disciplined PPS output tracks the GPS second to **σ ~35–50 ns in short,
-  good-reception windows**, but the wander is **reception-limited** — ~150 ns over minutes,
-  σ ~200–250 ns beyond ~10 min. The absolute output-vs-GPS offset is centered to **≤100 ns
-  and reproducible across reboots** (Smith-predictor servo + loopback self-calibration; the
-  old software servo was ±1.4 ms). See [`report/REPORT.md`](report/REPORT.md) for the
-  window-dependence and the receiver-limited floor.
+  good-reception windows**, but the low-frequency variation (~150 ns over minutes,
+  σ ~200–250 ns beyond ~10 min) is **hardware-limited, not firmware-fixable** — its source
+  isn't separable without an external reference, and the data leans the crystal/oscillator
+  (temperature-correlated) rather than the receiver (only a small ~13–18 ns floor is
+  receiver-limited). The absolute output-vs-GPS offset is centered to **≤100 ns and
+  reproducible across reboots** (Smith-predictor servo + loopback self-calibration; the old
+  software servo was ±1.4 ms). See [`report/REPORT.md`](report/REPORT.md) for the limits.
 
 Before/after — phase *measurement* precision (Instant ±ms → PIO 16 ns) and the resulting
 output phase:
