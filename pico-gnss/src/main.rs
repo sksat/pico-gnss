@@ -546,18 +546,27 @@ fn now_local_ns() -> u64 {
     Instant::now().as_micros() * 1000
 }
 
+/// 走行中 capture SM の jmp_pin だけを execctrl 経由で切替える (GP2↔GP4)。**set_config は使わない**:
+/// use_program 済み config だと末尾で exec_jmp(origin) を呼び、走行中 SM の PC を先頭へ強制ジャンプさせる。
+/// capture SM で pin high 中にこれをやると先頭 jmp pin rising が即 capture 経路へ入り、4 サイクル無減算 =
+/// 自走カウンタ X が −2 tick 損し、偽 push も 1 個出る (KPOKE 実験 20260704 で実証)。jmp_pin レジスタだけ
+/// 書けば program/clkdiv/pindirs は不変 (cfg_gp2/cfg_gp4 は jmp_pin 以外同一) なので X を乱さず切替えられる。
+fn switch_jmp_pin(sm: usize, pin: u8) {
+    embassy_rp::pac::PIO0
+        .sm(sm)
+        .execctrl()
+        .modify(|w| w.set_jmp_pin(pin));
+}
+
 /// PIO がラッチした PPS エッジを読み、間隔を ns で求めて出す + 周波数を規律するタスク。
 #[embassy_executor::task]
 async fn pps_task(
     mut capture: TimedPpsCapture<'static, PIO0, 0>,
     mut sm3: StateMachine<'static, PIO0, 3>,
-    // 実験(KPOKE): SM3 への同値 set_config 用の config (cfg_gp2 と同一内容)。制御には非関与。
-    poke_cfg: PioConfig<'static, PIO0>,
 ) {
     let mut count: u32 = 0; // ログ用エッジ連番
     let mut iv_buf = [0i64; RX_JIT_WIN]; // 直近 Locked エッジの interval_ns (受信品質ジッタ用 ring buffer)
     let mut iv_cnt: usize = 0;
-    let mut edge_n: u32 = 0; // 実験(KPOKE): poke タイミング用エッジ連番 (60 エッジ≒60s に 1 poke)
 
     loop {
         // wait_edge + timeline.observe は TimedPpsCapture に委譲。生カウンタは edge.raw で取れる。
@@ -629,66 +638,6 @@ async fn pps_task(
             missed,
             freq
         );
-
-        // 実験(KPOKE): 「校正切替量子 −4 tick」の機構特定。仮説は「embassy の set_config が走行中 SM の
-        // CLKDIV 等を "同値" で再書込みするだけで、その SM の自走ダウンカウンタ X が数 sysclk 分の減算を
-        // スキップする」。純観測 SM3 (GP2 常時・制御非関与) に同値書込みを打ち、K_same=c0−c3 の段として
-        // 直接測る。**書込みは全て同値 (read した値をそのまま write) でレジスタ内容を変えない。** poke は
-        // await を持たず数 µs のレジスタ書込みのみ。60 エッジ (≒60s) に 1 回、6 種を巡回する。
-        edge_n += 1;
-        if edge_n % 60 == 0 {
-            // 初回 poke (edge_n=60) を idx 0 (full n=1) から始めるため -1 する (edge_n>=60 で underflow なし)。
-            match (edge_n / 60 - 1) % 6 {
-                0 => {
-                    // full n=1: embassy set_config を 1 回 (CLKDIV/EXECCTRL/SHIFTCTRL/PINCTRL を同値再書込み)。
-                    sm3.set_config(&poke_cfg);
-                    info!("KPOKE kind=full n=1 edge={}", edge_n);
-                }
-                1 => {
-                    // full n=4。
-                    for _ in 0..4 {
-                        sm3.set_config(&poke_cfg);
-                    }
-                    info!("KPOKE kind=full n=4 edge={}", edge_n);
-                }
-                2 => {
-                    // CLKDIV のみ同値再書込み n=4 (read→同値 write。値は変えない)。
-                    let r = embassy_rp::pac::PIO0.sm(3).clkdiv();
-                    for _ in 0..4 {
-                        let v = r.read();
-                        r.write_value(v);
-                    }
-                    info!("KPOKE kind=clkdiv n=4 edge={}", edge_n);
-                }
-                3 => {
-                    // EXECCTRL のみ同値再書込み n=4。
-                    let r = embassy_rp::pac::PIO0.sm(3).execctrl();
-                    for _ in 0..4 {
-                        let v = r.read();
-                        r.write_value(v);
-                    }
-                    info!("KPOKE kind=execctrl n=4 edge={}", edge_n);
-                }
-                4 => {
-                    // SHIFTCTRL のみ同値再書込み n=4。
-                    let r = embassy_rp::pac::PIO0.sm(3).shiftctrl();
-                    for _ in 0..4 {
-                        let v = r.read();
-                        r.write_value(v);
-                    }
-                    info!("KPOKE kind=shiftctrl n=4 edge={}", edge_n);
-                }
-                _ => {
-                    // PINCTRL のみ同値再書込み n=4 ((edge_n/60)%6 == 5)。
-                    let r = embassy_rp::pac::PIO0.sm(3).pinctrl();
-                    for _ in 0..4 {
-                        let v = r.read();
-                        r.write_value(v);
-                    }
-                    info!("KPOKE kind=pinctrl n=4 edge={}", edge_n);
-                }
-            }
-        }
     }
 }
 
@@ -739,8 +688,9 @@ async fn recal_k(
     k: u32,
     last_period: u32,
 ) -> u32 {
-    // SM2 を GP2 へ (jmp_pin だけ替わる同一 program。set_config は X を触らないので K の基準カウンタは不変)。
-    sm.set_config(cfg_gp2);
+    // SM2 を GP2 へ (jmp_pin だけ切替。set_config は exec_jmp(origin) で走行中 SM の X に −2 tick の段を作る
+    // ため使わない。KPOKE 実験 20260704 で実証)。cfg_gp2 と cfg_gp4 は jmp_pin 以外同一なので register 直書きで足りる。
+    switch_jmp_pin(2, cfg_gp2.get_exec().jmp_pin);
     while sm.rx().try_pull().is_some() {} // 切替前後の stale/in-flight 捕捉を捨てる
     let mut samples: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
     for i in 0..RECAL_SAMPLES {
@@ -785,8 +735,8 @@ async fn recal_k(
         }
         let _ = samples.push((c0, c2));
     }
-    // SM2 を GP4 へ戻す (X 保持)。drain して次の GP4 捕捉が新鮮な出力エッジになるように。
-    sm.set_config(cfg_gp4);
+    // SM2 を GP4 へ戻す (jmp_pin だけ切替、X 保持)。drain して次の GP4 捕捉が新鮮な出力エッジになるように。
+    switch_jmp_pin(2, cfg_gp4.get_exec().jmp_pin);
     while sm.rx().try_pull().is_some() {}
     // 評価: spread ゲート → mean → |Δk| cap。怪しければ旧 k 維持 (誤った K で出力を飛ばさない)。
     if samples.len() < 3 {
@@ -1382,11 +1332,14 @@ async fn main(spawner: Spawner) {
             }
         }
 
-        // SM2 を GP4 (ループバック) に切替。set_config は X を触らないので K は有効のまま。
+        // SM2 を GP4 (ループバック) に切替。jmp_pin レジスタだけ書く (set_config は exec_jmp(origin) で走行中
+        // SM の X に −2 tick の段を作る。これは K 測定の後なので K に取り込まれず、ピン上の +32ns 固定オフセットに
+        // なっていた。KPOKE 実験 20260704 で実証)。cfg_gp4 は recal_k / gen_capture_task へ move するので生成は残す。
+        // enable 前に set_config(&cfg_gp2) 済み (program/clkdiv/pindirs は cfg_gp4 と同一) なので jmp_pin 切替で足りる。
         let mut cfg_gp4 = PioConfig::default();
         cfg_gp4.use_program(&lb_loaded, &[]);
         cfg_gp4.set_jmp_pin(&lb_pin);
-        sm2.set_config(&cfg_gp4);
+        switch_jmp_pin(2, cfg_gp4.get_exec().jmp_pin);
 
         // SM1: 規律 PPS 生成を GP3 へ (rp-pps の SteeredPpsOutput)。初期周期 = ppb=0 の 1Hz (内部で
         // output_period_cycles)。周期は gen_capture_task が毎エッジ set_next_period で操舵する
@@ -1411,8 +1364,8 @@ async fn main(spawner: Spawner) {
         info!("KEXPCFG sm3=gp2 prog=lb_loaded (pure observer, not in control)");
 
         // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
-        // 実験(KPOKE): SM3 への同値 set_config 用に cfg_gp2 と同一内容の Config を渡す (Config は Copy)。
-        spawner_high.spawn(pps_task(capture, sm3, cfg_gp2).unwrap());
+        // cfg_gp2 は Copy なので gen_capture_task へも渡せる (SM2 の再較正切替に使う)。
+        spawner_high.spawn(pps_task(capture, sm3).unwrap());
         spawner_high.spawn(gen_capture_task(output, sm2, k, cfg_gp2, cfg_gp4).unwrap());
     } else {
         // 非PIO 素朴経路 (S0/S1): PIO0 は未消費。GP2=GPS soft 割込、GP3=Ticker トグル、GP4 放置。
