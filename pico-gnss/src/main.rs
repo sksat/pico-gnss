@@ -314,6 +314,17 @@ static C0_GPS: AtomicU32 = AtomicU32::new(0);
 /// GPS PPS エッジの世代カウンタ。出力エッジ間に進んでいなければ GPS 欠落 = C0_GPS は古い → 補正に使わない。
 static C0_GEN: AtomicU32 = AtomicU32::new(0);
 
+/// 実験 (KEXP): GP2 を常時観測する第3 capture SM (SM3) が捕えた最新の GPS PPS 生カウンタ。
+/// **純観測** — K/hwphase/servo/recal/set_next_period のどの式にも入らない。pps_task が毎エッジ
+/// drain-to-latest し、Locked エッジで C0_GPS と同じ世代境界 (C0_GEN の Release) の内側で store する。
+/// 読者は gen_capture_task の KEXP ログ 1 箇所のみ (grep で load 1・store 1 の計 2 箇所を機械確認できる)。
+/// torn-read 不在は「pps_task と gen_capture_task が同一 executor (spawner_high)」に依存 — 将来どちらかを
+/// 別 executor へ移すと c0/c3 の一貫性が壊れる。
+static C3_GPS: AtomicU32 = AtomicU32::new(0);
+/// そのエッジで SM3 FIFO から drain した個数 (1=正常, 0=SM3 未着/取り損ね→C3_GPS は前値のまま,
+/// >1=pps_task が 1s 以上 stall した backlog で latest が先行エッジになりミスペア疑い)。解析は c3n≠1 を棄却。
+static C3_N: AtomicU32 = AtomicU32::new(0);
+
 /// 受信適応帯域: 1=悪受信 (遅い/減衰ループ)、0=良受信 (速いループ)。pps_task が間隔ジッタから set、
 /// gen_capture_task が読んで (i_den,d_den) を切替える。
 static RECEPTION_BAD: AtomicU32 = AtomicU32::new(0);
@@ -537,7 +548,10 @@ fn now_local_ns() -> u64 {
 
 /// PIO がラッチした PPS エッジを読み、間隔を ns で求めて出す + 周波数を規律するタスク。
 #[embassy_executor::task]
-async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
+async fn pps_task(
+    mut capture: TimedPpsCapture<'static, PIO0, 0>,
+    mut sm3: StateMachine<'static, PIO0, 3>,
+) {
     let mut count: u32 = 0; // ログ用エッジ連番
     let mut iv_buf = [0i64; RX_JIT_WIN]; // 直近 Locked エッジの interval_ns (受信品質ジッタ用 ring buffer)
     let mut iv_cnt: usize = 0;
@@ -549,6 +563,16 @@ async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
         // エポックのアンカー用に Instant を読む (µs ジッタは絶対オフセットのみに効く)。
         let query_ns = now_local_ns();
 
+        // 実験(KEXP): 同じ GP2 を見る SM3 を毎エッジ最新まで drain し、SM0 と lockstep に保つ。
+        // Locked 以外のエッジでも drain して残留を残さない(→定常で c3n==1)。store は下の Locked ゲート内のみ。
+        // try_pull のみ (wait_pull は FIFO 割込を有効化し新しい起床経路を作るので絶対に使わない)。
+        let mut c3: Option<u32> = None;
+        let mut c3n: u32 = 0;
+        while let Some(v) = sm3.rx().try_pull() {
+            c3 = Some(v);
+            c3n += 1;
+        }
+
         // 周波数規律 (Locked のみ・復帰 quarantine) + 次の RMC 用にエッジ記録を PpsGpsdo に委譲。
         // PPS_TS signal は不要に: エッジは共有 state に記録され、main の feed_nmea が拾う。ここは log だけ。
         count += 1;
@@ -557,8 +581,13 @@ async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
         // 基準にすると、ループがそれと対にして出力が誤った点へ寄り、しかも capture SM の余分捕捉で SM0/SM2
         // の実効 K が runtime ドリフトする (オシロで offset② が ~µs まで育ち boot でリセット、を実機確認)。
         if matches!(step.event, PpsEvent::Locked { .. }) {
+            // 実験(KEXP): C3 store は C0_GEN の Release より前に置く (Release が C3_GPS/C3_N/C0_GPS を一括 publish)。
+            if let Some(v) = c3 {
+                C3_GPS.store(v, Ordering::Relaxed); // c3n==0 のとき前値を保持 (下の C3_N が stale を示す)
+            }
+            C3_N.store(c3n, Ordering::Relaxed);
             C0_GPS.store(edge_raw, Ordering::Relaxed);
-            C0_GEN.fetch_add(1, Ordering::Release); // gen++ (Release: gen 進行で直前の C0_GPS store が見える)
+            C0_GEN.fetch_add(1, Ordering::Release); // gen++ (Release: gen 進行で直前の C3/C0 store が見える)
             // 受信品質: Locked エッジの interval ジッタ (直近 RX_JIT_WIN の範囲 = max−min) を hysteresis で判定。
             // 水晶オフセット (~+2900ns) は共通なので範囲では相殺し、純粋なエッジ間ジッタ (= 受信劣化) を拾う。
             iv_buf[iv_cnt % RX_JIT_WIN] = edge.interval_ns as i64;
@@ -849,6 +878,10 @@ async fn gen_capture_task(
         // stage② PIO ハード位相: 出力エッジ と 最新 GPS エッジ の生カウンタ差 (mod 1秒) を ns に。
         // Instant を介さないので executor のウェイクアップ遅延 (~ms) に汚されず 16ns 分解能。
         let c0 = C0_GPS.load(Ordering::Relaxed);
+        // 実験(KEXP): 同じ await 無し snapshot 区間 (cur_gen Acquire 〜 PPSGEN emit) で C3 も読む。
+        // (cur_gen, c0, c3, c3n) は torn read なしの一貫 snapshot。純観測で制御式には入らない。
+        let c3 = C3_GPS.load(Ordering::Relaxed);
+        let c3n = C3_N.load(Ordering::Relaxed);
         // hwphase は loopback (出力 vs GPS) の相対位相。静的 pad/経路スキューは scope チューニングせず
         // 受け入れる (旧 ABS_OFFSET は除去、recal が実効 K のドリフトを bound)。
         let k_eff = k;
@@ -988,6 +1021,22 @@ async fn gen_capture_task(
                 recal_eff(PRECISION_STAGE),
                 0u32, // dith_ticks: PIO 経路は dither 不使用 (両経路スキーマ一致のため 0)
                 steer_ff_mppb // steer_ff: clamp 後の操舵 FF 偏差 (steering − level)
+            );
+            // 実験(KEXP): 実効 K ドリフト切り分け用の生カウンタ行。PPSGEN と同 count で 1:1 join できる。
+            // 純観測 (c3/c3n は制御に非関与)。PPSGEN のフォーマット/引数は 1 byte も変えていない (別 info! を後置)。
+            info!(
+                "KEXP count={} gen={} c0={} c2={} c3={} c3n={} k={} kt={} fresh={} paired={} lk={}",
+                count,
+                cur_gen,
+                c0,
+                x,
+                c3,
+                c3n,
+                k,
+                k_target,
+                fresh as u8,
+                paired as u8,
+                u.locked as u8
             );
         }
         last_x = Some(x);
@@ -1171,6 +1220,7 @@ async fn main(spawner: Spawner) {
             sm0,
             sm1,
             mut sm2,
+            mut sm3,
             ..
         } = Pio::new(p.PIO0, Irqs);
         let mut capture = TimedPpsCapture::new(&mut common, sm0, p.PIN_2, clk_sys_freq());
@@ -1282,8 +1332,23 @@ async fn main(spawner: Spawner) {
         const PPS_PULSE_NS: u32 = 100_000_000; // 100 ms
         let output = SteeredPpsOutput::new(&mut common, sm1, p.PIN_3, clk_sys_freq(), PPS_PULSE_NS);
 
+        // --- 実験: SM3 を GP2 に常時向けた純観測 SM として起動 (KEXP 診断。制御には非関与) ---
+        // boot K 較正・verify・cfg_gp4 切替が全部終わった後・spawn 直前に enable する (late enable):
+        // 較正の繊細な c0/c2 read に干渉しえず、SM3 の enabled 全期間で consumer は pps_task 1 個に保たれる。
+        // 既存 cfg_gp2 (jmp_pin=GP2, lb_loaded 再利用) をそのまま借りる。set_config は &Config を借りるだけで
+        // この後 cfg_gp2 が gen_capture_task へ move されても借用は set_config で終わるので衝突しない。
+        // GP2 の pindirs は SM0 が設定済み → set_pin_dirs 不要。X は初期化しない (絶対値は無意味、解析は
+        // ドリフトのみ)。分周 default (=SM0/SM2 と同一レート)。
+        sm3.set_config(&cfg_gp2); // SM0 と同一 GP2 を jmp_pin に。命令メモリは lb_loaded 参照共有で増ゼロ
+        sm3.set_enable(true);
+        // enable 直後に SM0/SM3 両 GP2-FIFO を drain して等化 (SM0=verify のエッジ残留, SM3=enable 時に
+        // GP2 が high なら入る spurious 捕捉を掃く → spawn 後の最初のエッジから c0/c3 が 1:1)。
+        while capture.capture_mut().try_read().is_some() {}
+        while sm3.rx().try_pull().is_some() {}
+        info!("KEXPCFG sm3=gp2 prog=lb_loaded (pure observer, not in control)");
+
         // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
-        spawner_high.spawn(pps_task(capture).unwrap());
+        spawner_high.spawn(pps_task(capture, sm3).unwrap());
         spawner_high.spawn(gen_capture_task(output, sm2, k, cfg_gp2, cfg_gp4).unwrap());
     } else {
         // 非PIO 素朴経路 (S0/S1): PIO0 は未消費。GP2=GPS soft 割込、GP3=Ticker トグル、GP4 放置。

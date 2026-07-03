@@ -337,6 +337,16 @@ stage-3 (起動時較正のみ、recal なし) を 100 分定点観測すると�
 +187→+424 ns と単調に歩いた (t000-t080、+3.8 ns/min。最終点 t100 はオシロ側の計測不良で棄却)。
 この間 PPS の Irregular/missed は **0**。旧仮説「capture エッジ数の非対称 × capture gap (~2 tick) の蓄積」
 では説明できない (非対称イベントが無いのに這う)。recal あり 40 分連続 (2402 shot、失敗 0) では
-−0.1 ns/min で平坦。recal は ~2.6 分ごとに dk=−4〜−5 tick で、dk の積算レート (~30 ns/min 相当) と
-pin で見える creep (+3.8 ns/min) の乖離も未説明。**スリップの出どころは引き続き未特定**。
-ログ/解析: `logs/20260703-recal-scope/` (checkpoint.py / dense.py / fig_walk.py)。
+−0.1 ns/min で平坦。
+
+**→ 同日夜の第3 SM 実験 (KEXP) で決着** (`logs/20260703-kexp/`、firmware に SM3=GP2 純観測を追加し
+c0/c2/c3 を毎秒 2.4h ログ + オシロ 7802 shot 並走。評価は workflow 4 系統 + 判定):
+- **SM 個体差は棄却**: 同じ GP2 を見る SM0−SM3 差 (K_same) は p-p 32ns (2 tick)・傾き 0.000 ns/min で lockstep。
+- **dk の大半は「GP4→GP2 切替量子」**: dk は 56 回中 42 回がぴったり −4 tick (98% が −3..−5)、温度と無相関。
+  −4 tick/157.5s = −24.4 ns/min が kt の歩きの正体。切替量子は c2 の実在の段として現れ recal が段込みで
+  K を測るため hwphase で相殺され、**ピンには一切出ない** (オシロ 2.4h 平坦 −0.006 ns/min、kt と無相関)。
+- **実ドリフトは ~3-4 ns/min だけ** (dk のうち ~−0.6 tick 分。stage-3 の +3.8 ns/min と同源とみられる。出所は
+  依然未特定だが、recal が吸収しピンは平坦)。旧「dk レートと pin creep の 8 倍乖離」は切替量子+非同時計測の
+  見かけで、勘定は全て閉じた (c0−c2=(c0−c3)+(c3−c2) 一致、dk 積算=k 変化 0ns 一致、位相恒等式 100% ビット一致)。
+- 次の最小実験: recal 間隔 75/150/300 edges 掃引 (dk が per-event 一定なら切替量子で確定、間隔比例なら連続ドリフト)。
+  payoff: 量子を除く slew ゲート or recal 疎化で kt の見かけの歩きと ~6s holdover gap を削れる。
