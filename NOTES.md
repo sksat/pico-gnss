@@ -348,5 +348,15 @@ c0/c2/c3 を毎秒 2.4h ログ + オシロ 7802 shot 並走。評価は workflow
 - **実ドリフトは ~3-4 ns/min だけ** (dk のうち ~−0.6 tick 分。stage-3 の +3.8 ns/min と同源とみられる。出所は
   依然未特定だが、recal が吸収しピンは平坦)。旧「dk レートと pin creep の 8 倍乖離」は切替量子+非同時計測の
   見かけで、勘定は全て閉じた (c0−c2=(c0−c3)+(c3−c2) 一致、dk 積算=k 変化 0ns 一致、位相恒等式 100% ビット一致)。
-- 次の最小実験: recal 間隔 75/150/300 edges 掃引 (dk が per-event 一定なら切替量子で確定、間隔比例なら連続ドリフト)。
-  payoff: 量子を除く slew ゲート or recal 疎化で kt の見かけの歩きと ~6s holdover gap を削れる。
+- **→ 翌 20260704 の KPOKE 実験で切替量子の機構まで特定** (`logs/20260704-kpoke/`、純観測 SM3 に
+  「同値」書込みを 60s ごと 6 種巡回で打ち、K_same=c0−c3 の段を計測。オシロ並走 1300+ shot):
+  - CLKDIV/EXECCTRL/SHIFTCTRL/PINCTRL の単離同値書込みは**全てシロ** (段 0±0.5 tick、n=7 each)。
+  - `set_config()` 丸ごとだけがクロ: ×1 で −1〜−2 tick、×4 で −6〜−8 tick。**犯人は embassy set_config 末尾の
+    `exec_jmp(origin)`** (use_program 済み config は走行中 SM の PC をプログラム先頭へ強制ジャンプする)。
+  - 機構: エッジ直後 (pin high) に飛ぶと先頭の `jmp pin rising` が即 capture 経路へ入り、強制 jmp(1)+jmp pin(1)+
+    in(1)+push(1) = 4 cyc 無減算 = **−2 tick/呼び出し** (pin low なら −1)。recal は 2 呼び出しで −4。
+    副産物の**偽 FIFO push も決定論的に確認** (full×1 の次エッジは必ず c3n=2、×4 は FIFO 満杯で c3n=4 + 真エッジ push 欠落)。
+  - **+33ns 固定オフセットの正体も同機構**: 校正は K を測った「後」に GP4 へ戻すため、戻しの −2 tick (32ns) が
+    K に取り込まれず残り、サーボが偏った hwphase を 0 に保つ結果ピンが +32ns 側へ張り付く (オシロ実測 +33.6ns と一致)。
+  - **対策**: 切替を EXECCTRL の jmp_pin フィールドだけの書換え (PAC modify) にすれば量子も +32ns も消えるはず。
+    検証の予言: dk −4 → 実ドリフトのみ (~−0.6 tick/2.6min)、オシロ gap 平均 +33ns → 配線スキュー程度。

@@ -551,10 +551,13 @@ fn now_local_ns() -> u64 {
 async fn pps_task(
     mut capture: TimedPpsCapture<'static, PIO0, 0>,
     mut sm3: StateMachine<'static, PIO0, 3>,
+    // 実験(KPOKE): SM3 への同値 set_config 用の config (cfg_gp2 と同一内容)。制御には非関与。
+    poke_cfg: PioConfig<'static, PIO0>,
 ) {
     let mut count: u32 = 0; // ログ用エッジ連番
     let mut iv_buf = [0i64; RX_JIT_WIN]; // 直近 Locked エッジの interval_ns (受信品質ジッタ用 ring buffer)
     let mut iv_cnt: usize = 0;
+    let mut edge_n: u32 = 0; // 実験(KPOKE): poke タイミング用エッジ連番 (60 エッジ≒60s に 1 poke)
 
     loop {
         // wait_edge + timeline.observe は TimedPpsCapture に委譲。生カウンタは edge.raw で取れる。
@@ -626,6 +629,66 @@ async fn pps_task(
             missed,
             freq
         );
+
+        // 実験(KPOKE): 「校正切替量子 −4 tick」の機構特定。仮説は「embassy の set_config が走行中 SM の
+        // CLKDIV 等を "同値" で再書込みするだけで、その SM の自走ダウンカウンタ X が数 sysclk 分の減算を
+        // スキップする」。純観測 SM3 (GP2 常時・制御非関与) に同値書込みを打ち、K_same=c0−c3 の段として
+        // 直接測る。**書込みは全て同値 (read した値をそのまま write) でレジスタ内容を変えない。** poke は
+        // await を持たず数 µs のレジスタ書込みのみ。60 エッジ (≒60s) に 1 回、6 種を巡回する。
+        edge_n += 1;
+        if edge_n % 60 == 0 {
+            // 初回 poke (edge_n=60) を idx 0 (full n=1) から始めるため -1 する (edge_n>=60 で underflow なし)。
+            match (edge_n / 60 - 1) % 6 {
+                0 => {
+                    // full n=1: embassy set_config を 1 回 (CLKDIV/EXECCTRL/SHIFTCTRL/PINCTRL を同値再書込み)。
+                    sm3.set_config(&poke_cfg);
+                    info!("KPOKE kind=full n=1 edge={}", edge_n);
+                }
+                1 => {
+                    // full n=4。
+                    for _ in 0..4 {
+                        sm3.set_config(&poke_cfg);
+                    }
+                    info!("KPOKE kind=full n=4 edge={}", edge_n);
+                }
+                2 => {
+                    // CLKDIV のみ同値再書込み n=4 (read→同値 write。値は変えない)。
+                    let r = embassy_rp::pac::PIO0.sm(3).clkdiv();
+                    for _ in 0..4 {
+                        let v = r.read();
+                        r.write_value(v);
+                    }
+                    info!("KPOKE kind=clkdiv n=4 edge={}", edge_n);
+                }
+                3 => {
+                    // EXECCTRL のみ同値再書込み n=4。
+                    let r = embassy_rp::pac::PIO0.sm(3).execctrl();
+                    for _ in 0..4 {
+                        let v = r.read();
+                        r.write_value(v);
+                    }
+                    info!("KPOKE kind=execctrl n=4 edge={}", edge_n);
+                }
+                4 => {
+                    // SHIFTCTRL のみ同値再書込み n=4。
+                    let r = embassy_rp::pac::PIO0.sm(3).shiftctrl();
+                    for _ in 0..4 {
+                        let v = r.read();
+                        r.write_value(v);
+                    }
+                    info!("KPOKE kind=shiftctrl n=4 edge={}", edge_n);
+                }
+                _ => {
+                    // PINCTRL のみ同値再書込み n=4 ((edge_n/60)%6 == 5)。
+                    let r = embassy_rp::pac::PIO0.sm(3).pinctrl();
+                    for _ in 0..4 {
+                        let v = r.read();
+                        r.write_value(v);
+                    }
+                    info!("KPOKE kind=pinctrl n=4 edge={}", edge_n);
+                }
+            }
+        }
     }
 }
 
@@ -1348,7 +1411,8 @@ async fn main(spawner: Spawner) {
         info!("KEXPCFG sm3=gp2 prog=lb_loaded (pure observer, not in control)");
 
         // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
-        spawner_high.spawn(pps_task(capture, sm3).unwrap());
+        // 実験(KPOKE): SM3 への同値 set_config 用に cfg_gp2 と同一内容の Config を渡す (Config は Copy)。
+        spawner_high.spawn(pps_task(capture, sm3, cfg_gp2).unwrap());
         spawner_high.spawn(gen_capture_task(output, sm2, k, cfg_gp2, cfg_gp4).unwrap());
     } else {
         // 非PIO 素朴経路 (S0/S1): PIO0 は未消費。GP2=GPS soft 割込、GP3=Ticker トグル、GP4 放置。
