@@ -65,7 +65,7 @@ built from within `pico-gnss/` (where its `.cargo/config.toml` selects the
 
 ![evaluation report](docs/report/report-en.png)
 
-Generated from a real on-device log ([`sample-capture.log`](docs/report/sample-capture.log), ~227 s)
+Generated from a real on-device log (~227 s)
 with `uv run webapp/plot_report.py`:
 
 - **A** — the GPSDO learns the crystal drift (~+2.5 ppm) at boot and then holds it at the
@@ -80,7 +80,7 @@ with `uv run webapp/plot_report.py`:
   (temperature-correlated) rather than the receiver (only a small ~13–18 ns floor is
   receiver-limited). The absolute output-vs-GPS offset is centered to **≤100 ns and
   reproducible across reboots** (Smith-predictor servo + loopback self-calibration; the old
-  software servo was ±1.4 ms). See [`docs/report/REPORT.md`](docs/report/REPORT.md) for the limits.
+  software servo was ±1.4 ms). See [`docs/report/precision-ladder/README.md`](docs/report/precision-ladder/README.md) for the limits.
 
 Before/after — phase *measurement* precision (Instant ±ms → PIO 16 ns) and the resulting
 output phase:
@@ -96,6 +96,6 @@ The whole pull-in from boot, one frame per PPS: the output PPS converging onto t
 (top, auto-zooming scope) alongside the firmware's internal state — offset/hwphase, time
 error, crystal ppb, and temperature with its feed-forward contribution:
 
-![GPSDO pull-in from boot — scope + parameters, per-PPS](docs/report/combo-gpsdo-fromboot.gif)
+![GPSDO pull-in from boot — scope + parameters, per-PPS](docs/report/precision-ladder/precision-figs/combo-gpsdo-fromboot.gif)
 
-See [`docs/report/REPORT.md`](docs/report/REPORT.md) for the full methodology and figures (Japanese).
+See [`docs/report/precision-ladder/README.md`](docs/report/precision-ladder/README.md) for the full methodology and figures (Japanese).

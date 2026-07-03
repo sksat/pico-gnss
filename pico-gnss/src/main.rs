@@ -14,7 +14,8 @@
 //! - `TIME unix_ns=<n> ppb=<p> holdover_ms=<h> locked=<0|1>`  (GPSDO の規律 UTC)
 //!
 //! ## PPS タイムスタンプは PIO ハードキャプチャ (~16ns 分解能)
-//! ソフト (embassy Input + Instant) はジッタ ~9µs が床 (M0+ の critical-section 全 IRQ マスク)。
+//! ソフト (embassy Input + Instant) はジッタが µs オーダの床 (M0+ の critical-section 全 IRQ マスク。
+//! σ は負荷/boot で ~2〜10µs、衝突時は数十 µs のスパイク)。
 //! PIO0 SM0 で PPS エッジを sysclk 2 サイクル(=16ns)分解能でラッチし、間隔を ns で得る。
 //!
 //! ## GPSDO (GPS 規律発振器)
@@ -76,7 +77,7 @@ static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<PpsGpsdo>> =
 /// phase_servo/recal_on/temp_ff) が段を構成する。**5 = production (出荷既定)** で、現出荷ファームと
 /// bit 一致することを下の const assert が機械保証する (計測 workflow が段ごとに一時変更する)。
 /// - S0: naive 自走 (規律なし)。S1: soft 周波数規律 (+dither)。S2: 全 PIO I/O + loopback, 開ループFF。
-/// - S3: PLL 閉ループ (Smith 内包)。S4: recal + ABS_OFFSET。S5: 温度FF = production。
+/// - S3: PLL 閉ループ (Smith 内包)。S4: recal。S5: 温度FF = production。
 const PRECISION_STAGE: u8 = 5;
 // 上限ガード: stage>5 だと全ゲートが production 相当 (>=N) に倒れる一方、下の override-sentinel 強制は
 // `!=5`/`==5` ゲートなので外れてしまい、override 付きで production 相当を焼けてしまう。それを禁止する。
@@ -97,20 +98,9 @@ const fn temp_ff(s: u8) -> bool {
     s >= 5
 }
 
-/// substage override (センチネル=未指定→stage 既定)。S4a は ABS_OFFSET を 0 で焼いて scope で符号を確定
-/// してから確定 tick で再焼きする (chicken/egg をノブで解消)。S4b は recal off を巨大値で焼く。
-/// **production では必ず両方センチネル** (下の const assert が保証)。
-const ABS_OFFSET_OVERRIDE: i32 = i32::MIN; // i32::MIN=未指定
+/// substage override (センチネル=未指定→stage 既定)。S4b は recal off を巨大値で焼く。
+/// **production では必ずセンチネル** (下の const assert が保証)。
 const RECAL_EDGES_OVERRIDE: u32 = u32::MAX; // u32::MAX=未指定
-const fn abs_off(s: u8) -> i32 {
-    if ABS_OFFSET_OVERRIDE != i32::MIN {
-        ABS_OFFSET_OVERRIDE
-    } else if recal_on(s) {
-        ABS_OFFSET_TICKS
-    } else {
-        0
-    }
-}
 const fn recal_eff(s: u8) -> u32 {
     if RECAL_EDGES_OVERRIDE != u32::MAX {
         RECAL_EDGES_OVERRIDE
@@ -126,16 +116,9 @@ const fn recal_eff(s: u8) -> u32 {
 const _: () = assert!(use_pio(5) && apply_freq(5) && phase_servo(5) && recal_on(5) && temp_ff(5));
 const _: () = assert!(temp_ff(5) == TEMP_FF_ENABLE);
 // override 依存の不変は **production (stage 5) のときだけ** 課す: stage 5 では override は必ず未指定
-// (sentinel) で abs_off/recal_eff は出荷リテラルに簡約。stage != 5 (計測) では override を許す
-// (S4a/S4b の chicken/egg をノブで解消する採用#3 のため)。これで「stage 5 で焼く=出荷 bit 一致」を
-// 保ちつつ、計測 workflow が ABS_OFFSET_OVERRIDE=0 等を立てて焼ける (PLAN 2.1 の無ゲート版だと
-// 計画 4 の S4a 手順自体がコンパイル不能になるため、ここはゲートを足す逸脱)。
-const _: () = assert!(
-    PRECISION_STAGE != 5 || (ABS_OFFSET_OVERRIDE == i32::MIN && RECAL_EDGES_OVERRIDE == u32::MAX)
-);
-const _: () = assert!(
-    PRECISION_STAGE != 5 || (abs_off(5) == ABS_OFFSET_TICKS && recal_eff(5) == RECAL_EDGES)
-);
+// (sentinel) で recal_eff は出荷リテラルに簡約。stage != 5 (計測) では override を許す。
+const _: () = assert!(PRECISION_STAGE != 5 || RECAL_EDGES_OVERRIDE == u32::MAX);
+const _: () = assert!(PRECISION_STAGE != 5 || recal_eff(5) == RECAL_EDGES);
 // ラダー走行中 (stage != 5) は実験 harness と排他: 段切替えと別系統の実験フラグを同時に立てない。
 const _: () = assert!(
     PRECISION_STAGE == 5 || !(CONTROLLER_SWEEP || PRBS_INJECT || KICK_INJECT || INTERMITTENT_EXP)
@@ -287,11 +270,6 @@ const KICK_PERIOD: u32 = 150; // locked エッジ毎に 1 発(セグメント 30
 /// (CONTROLLER_SWEEP_EDGES=900) より十分大きくして実験中は recal を発火させない。実験後は production の
 /// 300 へ戻す (boot 一発較正で K の初期値は確定済み)。
 const RECAL_EDGES: u32 = 150; // production: ~2.5分毎に ΔC(実効K)再測。dk≈-5tick/300edge のスリップ sawtooth を ~40ns に抑える。
-/// 出力 vs GPS の静残差 (pad/path の GP2-vs-GP4 固定差) を servo 目標へ注入する絶対 anchor (tick, ×16ns)。
-/// recal でスリップを bound した後に **scope で GP4-GP2 を実測**して決める (loopback では測れない絶対量)。
-/// hwphase 計算の k だけに効かせ、raw_lag gate と recal は真 K のまま。0 で無効。サインは scope で確定。
-/// 実測 (recal 有効) GP2-vs-GP4 ≈ +48ns late → +3 tick で出力を進めて中心化。
-const ABS_OFFSET_TICKS: i32 = 3;
 
 /// **実験: 間欠ループバック特性化**。ループバックを常時でなく間欠で使う設計 (普段は SM を別用途に空ける) に
 /// したとき、出力位相がどう振る舞うかを実機で測る。閉窓 (通常の位相ループ + 窓入口で K 再較正) と
@@ -437,7 +415,7 @@ async fn naive_pps_out_task(mut out: Output<'static>) {
 }
 
 /// 非PIO 素朴 1PPS 入力タスク (S0/S1)。GP2 の GPS 1PPS を GPIO 割込 + Instant で soft 捕捉
-/// (~9µs 下限 = M0+ critical-section 全 IRQ マスク)。連続エッジ差から interval を作り、production と
+/// (µs オーダ下限 = M0+ critical-section 全 IRQ マスク。σ は負荷で ~2〜10µs)。連続エッジ差から interval を作り、production と
 /// **同一の** `on_pps_edge` (raw 非参照を host テストで確認済) へ縮退 TimedEdge を渡して水晶 ppb を
 /// 規律コアに食わせる (S0=推定のみ・周期不適用 / S1=周期へ適用)。出力 vs GPS の開ループ modulo phase を
 /// `fold_phase_ns` で作り hwphase 欄に soft err として載せ、段共通スキーマの PPS/PPSGEN 行で出す。
@@ -510,7 +488,7 @@ async fn naive_pps_in_task(mut gps: Input<'static>) {
             )
         });
         info!(
-            "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={} dith_ticks={} steer_ff={}",
+            "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} dith_ticks={} steer_ff={}",
             count,
             interval_ns,
             interval_ns as i64 - 1_000_000_000,
@@ -536,7 +514,6 @@ async fn naive_pps_in_task(mut gps: Input<'static>) {
             1u8, // olmod: naive は常に開ループ modulo phase
             PRECISION_STAGE as u32,
             recal_eff(PRECISION_STAGE),
-            abs_off(PRECISION_STAGE),
             NAIVE_DITH_TICKS.load(Ordering::Relaxed), // dith_ticks: 実適用 dither 周期 (sigma-delta 証跡)
             steer_ff_mppb // steer_ff: clamp 後の操舵 FF 偏差 (steering − level)
         );
@@ -872,10 +849,9 @@ async fn gen_capture_task(
         // stage② PIO ハード位相: 出力エッジ と 最新 GPS エッジ の生カウンタ差 (mod 1秒) を ns に。
         // Instant を介さないので executor のウェイクアップ遅延 (~ms) に汚されず 16ns 分解能。
         let c0 = C0_GPS.load(Ordering::Relaxed);
-        // 絶対 anchor: 静残差 (pad/path) を servo 目標へ注入し出力ピンを GPS ピンへ寄せる。phase だけ k_eff、
-        // raw_lag gate と recal は真 K (混ぜると同一エッジ対が gate/sample から外れる)。
-        // 段ゲート: S4+ のみ ABS_OFFSET を適用 (S4a は ABS_OFFSET_OVERRIDE=0 で焼いて scope で符号確定)。
-        let k_eff = k.wrapping_sub(abs_off(PRECISION_STAGE) as u32);
+        // hwphase は loopback (出力 vs GPS) の相対位相。静的 pad/経路スキューは scope チューニングせず
+        // 受け入れる (旧 ABS_OFFSET は除去、recal が実効 K のドリフトを bound)。
+        let k_eff = k;
         let hwphase_ns = rp_pps::loopback_phase_ns(c0, x, k_eff, clk);
         // ペアリング診断: fold 前の生 tick 差。正しい隣接エッジ対なら小さい(=真の位相)、ミスペア(欠落/
         // drain/再ロック後に非隣接エッジと対)だと ≈±1秒。fold がそれを隠し ppm×1s 残差にループがロック
@@ -982,9 +958,9 @@ async fn gen_capture_task(
             // 互換のため既存 5 項 count/interval/dev/phase/hwphase を先頭に残す。cidx=制御器インデックス
             // (CONTROLLER_SWEEP の segment 鍵)、state=制御器の内部状態コード (ab_boost の boost 等)。
             // **末尾 append-only** (PLAN 採用#10): prefix と既存項は byte 不変。olmod=S2 開ループ modulo
-            // phase 列フラグ、stage/recal_eff/abs_off = この段の実効設定 (ログが一次情報・採用#3/#4)。
+            // phase 列フラグ、stage/recal_eff = この段の実効設定 (ログが一次情報・採用#3/#4)。
             info!(
-                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} abs_off={} dith_ticks={} steer_ff={}",
+                "PPSGEN count={} interval_ns={} dev_ns={} phase_ns={} hwphase_ns={} trim_ppb={} cidx={} p_ns={} d_ns={} trim_mppb={} slope_mppb={} raw_lag={} lk={} state={} jit={} rxbad={} inj_ns={} kick_ns={} temp_raw={} dynmode={} temp_k={} ff_delta={} olmod={} stage={} recal_eff={} dith_ticks={} steer_ff={}",
                 count,
                 iv,
                 iv - 1_000_000_000,
@@ -1010,7 +986,6 @@ async fn gen_capture_task(
                 olmod as u8,
                 PRECISION_STAGE as u32,
                 recal_eff(PRECISION_STAGE),
-                abs_off(PRECISION_STAGE),
                 0u32, // dith_ticks: PIO 経路は dither 不使用 (両経路スキーマ一致のため 0)
                 steer_ff_mppb // steer_ff: clamp 後の操舵 FF 偏差 (steering − level)
             );
@@ -1173,13 +1148,12 @@ async fn main(spawner: Spawner) {
             | ((KICK_INJECT as u8) << 2)
             | ((INTERMITTENT_EXP as u8) << 3);
         info!(
-            "PPSCFG stage={} use_pio={} apply_freq={} phase_servo={} recal_eff={} abs_off={} temp_ff={} ctrl={=str} i_den={} d_den={} smith={} phase_use_hw={} exp_flags={}",
+            "PPSCFG stage={} use_pio={} apply_freq={} phase_servo={} recal_eff={} temp_ff={} ctrl={=str} i_den={} d_den={} smith={} phase_use_hw={} exp_flags={}",
             PRECISION_STAGE as u32,
             use_pio(PRECISION_STAGE) as u8,
             apply_freq(PRECISION_STAGE) as u8,
             phase_servo(PRECISION_STAGE) as u8,
             recal_eff(PRECISION_STAGE),
-            abs_off(PRECISION_STAGE),
             temp_ff(PRECISION_STAGE) as u8,
             ctrl_name,
             cfg0.0,

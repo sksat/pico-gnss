@@ -36,9 +36,11 @@ PPS 立ち上がりは UTC 秒境界。**そのエッジを 2 系統 (capture=PI
 **なぜ firmware 側でやるか**: host (probe-rs RTT 経由) で同期すると USB/probe の往復ジッタ
 (数十 ms) が乗り、PPS 本来の精度が失われる。エッジを µs で刻める MCU 上で対応付けるのが必須。
 
-### PPS タイムスタンプ: ソフト ~9µs → PIO ハードキャプチャ ~10ns (重要)
+### PPS タイムスタンプ: ソフト µs オーダ → PIO ハードキャプチャ ~10ns (重要)
 
-**ソフト (embassy Input + `Instant::now()`) はジッタ σ ≈ 9µs が下限**。これは PPS 信号自体
+**ソフト (embassy Input + `Instant::now()`) は µs オーダのジッタが下限**。σ は負荷や boot で
+~2〜10µs 動く (20260703 の 8 boot 実測: 本体 ±2µs + critical-section 衝突時に数十 µs のスパイク、
+プール σ ≈ 4µs。旧計測の 9.8µs はその日の負荷での値で、下限ではなかった)。これは PPS 信号自体
 (モジュール仕様で数十 ns) ではなく RP2040 側のソフトタイムスタンプのレイテンシ揺らぎ。
 
 - 原因: RP2040 は Cortex-M0+ で BASEPRI が無く、`critical-section` が**全割り込みをマスク**する。
@@ -46,7 +48,7 @@ PPS 立ち上がりは UTC 秒境界。**そのエッジを 2 系統 (capture=PI
 - **効かなかった対策**: GPIO 割込を最優先(P0)に・PPS タスクを高優先 InterruptExecutor(P1) で走らせる
   → critical-section マスクの前では無力で σ は改善せず (9〜10µs)。複雑さだけ増えるので不採用 (revert 済)。
 
-**PIO ハードキャプチャで σ ≈ 10ns を達成** (約 900 倍改善):
+**PIO ハードキャプチャで σ ≈ 10ns を達成** (µs → ns、2〜3 桁の改善):
 - PIO0 SM0 で自走ダウンカウンタ X を 2 サイクル毎に減算しつつ pin を監視し、立ち上がりで X を FIFO に push。
   tick = 2 cyc = **16ns @125MHz**。CPU/割込/critical-section に一切依存しない (ハードでラッチ)。
 - CPU は連続する X の差 (wrapping_sub, ダウンカウンタ) から間隔を ns で得る。
@@ -268,7 +270,7 @@ stage② の位相ロックが sub-µs に収束した後、長尺 (~10分) で�
 - **位置 `X m` = 水平 CEP(50%)**: 直近 ~2 分窓の測位点の経験的ばらつき (50% がこの半径内)。
   詳細パネルに R95(95%)・2DRMS・σE/σN も。**ばらつき(精度=precision)であって真値とのズレ
   (確度=accuracy)ではない**。cold start 収束時のジャンプを除くため直近窓で評価する。
-- **時刻 `±X µs` = PPS タイムスタンプのジッタ(1σ)**: PPS 間隔偏差の標準偏差。上記の ~9µs 下限。
+- **時刻 `±X µs` = PPS タイムスタンプのジッタ(1σ)**: PPS 間隔偏差の標準偏差。上記の µs オーダ下限。
   一定レイテンシ(固定オフセット)は σ に出ない。絶対的 UTC 一致はモジュール PPS 確度(数十 ns)に依存。
 
 ## モジュール設定 (PMTK)
@@ -328,3 +330,13 @@ SLAS/CLAS 対応受信機 (u-blox F9 系等) が必要。
   ~15ppb からの理論見積りと一致)。webapp の「holdover 経過→誤差」散布図で可視化。
 - 出典: [MT3333 (MediaTek)](https://www.mediatek.com/products/location-intelligence/mt3333),
   1PPS ±10ns は MT3333 系モジュール (LOCOSYS MC-1612 ±11ns / Skylab SKG09D ±10ns) でも一致。
+
+### 実効 K スリップの再計測 (20260703): エッジ非対称ゼロでも這う
+
+stage-3 (起動時較正のみ、recal なし) を 100 分定点観測すると、gap (scope 実測 − hwphase) は
++187→+424 ns と単調に歩いた (t000-t080、+3.8 ns/min。最終点 t100 はオシロ側の計測不良で棄却)。
+この間 PPS の Irregular/missed は **0**。旧仮説「capture エッジ数の非対称 × capture gap (~2 tick) の蓄積」
+では説明できない (非対称イベントが無いのに這う)。recal あり 40 分連続 (2402 shot、失敗 0) では
+−0.1 ns/min で平坦。recal は ~2.6 分ごとに dk=−4〜−5 tick で、dk の積算レート (~30 ns/min 相当) と
+pin で見える creep (+3.8 ns/min) の乖離も未説明。**スリップの出どころは引き続き未特定**。
+ログ/解析: `logs/20260703-recal-scope/` (checkpoint.py / dense.py / fig_walk.py)。
