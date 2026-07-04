@@ -322,6 +322,11 @@ const SHADOW_EDGES: u32 = 60;
 const INJECT_FREQ_MPPB: i64 = 0;
 /// 注入を on にする count (これ以前は baseline)。ロック整定後に段を作れるよう粗く 5 分相当。
 const INJECT_START_COUNT: u32 = 300;
+/// 残留ドリフト調査 (20260704): SM3 (純観測) を GP2 でなく GP4 (出力 loopback) へ向ける。
+/// K ドリフトの残る容疑 = 捕捉パスの余分な通過 (偽捕捉) のピン間レート差、の検証。判定: 同じ GP4 を見る
+/// c2−c3 が平坦なら march はピン固有イベント、c2−c3 が march すれば SM2 固有で仮説棄却。
+/// 本番は false (c3=GP2 が KEXP の基準)。
+const C3_WATCH_GP4: bool = false;
 
 /// 最新の GPS PPS エッジの生カウンタ値 (SM0)。stage② の PIO 位相計測で gen_capture が参照する。
 static C0_GPS: AtomicU32 = AtomicU32::new(0);
@@ -1400,13 +1405,19 @@ async fn main(spawner: Spawner) {
         // この後 cfg_gp2 が gen_capture_task へ move されても借用は set_config で終わるので衝突しない。
         // GP2 の pindirs は SM0 が設定済み → set_pin_dirs 不要。X は初期化しない (絶対値は無意味、解析は
         // ドリフトのみ)。分周 default (=SM0/SM2 と同一レート)。
-        sm3.set_config(&cfg_gp2); // SM0 と同一 GP2 を jmp_pin に。命令メモリは lb_loaded 参照共有で増ゼロ
+        // C3_WATCH_GP4 (偽捕捉仮説の検証): SM3 を GP4 へ向ける。enable 前なので set_config でよい。
+        // cfg_gp4 は jmp_pin 以外 cfg_gp2 と同一、set_config は borrow のみでこの後の move と衝突しない。
+        sm3.set_config(if C3_WATCH_GP4 { &cfg_gp4 } else { &cfg_gp2 }); // 命令メモリは lb_loaded 参照共有で増ゼロ
         sm3.set_enable(true);
         // enable 直後に SM0/SM3 両 GP2-FIFO を drain して等化 (SM0=verify のエッジ残留, SM3=enable 時に
         // GP2 が high なら入る spurious 捕捉を掃く → spawn 後の最初のエッジから c0/c3 が 1:1)。
         while capture.capture_mut().try_read().is_some() {}
         while sm3.rx().try_pull().is_some() {}
-        info!("KEXPCFG sm3=gp2 prog=lb_loaded (pure observer, not in control)");
+        if C3_WATCH_GP4 {
+            info!("KEXPCFG sm3=gp4 prog=lb_loaded (pure observer, not in control)");
+        } else {
+            info!("KEXPCFG sm3=gp2 prog=lb_loaded (pure observer, not in control)");
+        }
 
         // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
         // cfg_gp2 は Copy なので gen_capture_task へも渡せる (SM2 の再較正切替に使う)。
