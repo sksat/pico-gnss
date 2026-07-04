@@ -327,6 +327,22 @@ const INJECT_START_COUNT: u32 = 300;
 /// c2−c3 が平坦なら march はピン固有イベント、c2−c3 が march すれば SM2 固有で仮説棄却。
 /// 本番は false (c3=GP2 が KEXP の基準)。
 const C3_WATCH_GP4: bool = false;
+/// 残留ドリフト調査 (20260704, codex 助言): SM3 shadow — servo と K 測定の完全分離 + cadence sweep。
+/// C3_WATCH_GP4=true で GP4 常駐の SM3 を、cadence 毎に GP2 へ SHADOW3_WINDOW_EDGES だけ向けて
+/// K03=c0−c3 の同一エッジ対を測る (データは既存 KEXP 行に出る。SM2/servo は一切触らない)。
+/// 判定: K03 の march が切替 1 回あたりに付くなら cadence 60→240 で傾きが 1/4 (切替起因の測定
+/// アーティファクト = shadow-K march の正体)、時間に付くなら不変 (実ドリフト)。本番は false。
+const SHADOW3: bool = false;
+/// 前半の cadence (locked 出力エッジ数)。
+const SHADOW3_EDGES_A: u32 = 60;
+/// 後半の cadence。
+const SHADOW3_EDGES_B: u32 = 240;
+/// 後半 (cadence B) へ切り替える count。
+const SHADOW3_PHASE_B_COUNT: u32 = 1500;
+/// GP2 滞在エッジ数 (同一エッジ対のサンプル数。先頭 1 個は切替過渡として host 解析で捨てる)。
+const SHADOW3_WINDOW_EDGES: u32 = 8;
+// SHADOW3 は SM3 が GP4 常駐であることが前提。
+const _: () = assert!(!SHADOW3 || C3_WATCH_GP4);
 
 /// 最新の GPS PPS エッジの生カウンタ値 (SM0)。stage② の PIO 位相計測で gen_capture が参照する。
 static C0_GPS: AtomicU32 = AtomicU32::new(0);
@@ -818,6 +834,9 @@ async fn gen_capture_task(
     let mut k_target: u32 = k; // 再較正が測った最新 K。毎エッジ k をここへ slew して寄せる (段差→ramp)。
     let k0_boot: u32 = k; // shadow recal 用: 起動時 K0 を保持し K_shadow の drift を dk=K_shadow-K0 で出す。
     let mut edges_since_shadow: u32 = 0;
+    // SM3 shadow の状態: cadence カウンタと、GP2 滞在の残エッジ数 (0 = GP4 常駐中)。
+    let mut edges_since_sh3: u32 = 0;
+    let mut sh3_window_left: u32 = 0;
     // 直近の出力周期語。再較正中の holdover 生 push に再利用する。必ず set_next_period (下) で代入されてから
     // recal_k に渡る (再較正はループ末尾＝周期語確定後にしか発火しない) ので、初期値は不要。
     let mut last_period: u32;
@@ -1143,6 +1162,32 @@ async fn gen_capture_task(
                 last_gen = C0_GEN.load(Ordering::Acquire);
             }
         }
+        // SM3 shadow (残ドリフト調査): SM3 を cadence 毎に GP2 へ WINDOW エッジだけ向けて K03=c0−c3 を測る。
+        // SM2/servo/last_x は一切触らない (SM3 は制御非関与)。データは KEXP 行に出るので、ここは切替と目印だけ。
+        // 切替はどちら向きも出力エッジ処理直後 = 両パルスの high 窓内 (100ms) なので、SM3 は high ループの
+        // まま継ぎ目なく移り、余分な捕捉パス通過は起きない。
+        if SHADOW3 && u.locked {
+            if sh3_window_left > 0 {
+                sh3_window_left -= 1;
+                if sh3_window_left == 0 {
+                    switch_jmp_pin(3, cfg_gp4.get_exec().jmp_pin);
+                    info!("KSH3 count={} on=4", count);
+                }
+            } else {
+                edges_since_sh3 += 1;
+                let cadence = if count < SHADOW3_PHASE_B_COUNT {
+                    SHADOW3_EDGES_A
+                } else {
+                    SHADOW3_EDGES_B
+                };
+                if edges_since_sh3 >= cadence {
+                    edges_since_sh3 = 0;
+                    sh3_window_left = SHADOW3_WINDOW_EDGES;
+                    switch_jmp_pin(3, cfg_gp2.get_exec().jmp_pin);
+                    info!("KSH3 count={} on=2", count);
+                }
+            }
+        }
         if INTERMITTENT_EXP {
             // 間欠ループバック実験: 閉窓 (EXP_TON_EDGES) ↔ 開窓 (EXP_TOFF_SCHEDULE[idx]) を巡回。
             // 開窓中は recal を止め周波数FFのみ (上の exp_hold)。窓入口 (開→閉) で K を測り直す。
@@ -1395,6 +1440,11 @@ async fn main(spawner: Spawner) {
         // output_period_cycles)。周期は gen_capture_task が毎エッジ set_next_period で操舵する
         // (dither+period word 計算は rp-pps、servo=PLL は firmware 側に残す)。high 幅 100ms = GPS
         // モジュール/GPSDO の一般的な 1PPS 幅 (外部機器へ配れる; 規律対象は立ち上がりエッジで幅に不依存)。
+        // 注 (20260704): この幅はカウンタのズレの実ドリフト源でもある。捕捉プログラムの low ループは X wrap
+        // (68.7s 毎) で +1cy 損し high ループは損しないため、ピンの high-duty 差 (GPS-R PPS は high 900ms/low
+        // 100ms 実測、出力は high 100ms) の分だけ 2 カウンタが 0.436×Δduty tick/min で離れる (=定期校正が
+        // 追っていた ~5.6ns/min の正体)。900ms にして duty を揃えると march は −0.01ns/min に消える (実証済み)。
+        // 本番は外部機器互換で 100ms のまま、恒久修正は wrap 均衡 capture プログラム側で行う。
         const PPS_PULSE_NS: u32 = 100_000_000; // 100 ms
         let output = SteeredPpsOutput::new(&mut common, sm1, p.PIN_3, clk_sys_freq(), PPS_PULSE_NS);
 
