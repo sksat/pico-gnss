@@ -100,6 +100,41 @@ pub fn pps_capture_program() -> Program<32> {
     .program
 }
 
+/// Wrap-cost-balanced variant of [`pps_capture_program`].
+///
+/// In the original program the X counter's 2³²-wrap (every ≈68.7 s at 125 MHz) costs one extra
+/// cycle in the **low** wait loop (the `jmp low` guard) but nothing in the **high** wait loop
+/// (`jmp x--`'s fall-through already lands on the next instruction). A pair of counters watching
+/// pins with *different* duty cycles therefore drifts apart by `wraps/min × Δduty × 8 ns` — about
+/// 5.6 ns/min for a 100 ms-high output looped back against a 900 ms-high receiver PPS (measured;
+/// the periodic-recalibration `dk ≈ −1 tick / 2.5 min` was exactly this).
+///
+/// This variant adds the same one-instruction guard to the high loop, so a wrap costs +1 cycle in
+/// **both** loops: every counter slips a uniform 8 ns per wrap (≈0.12 ppb) regardless of the
+/// waveform it watches. The common slip cancels in every counter-pair difference and is absorbed
+/// by frequency estimation; pair drift becomes duty-independent. Tick rate (2 cycles) and the
+/// capture-path cost are unchanged. Choose per state machine set — all counters that are compared
+/// against each other should run the same variant.
+pub fn pps_capture_program_wrap_balanced() -> Program<32> {
+    pio::pio_asm!(
+        ".wrap_target",
+        "low:",
+        "    jmp pin rising", // pin high → real rising edge → capture
+        "    jmp x-- low",    // X--; loop while X != 0
+        "    jmp low",        // X wrapped to 0: keep going, don't emit a false capture
+        "rising:",
+        "    in x, 32",
+        "    push noblock",
+        "high:",
+        "    jmp x-- highchk",
+        "    jmp highchk", // X wrapped to 0: same +1-cycle toll as the low loop (wrap-cost symmetry)
+        "highchk:",
+        "    jmp pin high", // wait for the pin to fall before arming the next edge
+        ".wrap",
+    )
+    .program
+}
+
 /// Steerable **1PPS output** program for one state machine, with a configurable high-pulse width.
 ///
 /// Once at start it pulls a *high-width word* and stashes it in `ISR` (the high pulse length in PIO
@@ -502,6 +537,13 @@ mod tests {
     #[test]
     fn capture_program_shape() {
         assert_eq!(pps_capture_program().code.len(), 7);
+    }
+
+    // 対称版: high 待ちループにも 0 跨ぎの受け皿 jmp が入るぶん 1 命令長い。
+    // 一周のコストが両ループで +1 cycle に揃い、ペアの読み差が duty 非依存になる。
+    #[test]
+    fn wrap_balanced_capture_program_shape() {
+        assert_eq!(pps_capture_program_wrap_balanced().code.len(), 8);
     }
 
     #[test]

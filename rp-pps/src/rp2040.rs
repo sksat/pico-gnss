@@ -29,8 +29,23 @@ impl<P: PIOExt, SM: StateMachineIndex> PpsCapture<P, SM> {
     /// # Panics
     /// If the program does not fit in the PIO's instruction memory.
     pub fn new(pio: &mut PIO<P>, sm: UninitStateMachine<(P, SM)>, pps_gpio: u8) -> Self {
+        Self::new_with_program(pio, sm, pps_gpio, &crate::pps_capture_program())
+    }
+
+    /// Like [`PpsCapture::new`] but with an explicit capture program, e.g.
+    /// [`crate::pps_capture_program_wrap_balanced`]. Counters that are compared against each
+    /// other should all run the same variant.
+    ///
+    /// # Panics
+    /// If the program does not fit in the PIO's instruction memory.
+    pub fn new_with_program(
+        pio: &mut PIO<P>,
+        sm: UninitStateMachine<(P, SM)>,
+        pps_gpio: u8,
+        program: &pio::Program<32>,
+    ) -> Self {
         let installed = pio
-            .install(&crate::pps_capture_program())
+            .install(program)
             .expect("PIO instruction memory full");
         let (mut sm, rx, _tx) = PIOBuilder::from_installed_program(installed)
             .jmp_pin(pps_gpio)

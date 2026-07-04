@@ -343,6 +343,13 @@ const SHADOW3_PHASE_B_COUNT: u32 = 1500;
 const SHADOW3_WINDOW_EDGES: u32 = 8;
 // SHADOW3 は SM3 が GP4 常駐であることが前提。
 const _: () = assert!(!SHADOW3 || C3_WATCH_GP4);
+/// 残留ドリフトの恒久修正 (20260704): 捕捉プログラムを一周コスト対称版にする。X の 0 跨ぎ (68.7s 毎) の
+/// +1 cycle が low 待ちループだけに乗る非対称 × ピンの duty 差で、別ピンを見る 2 カウンタが
+/// 0.87 回/分 × Δduty × 8ns (実測 5.6ns/min) で開くのを、両ループ +1 cycle に揃えて duty 非依存にする。
+/// 全カウンタが一律 8ns/68.7s (≈0.12ppb) 遅れるが、共通分は読み差から消え周波数推定が吸収する。
+/// もう 1 つの対処はパルス幅合わせ (PPS_PULSE_NS を GPS-R と同じ low 100ms = high 900ms にする) で、
+/// どちらも実測で march ≈ 0 を確認済み。幅合わせは受信機の波形に依存するため、既定はこちらの対称版。
+const WRAP_BALANCED_CAPTURE: bool = true;
 
 /// 最新の GPS PPS エッジの生カウンタ値 (SM0)。stage② の PIO 位相計測で gen_capture が参照する。
 static C0_GPS: AtomicU32 = AtomicU32::new(0);
@@ -1331,12 +1338,19 @@ async fn main(spawner: Spawner) {
             mut sm3,
             ..
         } = Pio::new(p.PIO0, Irqs);
-        let mut capture = TimedPpsCapture::new(&mut common, sm0, p.PIN_2, clk_sys_freq());
+        // 捕捉プログラムの variant 選択。比較し合う全 capture SM (SM0/SM2/SM3) を同じ variant で載せる。
+        let capture_prog = if WRAP_BALANCED_CAPTURE {
+            rp_pps::pps_capture_program_wrap_balanced()
+        } else {
+            rp_pps::pps_capture_program()
+        };
+        let mut capture =
+            TimedPpsCapture::new_with_program(&mut common, sm0, p.PIN_2, clk_sys_freq(), &capture_prog);
 
         // stage②: SM2 (ループバック位相計測。rp-pps 外の実験機能) は capture と GP2 を共有して生カウンタ差
         // K=C0−C2 を較正する。embassy の set_jmp_pin は &Pin を要求し GP2 は一度しか make できないので、
         // capture.jmp_pin() で GP2 Pin を借り、capture プログラムをもう一枚 load する。
-        let lb_loaded = common.load_program(&rp_pps::pps_capture_program());
+        let lb_loaded = common.load_program(&capture_prog);
         let lb_pin = common.make_pio_pin(p.PIN_4);
         sm2.set_pin_dirs(PioDirection::In, &[&lb_pin]);
         let mut cfg_gp2 = PioConfig::default();
@@ -1444,7 +1458,7 @@ async fn main(spawner: Spawner) {
         // (68.7s 毎) で +1cy 損し high ループは損しないため、ピンの high-duty 差 (GPS-R PPS は high 900ms/low
         // 100ms 実測、出力は high 100ms) の分だけ 2 カウンタが 0.436×Δduty tick/min で離れる (=定期校正が
         // 追っていた ~5.6ns/min の正体)。900ms にして duty を揃えると march は −0.01ns/min に消える (実証済み)。
-        // 本番は外部機器互換で 100ms のまま、恒久修正は wrap 均衡 capture プログラム側で行う。
+        // 本番は外部機器互換で 100ms のまま、恒久修正は WRAP_BALANCED_CAPTURE (一周コスト対称の capture) が担う。
         const PPS_PULSE_NS: u32 = 100_000_000; // 100 ms
         let output = SteeredPpsOutput::new(&mut common, sm1, p.PIN_3, clk_sys_freq(), PPS_PULSE_NS);
 
@@ -1463,6 +1477,7 @@ async fn main(spawner: Spawner) {
         // GP2 が high なら入る spurious 捕捉を掃く → spawn 後の最初のエッジから c0/c3 が 1:1)。
         while capture.capture_mut().try_read().is_some() {}
         while sm3.rx().try_pull().is_some() {}
+        info!("CAPCFG wrap_balanced={}", WRAP_BALANCED_CAPTURE as u8);
         if C3_WATCH_GP4 {
             info!("KEXPCFG sm3=gp4 prog=lb_loaded (pure observer, not in control)");
         } else {

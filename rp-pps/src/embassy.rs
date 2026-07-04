@@ -27,10 +27,22 @@ impl<'d, PIO: Instance, const SM: usize> PpsCapture<'d, PIO, SM> {
     /// Load the capture program onto `sm`, route `pps_pin` as its input/`jmp` pin, and enable it.
     pub fn new(
         common: &mut Common<'d, PIO>,
-        mut sm: StateMachine<'d, PIO, SM>,
+        sm: StateMachine<'d, PIO, SM>,
         pps_pin: Peri<'d, impl PioPin>,
     ) -> Self {
-        let prog = common.load_program(&crate::pps_capture_program());
+        Self::new_with_program(common, sm, pps_pin, &crate::pps_capture_program())
+    }
+
+    /// Like [`PpsCapture::new`] but with an explicit capture program, e.g.
+    /// [`crate::pps_capture_program_wrap_balanced`]. Counters that are compared against each
+    /// other should all run the same variant.
+    pub fn new_with_program(
+        common: &mut Common<'d, PIO>,
+        mut sm: StateMachine<'d, PIO, SM>,
+        pps_pin: Peri<'d, impl PioPin>,
+        program: &pio::Program<32>,
+    ) -> Self {
+        let prog = common.load_program(program);
         let pin = common.make_pio_pin(pps_pin);
         sm.set_pin_dirs(Direction::In, &[&pin]);
         let mut cfg = Config::default();
@@ -85,6 +97,21 @@ impl<'d, PIO: Instance, const SM: usize> TimedPpsCapture<'d, PIO, SM> {
     ) -> Self {
         Self {
             capture: PpsCapture::new(common, sm, pps_pin),
+            timeline: crate::PpsEdgeTimeline::new(clk_hz),
+        }
+    }
+
+    /// Like [`TimedPpsCapture::new`] but with an explicit capture program, e.g.
+    /// [`crate::pps_capture_program_wrap_balanced`].
+    pub fn new_with_program(
+        common: &mut Common<'d, PIO>,
+        sm: StateMachine<'d, PIO, SM>,
+        pps_pin: Peri<'d, impl PioPin>,
+        clk_hz: u32,
+        program: &pio::Program<32>,
+    ) -> Self {
+        Self {
+            capture: PpsCapture::new_with_program(common, sm, pps_pin, program),
             timeline: crate::PpsEdgeTimeline::new(clk_hz),
         }
     }
