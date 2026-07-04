@@ -1459,7 +1459,7 @@ async fn main(spawner: Spawner) {
         // 100ms 実測、出力は high 100ms) の分だけ 2 カウンタが 0.436×Δduty tick/min で離れる (=定期校正が
         // 追っていた ~5.6ns/min の正体)。900ms にして duty を揃えると march は −0.01ns/min に消える (実証済み)。
         // 本番は外部機器互換で 100ms のまま、恒久修正は WRAP_BALANCED_CAPTURE (一周コスト対称の capture) が担う。
-        const PPS_PULSE_NS: u32 = 100_000_000; // 100 ms
+        const PPS_PULSE_NS: u32 = 900_000_000; // 既定 = 幅合わせ (low 100ms、GPS-R と同じ)。外部機器互換が要る場合は 100ms へ
         let output = SteeredPpsOutput::new(&mut common, sm1, p.PIN_3, clk_sys_freq(), PPS_PULSE_NS);
 
         // --- 実験: SM3 を GP2 に常時向けた純観測 SM として起動 (KEXP 診断。制御には非関与) ---
