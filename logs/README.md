@@ -30,3 +30,30 @@ cd pico-gnss && cargo build --release && cargo run --release > ../$RUN/pps-boot.
 # オシロ (IP は env、リポジトリに直書きしない)。再利用ツールは scripts/ から呼ぶ
 RIGOL_HOST=<scope-ip> python3 scripts/scope_raw.py convergence $RUN/convergence.gif 180
 ```
+
+## 追跡している図スクリプト
+
+例外として、`docs/report/precision-ladder/precision-figs/` の図を生成するスクリプトは
+再現性のためコミットする (`git add -f`。データではないので座標も IP も含まない)。
+生データ (RTT ログ、.shots) は上記の方針どおり gitignore のままなので、再生成には
+各試行のサブディレクトリが手元に残っている必要がある。実行方法は各スクリプト冒頭の
+docstring (usage 行) を参照。
+
+| スクリプト | 生成する図 |
+|---|---|
+| `precision-rework/plot_figs.py` | fig1-ladder, fig-naive-phase/jitter, fig-pio-*, fig-pll-*, ctrl, smith, fig2-s4-beforeafter, fig5-bootrepro, fig6-wander-source ほか |
+| `precision-rework/fig4_dither.py` | fig4-dither |
+| `precision-rework/fig_dither_concept.py` | fig-dither-concept |
+| `precision-rework/fig_loopback.py` | fig-loopback |
+| `precision-rework/fig_k_offset.py` | fig-k-offset |
+| `precision-rework/fig_kexp_setup.py` | fig-kexp-setup |
+| `precision-rework/fig789_tempff.py` | 温度ステップ実験の図 (fig7/8/9) |
+| `precision-rework/fig10_clamp.py` | fig10-clamp |
+| `precision-rework/per_step.py`, `standalone.py` | 補助図 |
+| `20260703-naive-boots/analyze_fig.py`, `fig_naive_jitter.py` | 素朴 1PPS の図 |
+| `20260703-recal-scope/fig_walk.py` | fig-recal-walk |
+| `20260704-jmppin-fix/fig_report.py` | fig-kpoke-poke, fig-kslip-fix |
+| `20260704-jmppin-fix/fig_fixresult.py` | fig-fix-result |
+| `20260704-drift-cause/fig_wrap.py` | fig-wrap-cost |
+| `20260704-drift-cause/fig_stairs.py` | fig-wrap-fold |
+| `20260704-drift-cause/fig_report_drift.py` | fig-inject, fig-shadow-march, fig-drift-elim, fig-w900 |
