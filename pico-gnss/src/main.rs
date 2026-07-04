@@ -308,6 +308,13 @@ const RECAL_SAMPLE_TICK_GATE: u32 = 64; // ≈1µs。実ドリフト ~19ns/min �
 /// 這うので補正も連続が自然。段差適用だと累積ドリフト(~6tick=96ns)を loop が急補正し D 項が跳ねて
 /// offset② が ~30s 暴れる (実機確認)。slew で ramp 化すると loop は滑らかに追従する。dk≈6 なら ~3 エッジで適用。
 const RECAL_K_SLEW_TICKS: i32 = 2;
+/// 残留ドリフト調査 (20260704): stage-3 (recal 適用なし) で K を頻繁に測るが**適用しない** shadow recal。
+/// 適用 K は起動時 K0 のまま (loop は stale K で pin が drift し続ける) で、測った K_shadow(t) を KSHADOW 行で
+/// ログするだけ。判定: gap(t)=scope-hwphase が -(K_shadow(t)-K0) と一致すれば残ドリフト=実効 K ドリフト、
+/// K_shadow 静止で gap だけ伸びれば出力生成/loopback の PLL 不可視バイアス (codex 助言の第1実験)。本番は false。
+const SHADOW_RECAL: bool = false;
+/// shadow K 測定の間隔 (locked 出力エッジ)。測定中は SM2 を GP2 へ奪う ~数秒 holdover になるので粗めに。
+const SHADOW_EDGES: u32 = 60;
 
 /// 最新の GPS PPS エッジの生カウンタ値 (SM0)。stage② の PIO 位相計測で gen_capture が参照する。
 static C0_GPS: AtomicU32 = AtomicU32::new(0);
@@ -797,6 +804,8 @@ async fn gen_capture_task(
     let mut count: u32 = 0;
     let mut last_gen: u32 = 0;
     let mut k_target: u32 = k; // 再較正が測った最新 K。毎エッジ k をここへ slew して寄せる (段差→ramp)。
+    let k0_boot: u32 = k; // shadow recal 用: 起動時 K0 を保持し K_shadow の drift を dk=K_shadow-K0 で出す。
+    let mut edges_since_shadow: u32 = 0;
     // 直近の出力周期語。再較正中の holdover 生 push に再利用する。必ず set_next_period (下) で代入されてから
     // recal_k に渡る (再較正はループ末尾＝周期語確定後にしか発火しない) ので、初期値は不要。
     let mut last_period: u32;
@@ -1091,6 +1100,26 @@ async fn gen_capture_task(
                     kp_inv,
                     smith
                 );
+            }
+        }
+        // shadow recal (残ドリフト調査): 適用中の recal が無い段 (S3) で、K を測るだけ測って適用しない。
+        // k_target は据え置くので loop は起動時 K0 のまま = pin は observed の +5-6ns/min で drift し続ける。
+        // recal_k は測定値 (nk) か却下時 k_target を返す。dk=k_meas-K0 を KSHADOW でログ、gap との照合は host で。
+        if SHADOW_RECAL && u.locked && !recal_on(PRECISION_STAGE) {
+            edges_since_shadow += 1;
+            if edges_since_shadow >= SHADOW_EDGES {
+                edges_since_shadow = 0;
+                let k_meas =
+                    recal_k(&mut sm, &mut output, &cfg_gp2, &cfg_gp4, k_target, last_period).await;
+                info!(
+                    "KSHADOW count={} k_meas={} k0={} dk={}",
+                    count,
+                    k_meas,
+                    k0_boot,
+                    k_meas.wrapping_sub(k0_boot) as i32
+                );
+                last_x = None; // GP4 捕捉が測定 gap を跨ぐので次 interval を無効化 (real recal と同じ)
+                last_gen = C0_GEN.load(Ordering::Acquire);
             }
         }
         if INTERMITTENT_EXP {
