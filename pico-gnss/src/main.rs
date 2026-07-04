@@ -343,6 +343,14 @@ const SHADOW3_PHASE_B_COUNT: u32 = 1500;
 const SHADOW3_WINDOW_EDGES: u32 = 8;
 // SHADOW3 は SM3 が GP4 常駐であることが前提。
 const _: () = assert!(!SHADOW3 || C3_WATCH_GP4);
+/// 温度 FF の長時間 A/B (20260705): 同一 boot 内で temp FF の適用だけを TEMPFF_ABAB_EDGES ごとに
+/// on/off 交互に切り替え、自然室温での遅いふらつき σ への効果を交絡なし (同 boot、同受信、同構成) で測る。
+/// 学習 (update_temp) は off 区間も回り続け、適用 (predicted_freq への反映) だけが切り替わる。
+/// 区間境界は TFFAB 行でログし、host 解析が区間ごとに σ を出す。基盤構成は recal なし (stage-3) +
+/// 幅合わせ + 一周コスト対称を想定。本番は false。
+const TEMPFF_ABAB: bool = false;
+/// 1 区間の長さ (locked 出力エッジ ≈ 秒)。30 分。遅いふらつきの周期 (64〜300 秒) より十分長く取る。
+const TEMPFF_ABAB_EDGES: u32 = 1800;
 /// 残留ドリフトの恒久修正 (20260704): 捕捉プログラムを一周コスト対称版にする。X の 0 跨ぎ (68.7s 毎) の
 /// +1 cycle が low 待ちループだけに乗る非対称 × ピンの duty 差で、別ピンを見る 2 カウンタが
 /// 0.87 回/分 × Δduty × 8ns (実測 5.6ns/min) で開くのを、両ループ +1 cycle に揃えて duty 非依存にする。
@@ -844,6 +852,9 @@ async fn gen_capture_task(
     // SM3 shadow の状態: cadence カウンタと、GP2 滞在の残エッジ数 (0 = GP4 常駐中)。
     let mut edges_since_sh3: u32 = 0;
     let mut sh3_window_left: u32 = 0;
+    // 温度 FF A/B の状態。初期値は段ゲートの設定 (stage-3 なら off 始まり)。
+    let mut edges_since_tffab: u32 = 0;
+    let mut tffab_on: bool = temp_ff(PRECISION_STAGE);
     // 直近の出力周期語。再較正中の holdover 生 push に再利用する。必ず set_next_period (下) で代入されてから
     // recal_k に渡る (再較正はループ末尾＝周期語確定後にしか発火しない) ので、初期値は不要。
     let mut last_period: u32;
@@ -1193,6 +1204,16 @@ async fn gen_capture_task(
                     switch_jmp_pin(3, cfg_gp2.get_exec().jmp_pin);
                     info!("KSH3 count={} on=2", count);
                 }
+            }
+        }
+        // 温度 FF の長時間 A/B: locked エッジを数え、区間ごとに適用だけを反転する。
+        if TEMPFF_ABAB && u.locked {
+            edges_since_tffab += 1;
+            if edges_since_tffab >= TEMPFF_ABAB_EDGES {
+                edges_since_tffab = 0;
+                tffab_on = !tffab_on;
+                CLOCK.lock(|g| g.borrow_mut().set_temp_ff_enable(tffab_on));
+                info!("TFFAB count={} temp_ff={}", count, tffab_on as u8);
             }
         }
         if INTERMITTENT_EXP {
