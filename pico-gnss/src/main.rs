@@ -315,6 +315,13 @@ const RECAL_K_SLEW_TICKS: i32 = 2;
 const SHADOW_RECAL: bool = false;
 /// shadow K 測定の間隔 (locked 出力エッジ)。測定中は SM2 を GP2 へ奪う ~数秒 holdover になるので粗めに。
 const SHADOW_EDGES: u32 = 60;
+/// 残留ドリフト調査 (20260704): 出力周波数へ**ループに隠して**既知バイアスを step 注入する。生成 vs 参照の切り分け。
+/// INJECT_START_COUNT 以降、freq_mppb に足すが loop の状態 (trim) には入れない。判定: (a) gap 傾きが注入分乗れば
+/// 「生成は見えないバイアスを運べる」= 生成側容疑、(b) loop が trim で打ち消して gap 傾き不変なら「生成は clean、
+/// 残ドリフトは参照/検出側」。1 ppb = 1000 mppb = 60 ns/min で残 ~+5 ns/min を明確に上回る。本番は 0。
+const INJECT_FREQ_MPPB: i64 = 0;
+/// 注入を on にする count (これ以前は baseline)。ロック整定後に段を作れるよう粗く 5 分相当。
+const INJECT_START_COUNT: u32 = 300;
 
 /// 最新の GPS PPS エッジの生カウンタ値 (SM0)。stage② の PIO 位相計測で gen_capture が参照する。
 static C0_GPS: AtomicU32 = AtomicU32::new(0);
@@ -1006,7 +1013,16 @@ async fn gen_capture_task(
         };
         // 周期語を保持: 再較正中の holdover 生 push に再利用 (dither はこの通常経路でのみ前進)。
         let pcorr_ns = if exp_hold { 0 } else { u.pcorr_ns };
-        last_period = output.set_next_period(freq_mppb, pcorr_ns + prbs_inj + kick_inj);
+        // 残ドリフト調査: 出力周波数へループに隠して既知バイアスを注入 (freq_mppb には足すが last_applied/loop 状態には非反映)。
+        let inj_mppb = if INJECT_FREQ_MPPB != 0 && u.locked && count >= INJECT_START_COUNT {
+            INJECT_FREQ_MPPB
+        } else {
+            0
+        };
+        last_period = output.set_next_period(freq_mppb + inj_mppb, pcorr_ns + prbs_inj + kick_inj);
+        if INJECT_FREQ_MPPB != 0 {
+            info!("KINJ count={} inj_mppb={}", count, inj_mppb);
+        }
         if let Some(iv) = interval_ns {
             count += 1;
             // 制御信号を全部出力 → ホストでプラント同定 + 制御器比較 + 項別比較ができる。
