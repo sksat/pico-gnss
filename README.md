@@ -1,4 +1,4 @@
-# pico-gnss-rs
+# pico-gnss
 
 [![crates.io](https://img.shields.io/crates/v/gnssdo.svg)](https://crates.io/crates/gnssdo)
 [![docs.rs](https://img.shields.io/docsrs/gnssdo)](https://docs.rs/gnssdo)
