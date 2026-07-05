@@ -536,7 +536,8 @@ impl PhaseController for IntegralRework {
         let mut rejected = false;
 
         if input.valid {
-            if locked && ctrl.abs() > self.cfg.outlier_ns && self.reject_cnt < self.cfg.outlier_max {
+            if locked && ctrl.abs() > self.cfg.outlier_ns && self.reject_cnt < self.cfg.outlier_max
+            {
                 self.reject_cnt += 1;
                 rejected = true;
             } else {
@@ -637,7 +638,10 @@ mod tests {
             }
         }
         assert!(locked_at.is_some(), "should lock within 400 edges");
-        assert!(out.abs() < 1_000, "should settle inside the lock window, got {out}");
+        assert!(
+            out.abs() < 1_000,
+            "should settle inside the lock window, got {out}"
+        );
     }
 
     #[test]
@@ -681,7 +685,10 @@ mod tests {
             assert_eq!(c.freq_trim_mppb(), seed, "getter before first edge");
             assert!(!c.is_locked());
             let o = drive(&mut c, 0, true); // steady (err==0) first edge
-            assert_eq!(o.trim_mppb, seed, "first emitted trim must equal the seed (seed={seed})");
+            assert_eq!(
+                o.trim_mppb, seed,
+                "first emitted trim must equal the seed (seed={seed})"
+            );
             assert_eq!(o.pcorr_ns, 0, "no phase kick on the first post-switch edge");
             assert_eq!(o.dbg.state, 0, "not boosting on a steady switch");
         }
@@ -796,7 +803,11 @@ mod tests {
             c.start_segment(ControlInit {
                 residual_trim_mppb: 4_321,
             });
-            assert!(!c.is_locked(), "{} should start a segment unlocked", c.name());
+            assert!(
+                !c.is_locked(),
+                "{} should start a segment unlocked",
+                c.name()
+            );
             // Drive a 15 µs offset closed-loop; every variant here is a phase servo → must lock.
             let mut out: i64 = 15_000;
             for _ in 0..400 {
@@ -829,6 +840,9 @@ mod tests {
         let cfg = IntegralReworkConfig::DEFAULT;
         // Bound: |trim step| ≤ e_i·1000/i_den + back-calc slack (no saturation here).
         let bound = cfg.e_i_ns * 1000 / cfg.i_den;
-        assert!(big <= bound as i64, "first step {big} should be clamped to ≤ {bound}");
+        assert!(
+            big <= bound as i64,
+            "first step {big} should be clamped to ≤ {bound}"
+        );
     }
 }

@@ -126,12 +126,24 @@ mod tests {
     #[test]
     fn pure_interval_matches_struct_and_handles_extremes() {
         // 純粋関数は (raw, prev, now) から直接補正。struct と同じ結果。
-        assert_eq!(correct_interval_ns(1_000_000_000, 2_000, 7_000), 999_999_995);
-        assert_eq!(correct_interval_ns(1_000_000_000, 7_000, 2_000), 1_000_000_005);
-        assert_eq!(correct_interval_ns(1_000_000_000, 5_000, 5_000), 1_000_000_000);
+        assert_eq!(
+            correct_interval_ns(1_000_000_000, 2_000, 7_000),
+            999_999_995
+        );
+        assert_eq!(
+            correct_interval_ns(1_000_000_000, 7_000, 2_000),
+            1_000_000_005
+        );
+        assert_eq!(
+            correct_interval_ns(1_000_000_000, 5_000, 5_000),
+            1_000_000_000
+        );
         // i32 の両極端の差 (~±4.29e9 ps = ±4.29ms) を i64 で取り overflow しない。
         let big = correct_interval_ns(1_000_000_000, i32::MIN, i32::MAX);
-        assert_eq!(big, 1_000_000_000 - ps_to_ns_round(i32::MAX as i64 - i32::MIN as i64));
+        assert_eq!(
+            big,
+            1_000_000_000 - ps_to_ns_round(i32::MAX as i64 - i32::MIN as i64)
+        );
         assert!(big < 1_000_000_000); // now>prev なので間隔は縮む
     }
 

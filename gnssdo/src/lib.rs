@@ -30,9 +30,7 @@ mod pll;
 mod pps;
 mod qerr;
 
-pub use control::{
-    ControlDebug, ControlInit, ControlInput, ControlOutput, PhaseController,
-};
+pub use control::{ControlDebug, ControlInit, ControlInput, ControlOutput, PhaseController};
 pub use controllers::{
     AlphaBetaBoost, AlphaBetaBoostConfig, Controller, IntegralRework, IntegralReworkConfig,
     OpenLoopFf,

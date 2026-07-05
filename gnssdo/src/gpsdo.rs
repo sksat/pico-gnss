@@ -259,15 +259,15 @@ pub struct DisciplinedClock {
     //   output  = f_ff + r_resid
     // The matched lead estimates the crystal temperature from the die sensor; the online regression
     // (temp_sm/temp_mt/temp_mf_mppb/temp_cov/temp_var) learns the local TC `k`.
-    temp_now: i64,      // latest temperature reading (raw sensor units), via update_temp
-    temp_have: bool,    // a temperature has been observed
-    temp_sm: i64,       // short EMA of temperature (<<TEMP_FP), ADC-noise removed; regression input
-    temp_mt: i64,       // long EMA of temperature (<<TEMP_FP), the centering mean
-    temp_mf_mppb: i64,  // EMA of measured frequency (milli-ppb)
-    temp_cov: i64,      // EMA of (temp_sm−mt)·(freq−mf)
-    temp_var: i64,      // EMA of (temp_sm−mt)²
-    temp_ref: i64,      // reference temperature (first reading, <<TEMP_FP); f_ff is k·(Tcrys_hat−ref)
-    r_resid: i64,       // non-thermal residual frequency estimate (milli-ppb), observer state
+    temp_now: i64,     // latest temperature reading (raw sensor units), via update_temp
+    temp_have: bool,   // a temperature has been observed
+    temp_sm: i64,      // short EMA of temperature (<<TEMP_FP), ADC-noise removed; regression input
+    temp_mt: i64,      // long EMA of temperature (<<TEMP_FP), the centering mean
+    temp_mf_mppb: i64, // EMA of measured frequency (milli-ppb)
+    temp_cov: i64,     // EMA of (temp_sm−mt)·(freq−mf)
+    temp_var: i64,     // EMA of (temp_sm−mt)²
+    temp_ref: i64, // reference temperature (first reading, <<TEMP_FP); f_ff is k·(Tcrys_hat−ref)
+    r_resid: i64,  // non-thermal residual frequency estimate (milli-ppb), observer state
     // Matched-lead state (die temperature → crystal temperature). Kept separate from temp_sm so the
     // lead path can later run at a higher rate (e.g. 30 Hz) than the 1 Hz regression; today they share
     // temp_ff_sm_shift so temp_die_lp mirrors temp_sm.
@@ -636,7 +636,10 @@ impl DisciplinedClock {
         let raw = self.predicted_freq_mppb();
         let delta = raw - self.freq_mppb;
         self.freq_mppb
-            + delta.clamp(-self.config.steer_ff_bound_mppb, self.config.steer_ff_bound_mppb)
+            + delta.clamp(
+                -self.config.steer_ff_bound_mppb,
+                self.config.steer_ff_bound_mppb,
+            )
     }
 
     /// Whether enough samples have been seen to lock the frequency.
@@ -996,7 +999,10 @@ mod tests {
         let ema = peak_phase(0);
         let ab = peak_phase(DisciplinedClockConfig::DEFAULT.slope_max_mppb);
         // 単一 EMA は ~12µs、α-β は ~1.3µs。少なくとも 5 倍の改善を回帰として固定。
-        assert!(ema > 8_000, "single-EMA ramp phase should be large, got {ema}ns");
+        assert!(
+            ema > 8_000,
+            "single-EMA ramp phase should be large, got {ema}ns"
+        );
         assert!(
             ab * 5 < ema,
             "α-β should cut ramp phase error >5x: ema={ema}ns ab={ab}ns"
@@ -1036,7 +1042,11 @@ mod tests {
         for _ in 0..c.config().quarantine_samples {
             assert_eq!(c.update_freq(1_000_010_000), FreqUpdate::Quarantined);
         }
-        assert_eq!(c.freq_slope_mppb(), slope_before, "slope must not move in quarantine");
+        assert_eq!(
+            c.freq_slope_mppb(),
+            slope_before,
+            "slope must not move in quarantine"
+        );
     }
 
     #[test]
@@ -1336,7 +1346,12 @@ mod tests {
                 saw_overreaction = true;
                 // 飽和時は steering が level±bound に張り付くこと。単なる |·|≤bound は clamp 定義上
                 // 恒真で、FF を 0 に潰す退化実装 (steering=level) も通ってしまうので符号付きで固定する。
-                let expect = c.freq_mppb() + if predicted > c.freq_mppb() { bound } else { -bound };
+                let expect = c.freq_mppb()
+                    + if predicted > c.freq_mppb() {
+                        bound
+                    } else {
+                        -bound
+                    };
                 assert_eq!(
                     steering, expect,
                     "saturated steering must sit at level±bound, not collapse to level"
@@ -1421,7 +1436,10 @@ mod tests {
                 predicted - c.freq_mppb(),
                 bound
             );
-            assert_eq!(steering, predicted, "temp-ff gentle ramp: clamp must stay dormant");
+            assert_eq!(
+                steering, predicted,
+                "temp-ff gentle ramp: clamp must stay dormant"
+            );
             checked += 1;
         }
         assert!(checked > 0);
@@ -1461,7 +1479,9 @@ mod tests {
         }
         let unix_end = h * 1_000_000_000; // 真の経過 = H 秒
         let e_level = c.prediction_residual_ns(d as u64, unix_end).unwrap();
-        let e_slope = c.prediction_residual_holdover_ns(d as u64, unix_end).unwrap();
+        let e_slope = c
+            .prediction_residual_holdover_ns(d as u64, unix_end)
+            .unwrap();
         // level-only は ~r·H²/2 ≈ 90µs、slope-aware は O(H) ~数百 ns。10× 以上の改善を回帰固定。
         assert!(
             e_level.abs() > 10_000,

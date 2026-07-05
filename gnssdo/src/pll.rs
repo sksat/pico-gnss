@@ -655,12 +655,23 @@ mod tests {
         run(&mut p, 100, 8);
         assert!(p.is_locked());
         // Switch into a fresh comparison segment with a seeded residual trim (output freq continuous).
-        PhaseController::start_segment(&mut p, ControlInit { residual_trim_mppb: 12_345 });
+        PhaseController::start_segment(
+            &mut p,
+            ControlInit {
+                residual_trim_mppb: 12_345,
+            },
+        );
         assert!(!PhaseController::is_locked(&p)); // lock blanked → warmup
         assert_eq!(p.freq_trim_mppb(), 12_345); // residual trim seeded
         // First post-switch edge: D needs lock (just blanked), so the correction is P-only — no kick
         // off stale Smith/derivative history.
-        let o = PhaseController::step(&mut p, ControlInput { err_ns: 800, valid: true });
+        let o = PhaseController::step(
+            &mut p,
+            ControlInput {
+                err_ns: 800,
+                valid: true,
+            },
+        );
         assert_eq!(o.dbg.d_ns, 0);
         assert_eq!(o.dbg.p_ns, 800 / 8);
     }

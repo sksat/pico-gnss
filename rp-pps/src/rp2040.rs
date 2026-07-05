@@ -44,9 +44,7 @@ impl<P: PIOExt, SM: StateMachineIndex> PpsCapture<P, SM> {
         pps_gpio: u8,
         program: &pio::Program<32>,
     ) -> Self {
-        let installed = pio
-            .install(program)
-            .expect("PIO instruction memory full");
+        let installed = pio.install(program).expect("PIO instruction memory full");
         let (mut sm, rx, _tx) = PIOBuilder::from_installed_program(installed)
             .jmp_pin(pps_gpio)
             .build(sm);

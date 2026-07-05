@@ -296,7 +296,11 @@ pub fn loopback_phase_ticks(
 /// (the historic "stale pairing" failure family). Gate the measurement on `|raw| <= max_lag_ticks`
 /// (a few ms ≫ any real phase, ≪ 1 s) so only correctly-paired edges drive the loop, keeping
 /// `phase == 0 ⟺ aligned`.
-pub fn loopback_raw_lag_ticks(reference_capture: u32, output_capture: u32, offset_ticks: u32) -> i32 {
+pub fn loopback_raw_lag_ticks(
+    reference_capture: u32,
+    output_capture: u32,
+    offset_ticks: u32,
+) -> i32 {
     reference_capture
         .wrapping_sub(output_capture)
         .wrapping_sub(offset_ticks) as i32

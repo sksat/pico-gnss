@@ -228,12 +228,32 @@ fn evaluate(make: Factory, reg: Regime, seeds: u64) -> Metrics {
         m.steady_rms += std_dev(&hw[1500..]);
         // reacquire from 50 µs
         let rec = gen_reception(1500, 2000 + s);
-        let (hw, lk) = run_plant(&mut *make(), 1500, &rec, reg, 0.0, None, 0.0, 50_000.0, 6000 + s);
+        let (hw, lk) = run_plant(
+            &mut *make(),
+            1500,
+            &rec,
+            reg,
+            0.0,
+            None,
+            0.0,
+            50_000.0,
+            6000 + s,
+        );
         m.reacq_1us_edge += hw.iter().position(|v| v.abs() < 1000.0).unwrap_or(1500) as f64;
         m.lock_edge += lk.iter().position(|&v| v).unwrap_or(1500) as f64;
         // step
         let rec = gen_reception(2000, 3000 + s);
-        let (hw, _) = run_plant(&mut *make(), 2000, &rec, reg, 0.0, Some(800), 2000.0, 0.0, 7000 + s);
+        let (hw, _) = run_plant(
+            &mut *make(),
+            2000,
+            &rec,
+            reg,
+            0.0,
+            Some(800),
+            2000.0,
+            0.0,
+            7000 + s,
+        );
         let seg = &hw[800..1600];
         m.step_settle_edge += seg.iter().position(|v| v.abs() < 200.0).unwrap_or(800) as f64;
         m.step_overshoot_ns += seg.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
@@ -243,7 +263,17 @@ fn evaluate(make: Factory, reg: Regime, seeds: u64) -> Metrics {
             .count() as f64;
         // drift
         let rec = gen_reception(3000, 4000 + s);
-        let (hw, _) = run_plant(&mut *make(), 3000, &rec, reg, 0.002, None, 0.0, 0.0, 8000 + s);
+        let (hw, _) = run_plant(
+            &mut *make(),
+            3000,
+            &rec,
+            reg,
+            0.002,
+            None,
+            0.0,
+            0.0,
+            8000 + s,
+        );
         m.drift_rms += std_dev(&hw[1500..]);
     }
     let n = seeds as f64;
@@ -351,7 +381,17 @@ fn ab_boost_does_not_lag_badly_under_harsh_drift() {
         let mut acc = 0.0;
         for s in 0..6u64 {
             let rec = gen_reception(3000, 4000 + s);
-            let (hw, _) = run_plant(&mut *make(), 3000, &rec, PIO, harsh, None, 0.0, 0.0, 9000 + s);
+            let (hw, _) = run_plant(
+                &mut *make(),
+                3000,
+                &rec,
+                PIO,
+                harsh,
+                None,
+                0.0,
+                0.0,
+                9000 + s,
+            );
             acc += std_dev(&hw[1500..]);
         }
         acc / 6.0
@@ -446,7 +486,11 @@ fn calibrate_reception_to_real_spectrum() {
             adj_s += std_dev(&adj);
             per_s += dominant_period(h) as f64;
         }
-        let (sd, adj, per) = (sd_s / seeds as f64, adj_s / seeds as f64, per_s / seeds as f64);
+        let (sd, adj, per) = (
+            sd_s / seeds as f64,
+            adj_s / seeds as f64,
+            per_s / seeds as f64,
+        );
         eprintln!(
             "  {:7.0}   {:6.0}   {:8.0}    {:5.2}   {:7.0}",
             rw,
@@ -478,7 +522,11 @@ fn calibrate_reception_to_real_spectrum() {
             adj_s += std_dev(&adj);
             per_s += dominant_period(h) as f64;
         }
-        let (sd, adj, per) = (sd_s / seeds as f64, adj_s / seeds as f64, per_s / seeds as f64);
+        let (sd, adj, per) = (
+            sd_s / seeds as f64,
+            adj_s / seeds as f64,
+            per_s / seeds as f64,
+        );
         eprintln!(
             "  {:6.0} {:8.0}   {:6.0}   {:8.0}    {:5.2}   {:7.0}",
             tau,
@@ -531,7 +579,11 @@ fn model_matches_real_wander_spectrum() {
         adj_s += std_dev(&adj);
         per_s += dominant_period(h) as f64;
     }
-    let (sd, adj, per) = (sd_s / seeds as f64, adj_s / seeds as f64, per_s / seeds as f64);
+    let (sd, adj, per) = (
+        sd_s / seeds as f64,
+        adj_s / seeds as f64,
+        per_s / seeds as f64,
+    );
     eprintln!(
         "MODEL vs REAL: sd={sd:.0}ns (real 223) adj/sd={:.2} (real 0.07, low-freq) period={per:.0}s (real ~190, loop mode)",
         adj / sd
@@ -587,8 +639,7 @@ fn delay_compensation_enables_damping() {
             for s in 0..seeds {
                 let rec = gen_reception_real(n, 300 + s);
                 let mut pll = PhaseLockLoop::with_config(cfg(kp, se));
-                let (hw, lk) =
-                    run_plant_delayed(&mut pll, n, &rec, PIO, 0.0, 0.0, 7000 + s, delay);
+                let (hw, lk) = run_plant_delayed(&mut pll, n, &rec, PIO, 0.0, 0.0, 7000 + s, delay);
                 let h = &hw[warm..];
                 sd_s += std_dev(h);
                 lock_s += lk[warm..].iter().filter(|&&x| x).count() as f64 / (n - warm) as f64;

@@ -31,7 +31,10 @@ fn holdover_endpoint_temp_aware() {
         return;
     };
     let env = |k: &str, d: i64| -> i64 {
-        std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
     };
     let (quant, sm, sh, gq8) = (
         env("GNSSDO_TEMP_QUANTIZE", 1).max(1),

@@ -225,7 +225,10 @@ fn i_den_sweep_under_thermal_curvature() {
             }
         }
         let mean = samples.iter().sum::<i64>() as f64 / samples.len() as f64;
-        let sd = (samples.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>()
+        let sd = (samples
+            .iter()
+            .map(|&x| (x as f64 - mean).powi(2))
+            .sum::<f64>()
             / samples.len() as f64)
             .sqrt();
         // 低速 wander の符号反転 (リンギング) 検出: 1-lag 自己相関。0.99 へ寄れば過減衰、負なら発振気味。
@@ -275,11 +278,18 @@ fn model_reproduces_observed_drift() {
     // 観測2: 数十分スケールの warming (加速度あり) → ~µs の excursion (実測 offset② ~2µs / 4.5h ドリフト)。
     let warm = warming(8_000_000.0, 300.0, 600, 60);
     let s_warm_ema = simulate(&warm, ema_only_cfg(), 0, 0);
-    let s_warm_ab = simulate(&warming(8_000_000.0, 300.0, 600, 60), DisciplinedClockConfig::DEFAULT, 0, 0);
+    let s_warm_ab = simulate(
+        &warming(8_000_000.0, 300.0, 600, 60),
+        DisciplinedClockConfig::DEFAULT,
+        0,
+        0,
+    );
     eprintln!(
         "MODEL warming (accel)  : EMA max={}ns tail={}ns | α-β max={}ns tail={}ns  (observed peak ~2000ns)",
-        s_warm_ema.max_abs_phase_ns, s_warm_ema.tail_mean_abs_phase_ns,
-        s_warm_ab.max_abs_phase_ns, s_warm_ab.tail_mean_abs_phase_ns
+        s_warm_ema.max_abs_phase_ns,
+        s_warm_ema.tail_mean_abs_phase_ns,
+        s_warm_ab.max_abs_phase_ns,
+        s_warm_ab.tail_mean_abs_phase_ns
     );
 
     // モデルが観測の桁を再現: 緩いドリフトで O(100ns)、能動 warming のピークで O(µs)。
@@ -298,7 +308,8 @@ fn model_reproduces_observed_drift() {
     assert!(
         s_warm_ab.max_abs_phase_ns < s_warm_ema.max_abs_phase_ns,
         "α-β should reduce the warming peak: ab={}ns ema={}ns",
-        s_warm_ab.max_abs_phase_ns, s_warm_ema.max_abs_phase_ns
+        s_warm_ab.max_abs_phase_ns,
+        s_warm_ema.max_abs_phase_ns
     );
     // 整定後はどちらも ns 級 (warming が止めば offset は戻る)。
     assert!(
@@ -437,5 +448,8 @@ fn replay_real_log_matches_hwphase() {
         sdm > sdr * 0.3 && sdm < sdr * 3.0,
         "model excursion std {sdm:.0} not within 0.3-3x of real {sdr:.0}"
     );
-    assert!(corr > 0.3, "model hwphase weakly correlated with real: corr={corr:.2}");
+    assert!(
+        corr > 0.3,
+        "model hwphase weakly correlated with real: corr={corr:.2}"
+    );
 }
