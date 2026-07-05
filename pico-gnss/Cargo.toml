@@ -4,7 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+description = "RP2040 GPSDO/GNSSDO firmware (embassy): PIO-hardware 1PPS capture, crystal discipline with holdover, and a steered 1PPS output phase-locked to a GNSS receiver's PPS."
+readme = "README.md"
 # `cargo run` picks this without --bin (the src/bin/ examples gpsdo / gpsdo_runner are also bins).
 default-run = "pico-gnss"
 
@@ -25,8 +27,8 @@ external-nmea = ["rp-pps/external-nmea"]
 bench = ["dep:nmea"]
 
 [dependencies]
-gnssdo = { path = "../gnssdo" }
-rp-pps = { path = "../rp-pps", features = ["embassy-rp", "gnssdo"] }
+gnssdo = { version = "0.1.0", path = "../gnssdo" }
+rp-pps = { version = "0.1.0", path = "../rp-pps", features = ["embassy-rp", "gnssdo"] }
 heapless = "0.9.3"
 # The bench bin calls the nmea crate directly; the firmware itself uses rp-pps's built-in parser.
 nmea = { version = "0.7", default-features = false, features = ["RMC"], optional = true }
