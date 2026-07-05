@@ -17,8 +17,29 @@ signal is lost.
 ![pico-gnss hardware](docs/pico-gnss-hardware.jpg)
 
 *The hardware: a Raspberry Pi Pico (RP2040) on a breakout, the Akizuki [AE-GNSS-EXTANT](https://akizukidenshi.com/catalog/g/g113849/)
-(Taiyo Yuden GYSFFMANC, MediaTek MT3333) GNSS module on the ribbon cable, and oscilloscope
+(Taiyo Yuden GYSFFMANC, MediaTek MT3333) GNSS module on jumper wires, and oscilloscope
 probes on the disciplined GP3 1PPS output and the GPS PPS for the phase measurements.*
+
+```mermaid
+flowchart RL
+  subgraph GPSR["GNSS receiver (AE-GNSS-EXTANT)"]
+    R_PPS["1PPS"]
+    R_TX["TX (NMEA)"]
+    R_RX["RX (config)"]
+  end
+  subgraph PICO["Pico (RP2040)"]
+    P_G2["GP2"]
+    P_G1["GP1 (UART RX)"]
+    P_G0["GP0 (UART TX)"]
+    P_G3["GP3"]
+    P_G4["GP4"]
+  end
+  R_PPS --> P_G2
+  R_TX --> P_G1
+  P_G0 --> R_RX
+  P_G3 --> OUT["disciplined 1PPS out"]
+  P_G3 -- "loopback (single wire)" --> P_G4
+```
 
 ![pico-gnss real-time dashboard](docs/dashboard.png)
 

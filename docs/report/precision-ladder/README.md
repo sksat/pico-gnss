@@ -6,7 +6,7 @@ GPS-R からはこの 1PPS のほかに、時刻と測位を載せた NMEA 文�
 今回の構成は以下の通り。GPS-R の PPS と UART を Pico の GPIO で受け、別の GPIO から GPSDO PPS を出力する。
 
 ```mermaid
-flowchart LR
+flowchart RL
   subgraph GPSR["GPS-R (AE-GNSS-EXTANT)"]
     R_PPS["1PPS"]
     R_TX["TX (NMEA)"]
@@ -118,7 +118,28 @@ flowchart LR
   LOOP --> PLL
 ```
 
-追加する配線は 1 本だけで、出力の GP3 を GP4 へ戻す。
+追加する配線は 1 本だけで、出力の GP3 を GP4 へ戻す。冒頭の構成図に loopback を足すと、次のようになる。
+
+```mermaid
+flowchart RL
+  subgraph GPSR["GPS-R (AE-GNSS-EXTANT)"]
+    R_PPS["1PPS"]
+    R_TX["TX (NMEA)"]
+    R_RX["RX (設定)"]
+  end
+  subgraph PICO["Pico (RP2040)"]
+    P_G2["GP2"]
+    P_G1["GP1 (UART RX)"]
+    P_G0["GP0 (UART TX)"]
+    P_G3["GP3"]
+    P_G4["GP4"]
+  end
+  R_PPS --> P_G2
+  R_TX --> P_G1
+  P_G0 --> R_RX
+  P_G3 --> OUT["GPSDO PPS 出力"]
+  P_G3 -- "loopback (1 本のワイヤ)" --> P_G4
+```
 
 ![loopback 接続。出力 GP3 の信号を 1 本のワイヤで GP4 へ戻し、GPS-R と出力の両方のエッジ時刻を PIO で捕まえる](precision-figs/fig-loopback.png)
 
