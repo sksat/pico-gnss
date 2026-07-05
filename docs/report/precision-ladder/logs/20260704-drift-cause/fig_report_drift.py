@@ -18,9 +18,11 @@ for fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",):
         except Exception: pass
 plt.rcParams["font.family"] = "Noto Sans CJK JP"; plt.rcParams["axes.unicode_minus"] = False
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOGS = os.path.dirname(HERE)
-OUT = os.path.join(os.path.dirname(os.path.dirname(HERE)),
-                   "docs", "report", "precision-ladder", "precision-figs")
+REPORT = os.path.dirname(os.path.dirname(HERE))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
+LOGS = os.path.join(ROOT, "logs")  # 生データ群 (gitignore、ローカルのみ)
+DATA = os.path.join(LOGS, "20260704-drift-cause")
+OUT = os.path.join(REPORT, "precision-figs")
 KEXP = re.compile(r"KEXP count=(\d+) gen=\d+ c0=(\d+) c2=(\d+) c3=(\d+) c3n=(\d+)")
 KSH3 = re.compile(r"KSH3 count=(\d+) on=(\d)")
 GREEN, DGREEN, RED, BROWN = "#1a7a1a", "#145914", "#cc3333", "#8a5a00"
@@ -93,9 +95,9 @@ def runmean(y, w=60):
 # ================= fig-inject (上段: 模式図 / 下段: 実測) =================
 def fig_inject():
     from matplotlib.patches import FancyBboxPatch, FancyArrowPatch, Circle
-    rtt = load_hwphase(os.path.join(HERE, "inj-rtt.log"))
+    rtt = load_hwphase(os.path.join(DATA, "inj-rtt.log"))
     t_inj = min((t for t, h, c in rtt if c >= 300))
-    gx, gy = gap_auto_series(os.path.join(HERE, "inj-rtt.log"), os.path.join(HERE, "inj-dense.shots"))
+    gx, gy = gap_auto_series(os.path.join(DATA, "inj-rtt.log"), os.path.join(DATA, "inj-dense.shots"))
     t0 = gx[0]
     xm = [(x - t0) / 60 for x in gx]
     tim = (t_inj - t0) / 60
@@ -188,11 +190,11 @@ def fig_inject():
 def fig_shadow():
     from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
     sh = []
-    for ln in open(os.path.join(HERE, "rtt.log"), errors="replace"):
+    for ln in open(os.path.join(DATA, "rtt.log"), errors="replace"):
         m = re.search(r"^(\d+\.\d+)\s.*KSHADOW count=\d+ k_meas=\d+ k0=\d+ dk=(-?\d+)", ln)
         if m:
             sh.append((float(m.group(1)), int(m.group(2))))
-    gx, gy = gap_auto_series(os.path.join(HERE, "rtt.log"), os.path.join(HERE, "shadow-dense.shots"))
+    gx, gy = gap_auto_series(os.path.join(DATA, "rtt.log"), os.path.join(DATA, "shadow-dense.shots"))
     t0 = sh[0][0]
     gxm = [(t - t0) / 60 for t in gx]
     g_off = st.mean([g for x, g in zip(gxm, gy) if abs(x) < 1.5])
@@ -268,7 +270,7 @@ def fig_shadow():
 def fig_elim():
     # 左: c3gp4 run の c2−c3 (同じ GP4) と gap を同軸で
     kexp = []
-    for ln in open(os.path.join(HERE, "c3gp4-rtt.log"), errors="replace"):
+    for ln in open(os.path.join(DATA, "c3gp4-rtt.log"), errors="replace"):
         m = KEXP.search(ln)
         if m:
             cnt, c0, c2, c3, c3n = (int(m.group(i)) for i in range(1, 6))
@@ -280,7 +282,7 @@ def fig_elim():
     ex = [(c - c00) / 60 for c, _ in kexp]
     ey = [(d - kexp[0][1]) * 16 for _, d in kexp]
     exy = [(x, y) for x, y in zip(ex, ey)]
-    gx, gy = gap_auto_series(os.path.join(HERE, "c3gp4-rtt.log"), os.path.join(HERE, "c3gp4-dense.shots"))
+    gx, gy = gap_auto_series(os.path.join(DATA, "c3gp4-rtt.log"), os.path.join(DATA, "c3gp4-dense.shots"))
     gxm = [(t - gx[0]) / 60 for t in gx]
     # 起動過渡 (ロック整定) を落とし、0 起点は整定後の先頭 1 分で取る
     keep = [i for i in range(len(gxm)) if gxm[i] > 2.0]
@@ -292,7 +294,7 @@ def fig_elim():
     # 右: sh3 run の K03 階段
     kx = {}
     marks = []
-    for ln in open(os.path.join(HERE, "sh3-rtt.log"), errors="replace"):
+    for ln in open(os.path.join(DATA, "sh3-rtt.log"), errors="replace"):
         m = KEXP.search(ln)
         if m:
             kx[int(m.group(1))] = (int(m.group(2)), int(m.group(4)), int(m.group(5)))
@@ -359,7 +361,7 @@ def fig_w900():
     bi = [i for i in range(len(bxm)) if bxm[i] > 3]
     bsl = slope([bxm[i] for i in bi], [by0[i] for i in bi])
     # 揃えた = 出力 high 900 ms (low 100 ms)
-    gx, gy = gap_auto_series(os.path.join(HERE, "w900-rtt.log"), os.path.join(HERE, "w900-dense.shots"))
+    gx, gy = gap_auto_series(os.path.join(DATA, "w900-rtt.log"), os.path.join(DATA, "w900-dense.shots"))
     gxm = [(t - gx[0]) / 60 for t in gx]
     gy0 = [g - st.mean(gy[:60]) for g in gy]
     gi = [i for i in range(len(gxm)) if gxm[i] > 3]
@@ -374,7 +376,7 @@ def fig_w900():
     ax.plot(gxm, runmean(gy0, 45), "-", color=DGREEN, lw=2,
             label=f"low を GPS-R と同じ 100 ms に (high 900 ms): {gsl:+.2f} ns/min")
     # 対称化プログラム版 (幅 100 ms のまま、0 跨ぎを両ループ 3 cycle に)
-    wbr = os.path.join(HERE, "wb-rtt.log"); wbs = os.path.join(HERE, "wb-dense.shots")
+    wbr = os.path.join(DATA, "wb-rtt.log"); wbs = os.path.join(DATA, "wb-dense.shots")
     if os.path.exists(wbs) and sum(1 for _ in open(wbs)) > 600:
         wx, wy = gap_auto_series(wbr, wbs)
         wxm0 = [(t - wx[0]) / 60 for t in wx]

@@ -9,7 +9,11 @@ for fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc","/usr/share/fonts
         try: font_manager.fontManager.addfont(fp)
         except: pass
 plt.rcParams["font.family"]="Noto Sans CJK JP"; plt.rcParams["axes.unicode_minus"]=False
-LOG=os.path.dirname(os.path.abspath(__file__)); OUT=os.path.join(os.path.dirname(os.path.dirname(LOG)),"docs","report","precision-ladder","precision-figs")
+HERE=os.path.dirname(os.path.abspath(__file__))
+REPORT=os.path.dirname(os.path.dirname(HERE))
+ROOT=os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
+LOG=os.path.join(ROOT,"logs","precision-rework")  # 生データ (gitignore、ローカルのみ)
+OUT=os.path.join(REPORT,"precision-figs")
 
 def rows(p,line,warm=5):
     out=[]

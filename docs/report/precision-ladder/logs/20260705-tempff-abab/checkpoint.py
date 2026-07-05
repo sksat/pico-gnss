@@ -6,7 +6,9 @@ usage: RIGOL_HOST=... uv run --python 3.12 --with python-vxi11 python3 checkpoin
 """
 import os, sys, time, statistics as st
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "..", "..", "scripts"))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(HERE)))))
+DATA = os.path.join(ROOT, "logs", "20260705-tempff-abab")  # 計測データの置き場 (gitignore、ローカルのみ)
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
 if os.environ.get("SCOPE_TRANSPORT") == "raw":
     from rigol_raw import RigolRaw as RigolVxi11  # VXI-11 read 死亡時のフォールバック
 else:
@@ -78,9 +80,9 @@ def main():
             fails += 1
         else:
             offs.append(v)
-            with open(os.path.join(HERE, f"{tag}.shots"), "a") as f:
+            with open(os.path.join(DATA, f"{tag}.shots"), "a") as f:
                 f.write(f"{time.time():.1f} {v:.1f}\n")
-    png = os.path.join(HERE, f"{tag}.png")
+    png = os.path.join(DATA, f"{tag}.png")
     try:
         r.screenshot(png)
     except Exception as e:
@@ -90,7 +92,7 @@ def main():
     line = (f"{time.strftime('%H:%M:%S')} {tag} n={len(offs)}/{n + fails} xinc={xinc_ns:.2f}ns "
             f"mean={m:+.1f}ns sigma={s:.1f}ns min={min(offs):+.1f} max={max(offs):+.1f}" if offs
             else f"{time.strftime('%H:%M:%S')} {tag} NO DATA (fails={fails})")
-    with open(os.path.join(HERE, "results.txt"), "a") as f:
+    with open(os.path.join(DATA, "results.txt"), "a") as f:
         f.write(line + "\n")
     print(line)
     # 合間は RUN (NORMal) に戻して画面をライブに保つ (次の checkpoint の setup が SINGle に戻す)

@@ -15,11 +15,13 @@ for fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",):
 plt.rcParams["font.family"] = "Noto Sans CJK JP"; plt.rcParams["axes.unicode_minus"] = False
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-OUT = os.path.join(ROOT, "docs", "report", "precision-ladder", "precision-figs")
+REPORT = os.path.dirname(os.path.dirname(HERE))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
+DATA = os.path.join(ROOT, "logs", "20260703-naive-boots")  # 生データ (gitignore、ローカルのみ)
+OUT = os.path.join(REPORT, "precision-figs")
 
 pooled = []
-for p in sorted(glob.glob(os.path.join(HERE, "boot*.log"))):
+for p in sorted(glob.glob(os.path.join(DATA, "boot*.log"))):
     dv = []
     for ln in open(p, errors="replace"):
         if "PPSGEN count=" not in ln:

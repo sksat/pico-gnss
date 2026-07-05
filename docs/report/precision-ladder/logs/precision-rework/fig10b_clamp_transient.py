@@ -23,14 +23,16 @@ plt.rcParams["font.family"] = "Noto Sans CJK JP"
 plt.rcParams["axes.unicode_minus"] = False
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(os.path.dirname(os.path.dirname(HERE)),
-                   "docs", "report", "precision-ladder", "precision-figs")
+REPORT = os.path.dirname(os.path.dirname(HERE))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
+DATA = os.path.join(ROOT, "logs", "precision-rework")  # 生データ (gitignore、ローカルのみ)
+OUT = os.path.join(REPORT, "precision-figs")
 PAT = re.compile(r"count=(\d+) .*hwphase_ns=(-?\d+)")
 
 
 def series(path, c_base, c_lo, c_hi):
     out = []
-    for ln in open(os.path.join(HERE, path), errors="replace"):
+    for ln in open(path, errors="replace"):
         m = PAT.search(ln)
         if m:
             c = int(m.group(1))
@@ -39,9 +41,9 @@ def series(path, c_base, c_lo, c_hi):
     return out
 
 
-unc = series("s5/stage5-heat.log", 268, 268 - 15, 268 + 75)
+unc = series(os.path.join(DATA, "s5/stage5-heat.log"), 268, 268 - 15, 268 + 75)
 # あり側は加熱を連打した中の 1 発 (c442)。直前ステップの残りが入らないよう窓は −5s から
-cl = series("s5/clamped-heat.log", 442, 442 - 5, 442 + 75)
+cl = series(os.path.join(DATA, "s5/clamped-heat.log"), 442, 442 - 5, 442 + 75)
 
 fig, (ax, axz) = plt.subplots(1, 2, figsize=(11.4, 4.6),
                               gridspec_kw={"width_ratios": [1.25, 1], "wspace": 0.22})

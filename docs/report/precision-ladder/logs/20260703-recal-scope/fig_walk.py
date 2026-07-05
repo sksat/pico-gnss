@@ -13,8 +13,10 @@ for fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",):
         except Exception: pass
 plt.rcParams["font.family"] = "Noto Sans CJK JP"; plt.rcParams["axes.unicode_minus"] = False
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-OUT = os.path.join(ROOT, "docs", "report", "precision-ladder", "precision-figs")
+REPORT = os.path.dirname(os.path.dirname(HERE))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
+DATA = os.path.join(ROOT, "logs", "20260703-recal-scope")  # 生データ (gitignore、ローカルのみ)
+OUT = os.path.join(REPORT, "precision-figs")
 
 def wall(hms):
     return time.mktime(time.strptime(f"2026-07-03 {hms}", "%Y-%m-%d %H:%M:%S"))
@@ -35,10 +37,10 @@ fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 4.4), sharey=True)
 
 # ---------- 左: stage-3 (起動時校正のみ) ----------
 BOOT3 = wall("09:17:10")
-rtt3 = load_rtt(os.path.join(HERE, "stage3-rtt.log"))
+rtt3 = load_rtt(os.path.join(DATA, "stage3-rtt.log"))
 pts = []
 for tag, bad in [("s3-t000", 0), ("s3-t020", 0), ("s3-t040", 0), ("s3-t060", 0), ("s3-t080", 0), ("s3-t100", 1)]:
-    shots = [(float(a), float(b)) for a, b in (ln.split() for ln in open(os.path.join(HERE, f"{tag}.shots")))]
+    shots = [(float(a), float(b)) for a, b in (ln.split() for ln in open(os.path.join(DATA, f"{tag}.shots")))]
     good = [v for _, v in shots if abs(v) < 450]
     w0, w1 = min(t for t, _ in shots), max(t for t, _ in shots)
     inner = [h for ts, h in rtt3 if w0 <= BOOT3 + ts <= w1]
@@ -65,9 +67,9 @@ ax1.grid(ls=":", alpha=0.4)
 
 # ---------- 右: stage-5 (recal あり、連続) ----------
 BOOT5 = wall("10:57:30")
-rtt5 = load_rtt(os.path.join(HERE, "stage5-rtt.log"))
+rtt5 = load_rtt(os.path.join(DATA, "stage5-rtt.log"))
 rtt5_w = [(BOOT5 + ts, h) for ts, h in rtt5]
-shots5 = [(float(a), float(b)) for a, b in (ln.split() for ln in open(os.path.join(HERE, "s5-dense.shots")))]
+shots5 = [(float(a), float(b)) for a, b in (ln.split() for ln in open(os.path.join(DATA, "s5-dense.shots")))]
 t0d = shots5[0][0]
 gx, gy = [], []
 j = 0
@@ -77,7 +79,7 @@ for t, v in shots5:
     if abs(rtt5_w[j][0] - t) <= 2.5:
         gx.append((t - t0d) / 60); gy.append(v - rtt5_w[j][1])
 recals = [BOOT5 + float(m.group(1)) for m in
-          (re.match(r"^(\d+\.\d+)\s", ln) for ln in open(os.path.join(HERE, "stage5-rtt.log"), errors="replace")
+          (re.match(r"^(\d+\.\d+)\s", ln) for ln in open(os.path.join(DATA, "stage5-rtt.log"), errors="replace")
            if "PHASE_K recal OK" in ln) if m]
 first = True
 for rt in recals:

@@ -10,7 +10,9 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(HERE, "..", "..", "scripts")
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(HERE)))))
+DATA = os.path.join(ROOT, "logs", "20260705-tempff-abab")  # 計測データの置き場 (gitignore、ローカルのみ)
+SCRIPTS = os.path.join(ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 sys.path.insert(0, HERE)
 if os.environ.get("SCOPE_TRANSPORT") == "raw":
@@ -53,11 +55,11 @@ def main():
     t_end = t_start + dur
     next_shot_png = t_start  # 開始直後に 1 枚
     n_ok = n_fail = n_scr = 0
-    out = os.path.join(HERE, f"{tag}.shots")
+    out = os.path.join(DATA, f"{tag}.shots")
     while time.time() < t_end:
         if time.time() >= next_shot_png:
             try:
-                png = os.path.join(HERE, f"scr-{int((time.time()-t_start)/60 + scr_off):04d}min.png")
+                png = os.path.join(DATA, f"scr-{int((time.time()-t_start)/60 + scr_off):04d}min.png")
                 r, xinc_ns = take_screenshot(r, png)
                 n_scr += 1
                 print(f"screenshot {png} ({n_scr})", flush=True)

@@ -9,7 +9,11 @@ for fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc","/usr/share/fonts
         try: font_manager.fontManager.addfont(fp)
         except: pass
 plt.rcParams["font.family"]="Noto Sans CJK JP"; plt.rcParams["axes.unicode_minus"]=False
-LOG=os.path.dirname(os.path.abspath(__file__)); OUT=os.path.join(os.path.dirname(os.path.dirname(LOG)),"docs","report","precision-ladder","precision-figs")
+HERE=os.path.dirname(os.path.abspath(__file__))
+REPORT=os.path.dirname(os.path.dirname(HERE))
+ROOT=os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
+LOG=os.path.join(ROOT,"logs","precision-rework")  # 生データ (gitignore、ローカルのみ)
+OUT=os.path.join(REPORT,"precision-figs")
 def rows(p,line="PPS count=",warm=5):
     out=[]
     for ln in open(os.path.join(LOG,p),errors="replace"):
@@ -39,7 +43,7 @@ ax.set_xlabel("経過 [秒]"); ax.set_ylabel("隣り合う GPS 周期の差 [ns]
 fig.tight_layout(); fig.savefig(os.path.join(OUT,"fig-pio-alone.png"),dpi=110); plt.close(fig)
 
 # PLL 単体: ロックしたあとの長時間 (~16分) の出力位相。位相0線つきで「ロック保持」を見せる
-NEWLOG=os.path.join(os.path.dirname(LOG),"20260630-precision-recap","S3-pll-long.log")
+NEWLOG=os.path.join(ROOT,"logs","20260630-precision-recap","S3-pll-long.log")
 lk=[d for d in rows_from(NEWLOG,"PPSGEN count=",0) if d.get("lk")==1 and abs(d.get("hwphase_ns",9e9))<5000]
 lk=[d for d in lk if d["count"]>=lk[0]["count"]+120]  # 整定の谷を落とし、ロック保持だけ見せる
 c=[d["count"] for d in lk]; hw=[d["hwphase_ns"] for d in lk]; t0=c[0]

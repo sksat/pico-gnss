@@ -19,9 +19,11 @@ for _fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
 plt.rcParams["font.family"] = "Noto Sans CJK JP"
 plt.rcParams["axes.unicode_minus"] = False
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPORT = os.path.dirname(os.path.dirname(HERE))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
 LOG = os.path.join(ROOT, "logs", "precision-rework")
-OUT = os.path.join(ROOT, "docs", "report", "precision-ladder", "precision-figs")
+OUT = os.path.join(REPORT, "precision-figs")
 os.makedirs(OUT, exist_ok=True)
 
 def rows(path, warm=0):

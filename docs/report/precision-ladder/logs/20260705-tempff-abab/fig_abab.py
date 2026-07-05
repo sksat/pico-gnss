@@ -24,8 +24,10 @@ plt.rcParams["font.family"] = "Noto Sans CJK JP"
 plt.rcParams["axes.unicode_minus"] = False
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(os.path.dirname(os.path.dirname(HERE)),
-                   "docs", "report", "precision-ladder", "precision-figs")
+REPORT = os.path.dirname(os.path.dirname(HERE))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
+DATA = os.path.join(ROOT, "logs", "20260705-tempff-abab")  # 生データ (gitignore、ローカルのみ)
+OUT = os.path.join(REPORT, "precision-figs")
 SETTLE = 300  # 切替後の整定として捨てる秒数
 
 PPS = re.compile(r"count=(\d+) .*hwphase_ns=(-?\d+).*lk=(\d).*temp_raw=(\d+)")
@@ -33,7 +35,7 @@ TFF = re.compile(r"TFFAB count=(\d+) temp_ff=(\d)")
 
 rows = []     # (count, hwphase, temp_raw)
 bounds = []   # (count, new_state)
-for line in open(os.path.join(HERE, "rtt.log"), errors="replace"):
+for line in open(os.path.join(DATA, "rtt.log"), errors="replace"):
     m = TFF.search(line)
     if m:
         bounds.append((int(m.group(1)), int(m.group(2))))
@@ -49,9 +51,9 @@ segs = [(s, c0, (edges[i + 1][0] if i + 1 < len(edges) else c_last + 1))
         for i, (c0, s) in enumerate(edges)]
 
 # オシロ shots: epoch → count へ (rtt.log の mtime と最終 count を錨にする)
-anchor_epoch = os.path.getmtime(os.path.join(HERE, "rtt.log"))
+anchor_epoch = os.path.getmtime(os.path.join(DATA, "rtt.log"))
 shots = []    # (count 相当, ns)
-for line in open(os.path.join(HERE, "abab.shots")):
+for line in open(os.path.join(DATA, "abab.shots")):
     t, v = line.split()
     shots.append((float(t) - anchor_epoch + c_last, float(v)))
 

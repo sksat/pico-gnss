@@ -18,8 +18,10 @@ for fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",):
         except Exception: pass
 plt.rcParams["font.family"] = "Noto Sans CJK JP"; plt.rcParams["axes.unicode_minus"] = False
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(os.path.dirname(os.path.dirname(HERE)),
-                   "docs", "report", "precision-ladder", "precision-figs")
+REPORT = os.path.dirname(os.path.dirname(HERE))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
+DATA = os.path.join(ROOT, "logs", "20260704-drift-cause")  # 生データ (gitignore、ローカルのみ)
+OUT = os.path.join(REPORT, "precision-figs")
 KEXP = re.compile(r"KEXP count=(\d+) gen=\d+ c0=(\d+) c2=(\d+) c3=(\d+) c3n=(\d+)")
 P = 4294967296 * 16e-9  # 一周の理論周期 [s]
 
@@ -30,7 +32,7 @@ def f32(u):
 
 
 rows = []
-for ln in open(os.path.join(HERE, "c3gp4-rtt.log"), errors="replace"):
+for ln in open(os.path.join(DATA, "c3gp4-rtt.log"), errors="replace"):
     m = KEXP.search(ln)
     if m:
         cnt, c0, c2, c3, c3n = (int(m.group(i)) for i in range(1, 6))

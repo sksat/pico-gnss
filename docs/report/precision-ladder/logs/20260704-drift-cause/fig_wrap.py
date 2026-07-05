@@ -15,8 +15,7 @@ for fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",):
         try: font_manager.fontManager.addfont(fp)
         except Exception: pass
 plt.rcParams["font.family"] = "Noto Sans CJK JP"; plt.rcParams["axes.unicode_minus"] = False
-OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                   "docs", "report", "precision-ladder", "precision-figs")
+OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "precision-figs")
 
 fig = plt.figure(figsize=(10.6, 10.4))
 gs = fig.add_gridspec(2, 1, height_ratios=[7.3, 4.6], hspace=0.12)

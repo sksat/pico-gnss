@@ -18,7 +18,10 @@ for fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",):
         except Exception: pass
 plt.rcParams["font.family"] = "Noto Sans CJK JP"; plt.rcParams["axes.unicode_minus"] = False
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOGS = os.path.dirname(HERE)
+REPORT = os.path.dirname(os.path.dirname(HERE))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
+LOGS = os.path.join(ROOT, "logs")  # 生データ群 (gitignore、ローカルのみ)
+DATA = os.path.join(LOGS, "20260704-jmppin-fix")
 OUT = os.path.join(LOGS, "..", "docs", "report", "precision-ladder", "precision-figs")
 RECAL = os.path.join(LOGS, "20260703-recal-scope")
 NOREC = os.path.join(LOGS, "20260704-fix-norecal")
@@ -115,7 +118,7 @@ BOOT5 = wall("10:57:30")
 rtt5_w = [(BOOT5 + t, h) for t, h in load_rtt(os.path.join(RECAL, "stage5-rtt.log"))]
 gx5, gy5 = gap_dense(shots(os.path.join(RECAL, "s5-dense.shots")), rtt5_w)
 x5 = [(t - gx5[0]) / 60 for t in gx5]
-gxf, gyf = gap_auto(shots(os.path.join(HERE, "fix-dense.shots")), load_rtt(os.path.join(HERE, "rtt.log")))
+gxf, gyf = gap_auto(shots(os.path.join(DATA, "fix-dense.shots")), load_rtt(os.path.join(DATA, "rtt.log")))
 xf = [(t - gxf[0]) / 60 for t in gxf]
 m5, mf = st.mean(gy5), st.mean(gyf)
 ax2.axhline(0, color="#ccc", lw=0.8)

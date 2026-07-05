@@ -19,7 +19,10 @@ for _fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
 plt.rcParams["font.family"] = "Noto Sans CJK JP"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOGS = os.path.dirname(HERE)
+REPORT = os.path.dirname(os.path.dirname(HERE))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
+LOGS = os.path.join(ROOT, "logs")  # 生データ群 (gitignore、ローカルのみ)
+DATA = os.path.join(LOGS, "20260704-jmppin-fix")
 FIGS = os.path.join(LOGS, "..", "docs", "report", "precision-ladder", "precision-figs")
 
 KEXP = re.compile(r"KEXP count=(\d+) gen=\d+ c0=(\d+) c2=(\d+) c3=(\d+) c3n=(\d+)")

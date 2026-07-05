@@ -15,8 +15,7 @@ for fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",):
         try: font_manager.fontManager.addfont(fp)
         except Exception: pass
 plt.rcParams["font.family"] = "Noto Sans CJK JP"; plt.rcParams["axes.unicode_minus"] = False
-OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                   "docs", "report", "precision-ladder", "precision-figs")
+OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "precision-figs")
 
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10.2, 7.4),
                                gridspec_kw={"height_ratios": [1.05, 0.95]})
@@ -77,7 +76,7 @@ _KEXP = re.compile(r"KEXP count=(\d+) gen=\d+ c0=(\d+) c2=\d+ c3=(\d+) c3n=(\d+)
 def _f32(u):
     u &= 0xFFFFFFFF
     return u - (1 << 32) if u >= (1 << 31) else u
-_KLOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+_KLOG = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))), "logs",
                      "20260703-kexp", "kexp-run.log")
 tm, kz, s3, _c0 = [], [], [], None
 for _line in open(_KLOG, errors="replace"):

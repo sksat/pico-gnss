@@ -12,8 +12,10 @@ for fp in ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",):
         except: pass
 plt.rcParams["font.family"]="Noto Sans CJK JP"; plt.rcParams["axes.unicode_minus"]=False
 HERE=os.path.dirname(os.path.abspath(__file__))
-OUT=os.path.join(os.path.dirname(os.path.dirname(HERE)),"docs","report","precision-ladder","precision-figs")
-LOG=os.path.join(os.path.dirname(HERE),"20260630-precision-recap","S1-warm-dither.log")
+REPORT=os.path.dirname(os.path.dirname(HERE))
+ROOT=os.path.dirname(os.path.dirname(os.path.dirname(REPORT)))
+OUT=os.path.join(REPORT,"precision-figs")
+LOG=os.path.join(ROOT,"logs","20260630-precision-recap","S1-warm-dither.log")
 
 d=[];c=[]
 for ln in open(LOG,errors="replace"):

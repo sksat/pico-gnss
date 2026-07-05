@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate fig7/8/9 (温度FF figures) from heat logs, best-effort.
 Labels use 「loopback 位相」「温度FF」; no 'hwphase' / 'temp-FF'."""
-import re, statistics as st
+import os, re, statistics as st
 import matplotlib
 matplotlib.use('Agg')
 from matplotlib import font_manager
@@ -13,7 +13,7 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 import matplotlib.pyplot as plt
 
 OUT = '/home/sksat/prog/pico-gnss-rs/.claude/worktrees/review-precision/docs/report/precision-ladder/precision-figs'
-S5 = 'logs/precision-rework/s5'
+S5 = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))), 'logs', 'precision-rework', 's5')
 
 def temp_c(raw):
     return 27 - ((raw/256)*3.3/4096 - 0.706)/0.001721
@@ -199,10 +199,10 @@ ax.annotate('', xy=(2.62, med_c), xytext=(2.62, med_u),
 ax.text(2.68, (med_u*med_c)**0.5, f'中央値で ~{r_med:.1f}倍\n(worst では ~{r_worst:.0f}倍)',
         va='center', ha='left', fontsize=10,
         bbox=dict(boxstyle='round', fc='#fdf6e3', ec='0.5', alpha=0.95))
-ax.set_xticks([1,2]); ax.set_xticklabels(['clamp なし','clamp あり'])
+ax.set_xticks([1,2]); ax.set_xticklabels(['リミッタなし','リミッタあり'])
 ax.set_xlim(0.45, 3.4); ax.set_ylim(150, 14000)
 ax.set_ylabel('加熱過渡の peak loopback 位相/℃ [ns/℃] (対数軸)')
-ax.set_title('±100 ppb の clamp による加熱過渡の変化')
+ax.set_title('±100 ppb リミッタによる加熱過渡の変化')
 fig.tight_layout(); fig.savefig(f'{OUT}/fig10-clamp-ab.png', dpi=120); plt.close(fig)
 print(f"FIG10: unclamped(stage5-heat) n={len(unc)} peak/C={[round(v) for v in sorted(unc)]} "
       f"med={med_u:.1f} worst={worst_u:.1f}")
