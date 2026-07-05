@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fig11-tempff-abab: 温度フィードフォワードだけを 30 分ごとに on/off 交互切替した
-夜通し運転の可視化。上: firmware の loopback 位相 + 基板温度、下: オシロ実測
-(GPS-R PPS vs 出力エッジ差)。セグメントごとの σ を帯の上に注記する。
+夜通し運転の可視化。上: firmware の loopback 位相 + 基板温度、中: オシロ実測
+(GPS-R PPS vs 出力エッジ差)、下: 区間 (30 分の切替のひとまとまり) ごとの σ。
 各セグメント冒頭 5 分は切替の整定として統計から除外する。温度は RP2040 内蔵センサを ℃ に換算。
 usage: uv run --with matplotlib python3 logs/20260705-tempff-abab/fig_abab.py
 """
@@ -84,10 +84,11 @@ sc_segs = seg_stats(shots)
 def temp_c(raw):
     return 27 - ((raw / 256) * 3.3 / 4096 - 0.706) / 0.001721
 
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 6.8), sharex=True,
-                               gridspec_kw={"hspace": 0.14})
+fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11, 8.2), sharex=True,
+                                    gridspec_kw={"hspace": 0.15,
+                                                 "height_ratios": [3, 3, 1.9]})
 h0 = c_first
-YLIM = 640  # σ 注記の行のぶん上に余白を取る
+YLIM = 560  # あり/なし ラベルの行のぶん上に余白を取る
 
 def shade(ax):
     for s, c0, c1 in segs:
@@ -97,11 +98,8 @@ def shade(ax):
 def annotate(ax, seg_list):
     for s, c0, c1, vals in seg_list:
         x = ((c0 + c1) / 2 - h0) / 3600
-        ax.text(x, 615, "あり" if s else "なし",
+        ax.text(x, 528, "あり" if s else "なし",
                 ha="center", va="top", fontsize=8.5, fontweight="bold",
-                color=("#1e7a2e" if s else "#a83226"))
-        ax.text(x, 500, f"σ {st.pstdev(vals):.0f}",
-                ha="center", va="top", fontsize=8.5,
                 color=("#1e7a2e" if s else "#a83226"))
 
 # 上段: loopback 位相 + 温度
@@ -112,7 +110,7 @@ ax1.axhline(0, color="gray", lw=0.5)
 ax1.set_ylabel("loopback 位相 [ns]")
 ax1.set_ylim(-YLIM, YLIM)
 ax1.set_yticks(range(-400, 401, 200))
-annotate(ax1, hw_segs)
+annotate(ax1, hw_segs)  # あり/なし の帯ラベルは最上段だけに置く
 axt = ax1.twinx()
 t_step = max(1, len(rows) // 2000)
 axt.plot(xs[::t_step], [temp_c(t) for _, _, t in rows][::t_step],
@@ -127,10 +125,29 @@ ax2.plot(xs2, [v for _, v in shots], ".", ms=1.2, color="#444444", alpha=0.45)
 shade(ax2)
 ax2.axhline(0, color="gray", lw=0.5)
 ax2.set_ylabel("オシロ実測 出力−GPS-R [ns]")
-ax2.set_xlabel("経過時間 [h]")
 ax2.set_ylim(-YLIM, YLIM)
 ax2.set_yticks(range(-400, 401, 200))
-annotate(ax2, sc_segs)
+
+# 下段: 区間ごとの σ。切替のたびに下がる/戻るが一目で見えるように棒で並べる
+shade(ax3)
+for s3, c0, c1, vals in sc_segs:
+    x0, x1 = (c0 - h0) / 3600, (c1 - h0) / 3600
+    ax3.bar((x0 + x1) / 2, st.pstdev(vals), width=(x1 - x0) * 0.86,
+            color=("#2a9d3a" if s3 else "#c0392b"), alpha=0.65, lw=0,
+            label="_")
+hw_pts = [(((c0 + c1) / 2 - h0) / 3600, st.pstdev(vals)) for _, c0, c1, vals in hw_segs]
+ax3.plot([x for x, _ in hw_pts], [y for _, y in hw_pts], "o-", ms=4.5, lw=0.9,
+         color="#222222", alpha=0.8)
+from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
+ax3.legend(handles=[Patch(color="#2a9d3a", alpha=0.65, label="オシロ実測 (あり)"),
+                    Patch(color="#c0392b", alpha=0.65, label="オシロ実測 (なし)"),
+                    Line2D([], [], marker="o", ms=4.5, lw=0.9, color="#222222",
+                           label="loopback 位相")],
+           loc="upper right", fontsize=8, ncols=3)
+ax3.set_ylabel("区間ごとの σ [ns]")
+ax3.set_xlabel("経過時間 [h]")
+ax3.set_ylim(0, 200)
 # 取得の穴 (scope 復旧作業) を正直に注記する。近接する穴は 1 つに束ねる
 raw_gaps = [(a, b) for (a, _), (b, _) in zip(shots, shots[1:]) if b - a > 240]
 gaps = []
