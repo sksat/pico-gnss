@@ -204,16 +204,17 @@ def _pick_sdiv(off_ns):
     return LADDER[-1] * 1e-9
 
 def _step_toward(cur_s, tgt_s):
-    """Move the timebase by at most ONE ladder notch toward the target, so the GIF zooms
-    gradually instead of jumping decades per frame."""
+    """Move the timebase toward the target along the ladder: one notch when close, two when
+    the target is >=3 notches away. Gradual zoom for the GIF, but without spending many
+    frames (each scale change costs ~1.1 s of trigger settle) crossing decades."""
     def idx(s):
         ns = s * 1e9
         return min(range(len(LADDER)), key=lambda i: abs(LADDER[i] - ns))
     ci, ti = idx(cur_s), idx(tgt_s)
-    if ti > ci:
-        ci += 1
-    elif ti < ci:
-        ci -= 1
+    d = ti - ci
+    if d:
+        step = 2 if abs(d) >= 3 else 1
+        ci += step if d > 0 else -step
     return LADDER[ci] * 1e-9
 
 

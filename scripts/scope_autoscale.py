@@ -21,7 +21,12 @@ import statistics
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from scope_pps import Rigol, rising_edge
+from scope_pps import rising_edge
+
+if os.environ.get("SCOPE_TRANSPORT") == "raw":
+    from rigol_raw import RigolRaw as Rigol  # lazy-flush 耐性の raw 5555 (VXI-11 死亡時)
+else:
+    from scope_pps import Rigol
 
 # 物理結線に合わせた既定 setup。CH1=GPS 直結(1×), CH2=gen を 10× プローブ。
 # 縦は 0->3.3V が画面に収まる 0.6V/div・offset -2.1V(scope_pps.CAPTURE_SETUP と同条件)。
