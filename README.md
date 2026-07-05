@@ -22,7 +22,7 @@ probes on the disciplined GP3 1PPS output and the GPS PPS for the phase measurem
 
 ![pico-gnss real-time dashboard](docs/dashboard.png)
 
-*Real-time web dashboard (`webapp/`): GPSDO-disciplined UTC, PPS jitter, frequency
+*Real-time web dashboard (`webapp/`): GPSDO/GNSSDO-disciplined UTC, PPS jitter, frequency
 discipline & holdover, sky plot / C/N₀, and the position fix. (Location masked for
 privacy — the dashboard has a built-in privacy mode that hides coordinates, the map
 marker and the NMEA lat/lon.)*
@@ -68,7 +68,7 @@ built from within `pico-gnss/` (where its `.cargo/config.toml` selects the
 Generated from a real on-device log (~227 s)
 with `uv run webapp/plot_report.py`:
 
-- **A** — the GPSDO learns the crystal drift (~+2.5 ppm) at boot and then holds it at the
+- **A** — the GPSDO/GNSSDO learns the crystal drift (~+2.5 ppm) at boot and then holds it at the
   ppb level, which is what enables holdover.
 - **B** — time-correction residual σ ≈ tens of ns, **inside the receiver's ±10 ns 1PPS spec**.
 - **C** — PPS jitter fits within a few 16 ns capture-quantization steps (PIO hardware capture,
@@ -96,6 +96,6 @@ The whole pull-in from boot, one frame per PPS: the output PPS converging onto t
 (top, auto-zooming scope) alongside the firmware's internal state — offset/hwphase, time
 error, crystal ppb, and temperature with its feed-forward contribution:
 
-![GPSDO pull-in from boot — scope + parameters, per-PPS](docs/report/precision-ladder/precision-figs/combo-gpsdo-fromboot.gif)
+![GPSDO/GNSSDO pull-in from boot — scope + parameters, per-PPS](docs/report/precision-ladder/precision-figs/combo-gpsdo-fromboot.gif)
 
 See [`docs/report/precision-ladder/README.md`](docs/report/precision-ladder/README.md) for the full methodology and figures (Japanese).
