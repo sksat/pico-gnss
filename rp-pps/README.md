@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/rp-pps.svg)](https://crates.io/crates/rp-pps)
 [![docs.rs](https://img.shields.io/docsrs/rp-pps)](https://docs.rs/rp-pps)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/sksat/pico-gnss-rs/blob/main/LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/sksat/pico-gnss/blob/main/LICENSE)
 
 RP2040 / RP2350 **PIO building blocks for a GNSS 1PPS timebase**, plus NMEA time
 ingestion. The device/receiver-facing companion to
@@ -12,6 +12,8 @@ those inputs on the RP2040 — it hardware-timestamps the PPS edge on the PIO
 (~16 ns, free of the µs-scale jitter a software GPIO interrupt has on a Cortex-M0+),
 emits a steerable 1PPS, and decodes the receiver's NMEA to pair each edge with its
 UTC second.
+
+![loopback wiring: both the GPS-R PPS edge and the disciplined output edge are timestamped by PIO; their difference is the loopback phase](https://raw.githubusercontent.com/sksat/pico-gnss/main/docs/report/precision-ladder/precision-figs/fig-loopback-en.png)
 
 ## What it provides
 
@@ -65,7 +67,7 @@ let utc_ns = CLOCK.lock(|g| g.borrow().now_from_query_ns(now_ns()));
 ```
 
 See the `gpsdo` (drive `PpsGpsdo` by hand) and `gpsdo_runner` (spawn the runners)
-examples in the [repository](https://github.com/sksat/pico-gnss-rs).
+examples in the [repository](https://github.com/sksat/pico-gnss).
 
 ## Cargo features
 

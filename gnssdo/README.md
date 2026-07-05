@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/gnssdo.svg)](https://crates.io/crates/gnssdo)
 [![docs.rs](https://img.shields.io/docsrs/gnssdo)](https://docs.rs/gnssdo)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/sksat/pico-gnss-rs/blob/main/LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/sksat/pico-gnss/blob/main/LICENSE)
 
 `no_std`, HAL-agnostic **GNSS PPS disciplined clock & holdover core** (a GPSDO /
 GNSSDO — GNSS-disciplined oscillator — building block). Integer-only,

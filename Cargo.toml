@@ -10,7 +10,7 @@ default-members = ["gnssdo", "rp-pps"]
 edition = "2024"
 rust-version = "1.87"
 license = "MIT"
-repository = "https://github.com/sksat/pico-gnss-rs"
+repository = "https://github.com/sksat/pico-gnss"
 
 # rp-pps depends on `gnssdo` by version (a normal crates.io dep in its published manifest); for
 # local development this redirects that dep to the in-tree copy, so workspace changes to gnssdo are
