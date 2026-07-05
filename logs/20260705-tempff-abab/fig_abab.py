@@ -55,6 +55,19 @@ for line in open(os.path.join(HERE, "abab.shots")):
     t, v = line.split()
     shots.append((float(t) - anchor_epoch + c_last, float(v)))
 
+# 序盤にオシロ復旧の取得の穴があるので、穴のあとの最初のセグメント境界から先だけを
+# 図と統計に使う (両計器を同じ窓でそろえ、部分区間も作らない)
+CUT_AFTER_GAP = True
+if CUT_AFTER_GAP:
+    gap_ends = [b for (a, _), (b, _) in zip(shots, shots[1:]) if b - a > 240]
+    if gap_ends:
+        cut = min(c0 for _, c0, _ in segs if c0 >= max(gap_ends))
+        segs = [(s, c0, c1) for s, c0, c1 in segs if c0 >= cut]
+        rows = [r for r in rows if r[0] >= cut]
+        shots = [p for p in shots if p[0] >= cut]
+        c_first = cut
+
+
 def seg_stats(data):
     """data: (count, value) の列 → セグメントごとの (state, c0, c1, vals)"""
     out = []
