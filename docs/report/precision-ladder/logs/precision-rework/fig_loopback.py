@@ -34,7 +34,7 @@ ax.text(8.3, 3.26, "GP3", ha="center", va="top", fontsize=10, color="#446")
 
 # PIO ブロック: 独立した 3 つの小さなプログラム (SM) を走らせる
 ax.add_patch(FancyBboxPatch((5.0, 1.25), 3.0, 2.75, boxstyle="round,pad=0.05", fc="#f0f7f0", ec="#2a7d2a", lw=1.3))
-ax.text(6.5, 3.78, "PIO (独立した 3 つの小さなプログラム)", ha="center", va="center", fontsize=9.5, color="#2a7d2a")
+ax.text(6.5, 3.78, "PIO", ha="center", va="center", fontsize=9.5, color="#2a7d2a")
 for (bx0, by0, bw, lab) in ((5.2, 2.75, 1.45, "エッジ捕捉\n(GPS-R 用)"), (5.2, 1.45, 1.45, "エッジ捕捉\n(loopback 用)"), (6.83, 2.75, 1.12, "GPSDO PPS\n出力生成")):
     ax.add_patch(FancyBboxPatch((bx0, by0), bw, 0.85, boxstyle="round,pad=0.04", fc="#e4f2e4", ec="#2a7d2a", lw=1.1))
     ax.text(bx0 + bw / 2, by0 + 0.42, lab, ha="center", va="center", fontsize=9)
