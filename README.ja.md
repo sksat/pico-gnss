@@ -16,8 +16,10 @@ GNSS 受信機の 1Hz PPS 立ち上がりは UTC 秒境界を刻みます。本�
 ![pico-gnss ハードウェア](docs/pico-gnss-hardware.jpg)
 
 *評価ハードウェア: Raspberry Pi Pico (RP2040) を breakout に載せ、秋月 [AE-GNSS-EXTANT](https://akizukidenshi.com/catalog/g/g113849/)
-(太陽誘電 GYSFFMANC, MediaTek MT3333) GNSS モジュールをリボンケーブルで接続。規律 1PPS
+(太陽誘電 GYSFFMANC, MediaTek MT3333) GNSS モジュールをジャンパワイヤで接続。規律 1PPS
 出力 (GP3) と GPS PPS にオシロのプローブを当てて位相を測る。*
+
+![loopback 配線: GPS-R PPS と規律出力の両エッジを PIO で時刻捕捉し、差が loopback 位相になる](docs/report/precision-ladder/precision-figs/fig-loopback.png)
 
 ![pico-gnss リアルタイムダッシュボード](docs/dashboard.png)
 
