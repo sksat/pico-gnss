@@ -50,6 +50,17 @@ deliberately does **not** own the discipline (frequency estimation, holdover, th
 phase servo) — that is [`gnssdo`](https://crates.io/crates/gnssdo)'s job; feed it the
 timestamps and epoch this crate produces.
 
+## Measured on hardware
+
+![on-hardware evaluation](https://raw.githubusercontent.com/sksat/pico-gnss/main/docs/report/report-en.png)
+
+From a real on-device run (RP2040 @ 125 MHz + MT3333 receiver): the PPS interval
+read through the PIO capture stays within a few 16 ns quantization steps (panel C)
+— versus ~µs-scale jitter when the same edge is timestamped by a software GPIO
+interrupt — and the steered 1PPS output tracks the receiver's PPS at the tens-of-ns
+level. Full methodology and the precision deep-dive live in the
+[repository report](https://github.com/sksat/pico-gnss/blob/main/docs/report/precision-ladder/README.md) (Japanese).
+
 ## Example (sketch — turn-key GPSDO)
 
 ```rust,ignore
