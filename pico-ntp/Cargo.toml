@@ -27,6 +27,19 @@ required-features = ["bench"]
 # normal build does not produce a second firmware image that would be easy to flash by accident.
 bench = []
 
+# A receive path over the debug probe, for measuring what a real NTP client does with our time.
+#
+# The wiring is transmit-only, so the unicast exchange — the one that lets a client sound the path
+# instead of assuming it — cannot happen over the wire. This puts a mailbox in RAM that the probe
+# writes requests into and reads replies out of, so a host-side bridge can carry a real client's
+# unicast traffic to `tiny_ntp::server::respond` and back.
+#
+# **Off by default and never for production.** SWD is not a network: the request arrives by a path
+# with none of Ethernet's timing, so the client's own delay measurement describes the probe rather
+# than the link. It exists to answer "does a real client accept and converge on this time", not to
+# be a second way of serving it.
+swd-rx = []
+
 [dependencies]
 # The three layers this firmware wires together.
 gnssdo = { version = "0.1.0", path = "../gnssdo" }

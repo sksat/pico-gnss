@@ -43,6 +43,9 @@
 //! all** — the reference `ntpd` does, with `broadcastclient` (and, since we cannot answer the
 //! calibration exchange it would like to make, `disable auth` and an explicit `broadcastdelay`).
 
+#[cfg(feature = "swd-rx")]
+mod swd_rx;
+
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -599,6 +602,10 @@ async fn main(spawner: Spawner) {
     spawner.spawn(pps_task(capture).unwrap());
     spawner.spawn(nmea_task(uart_rx).unwrap());
     spawner.spawn(ntp_task(tx).unwrap());
+    // Debug only: a unicast exchange carried over the probe, so a real client can be measured
+    // against a link that cannot receive. See `swd_rx`.
+    #[cfg(feature = "swd-rx")]
+    spawner.spawn(swd_rx::swd_rx_task().unwrap());
 
     // Report the disciplined clock once a second, independently of whether we are serving, so a
     // silent server can be told apart from a stopped one.

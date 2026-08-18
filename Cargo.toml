@@ -7,6 +7,7 @@ members = [
     "tiny-ntp",
     "pico-10base-t",
     "pico-ntp",
+    "tools/swd-ntp-bridge",
 ]
 # A bare `cargo build`/`cargo test` targets the host-safe cores: gnssdo, rp-pps's
 # HAL-agnostic core, tiny-ntp, and pico-10base-t's frame/PHY codec. Build the
