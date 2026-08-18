@@ -7,14 +7,34 @@
 use core::fmt::Write as _;
 
 use defmt::{info, warn};
-use embassy_rp::uart::BufferedUartTx;
-use embassy_time::Timer;
-use embedded_io_async::Write;
+use embassy_rp::uart::{BufferedUart, BufferedUartTx};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
+use embedded_io_async::{Read as _, Write};
 use heapless::String;
 use portable_atomic::{AtomicU32, Ordering};
 
 /// AE-GNSS-EXTANT (GYSFFMANC) のデフォルトボーレート 9600。
 pub const GNSS_BAUD: u32 = 9600;
+
+/// 起動時に引き上げる先のボーレート。
+///
+/// # なぜ上げるのか (精度ではなく**正しさ**の問題)
+///
+/// PPS エッジと UTC 秒の対応付けは NMEA センテンスの到着で行うが、9600bps ではセンテンス
+/// バーストが ~640ms あり、しかも PPS エッジから数百 ms 遅れて始まる。結果、時刻センテンスは
+/// **次のパルスのほぼ真上**に届く。実測 (188 サンプル):
+///
+/// ```text
+/// RMC から次の PPS エッジまでの余裕: mean 490ms, sd 460ms, min 2ms
+/// ```
+///
+/// 分布はエッジの前後数十 ms に割れた二峰で、どちらに落ちるかはコイン投げ。衛星数が増えて
+/// GSV が伸びただけで反転し、**規律 UTC の秒番号が実行中に 1 秒飛ぶ**。位相しか見ていない限り
+/// 見えない (規律 1PPS は GPS エッジ上に ns で乗ったまま、違う秒のラベルを付けている)。
+///
+/// 12 倍にするとバーストは ~53ms になり、コイン投げが数百 ms の余裕に変わる。実機で確認済み:
+/// 9600 では ±1 秒の補正が要ったが、115200 では補正なしで時刻が合う。
+pub const GNSS_FAST_BAUD: u32 = 115_200;
 
 /// **実験**: dynamic model (PMTK886) を一定間隔で交互切替し、各セグメントの出力位相 (hwphase) を
 /// 受信を揃えた状態で比較する A/B。stationary(886,4) が wander を抑えるか増やすかを実機で決める
@@ -91,6 +111,115 @@ async fn send_pmtk<W: Write>(tx: &mut W, payload: &str) {
         let _ = tx.write_all(line.as_bytes()).await;
     } else {
         warn!("send_pmtk: line too long: {=str}", payload);
+    }
+}
+
+/// 受信機がどのボーレートで喋っているかを探し、[`GNSS_FAST_BAUD`] へ引き上げて**検証**する。
+///
+/// 戻り値は最終的に確立したレート。UART は分割前に渡すこと (`set_baudrate` は
+/// [`BufferedUart`] にしかない)。
+///
+/// # なぜ「送って終わり」ではないのか
+///
+/// * **PMTK251 に ACK は無い**。返事は片側がまだ採用していないレートで送ることになるので原理的に
+///   返せない。MT3333 の NMEA 仕様 (§2.3.14) もコマンドと許容レートを規定するだけで、切替に
+///   どれだけかかるかは書いていない。つまり**確かめる以外に知る方法が無い**。
+/// * **設定は firmware の再フラッシュを跨いで残る**。PMTK251 が既定へ戻るのは full cold start か
+///   standby のときだけなので、再フラッシュ後もモジュールは前回のレートのまま。9600 で開いて
+///   沈黙を見て「受信機が死んだ」と判断してしまう (実際にそう誤判定した)。
+///
+/// したがってコマンドの前後で port を **probe** する。これで後段の待ち時間は critical でなくなる
+/// — 短すぎてもモジュールが実際に落ち着いた側を probe が見つけて追従するので、「一つのモジュールを
+/// 一日測って調整した定数」を作らずに済む。
+pub async fn establish_link(uart: &mut BufferedUart) -> u32 {
+    let Some(found) = probe_baud(uart).await else {
+        // probe は最後に試したレート (fast) を残したまま抜けている。既定へ戻しておかないと、
+        // 受信機が後から既定レートで起動しても受信ループが追従できず、二度と復帰しない。
+        uart.set_baudrate(GNSS_BAUD);
+        warn!("GNSS: no NMEA at either baud — check wiring, or power-cycle the receiver");
+        return GNSS_BAUD;
+    };
+    if found == GNSS_FAST_BAUD {
+        info!("GNSS: already at {=u32}", GNSS_FAST_BAUD);
+        return found;
+    }
+
+    send_pmtk(uart, "PMTK251,115200").await;
+    // 9600 でコマンドが出切る (~21ms) のと、モジュールが送信中のセンテンスを終えるのに十分な長さ。
+    // 上のとおり probe があるので厳密でなくてよい。起動時 1 回きりで、規律のロックには数秒かかる。
+    Timer::after_millis(500).await;
+
+    match probe_baud(uart).await {
+        Some(rate) if rate == GNSS_FAST_BAUD => {
+            info!("GNSS: baud raised to {=u32}", GNSS_FAST_BAUD);
+            rate
+        }
+        Some(rate) => {
+            warn!("GNSS: PMTK251 did not take; continuing at {=u32}", rate);
+            rate
+        }
+        None => {
+            warn!(
+                "GNSS: lost the receiver after PMTK251; leaving port at {=u32}",
+                GNSS_BAUD
+            );
+            uart.set_baudrate(GNSS_BAUD);
+            GNSS_BAUD
+        }
+    }
+}
+
+/// 受信機が今どのレートで喋っているかを探し、port をそこに合わせる。**設定は変えない**。
+///
+/// [`establish_link`] と違って受信機に何も送らないので、設定を持たない側 (例のバイナリなど) が
+/// 使う。`PMTK251` の設定は firmware の再フラッシュを跨いで残るため、9600 決め打ちで開くと、
+/// 一度でも引き上げた受信機からは何も受け取れなくなる。
+pub async fn follow_baud(uart: &mut BufferedUart) -> Option<u32> {
+    let found = probe_baud(uart).await;
+    match found {
+        Some(rate) => info!("GNSS: talking at {=u32}", rate),
+        None => {
+            uart.set_baudrate(GNSS_BAUD);
+            warn!("GNSS: no NMEA at either baud — check wiring, or power-cycle the receiver");
+        }
+    }
+    found
+}
+
+/// 各レートを順に試し、NMEA が framing できたところで止める。port はそのレートのまま残す。
+async fn probe_baud(uart: &mut BufferedUart) -> Option<u32> {
+    for baud in [GNSS_BAUD, GNSS_FAST_BAUD] {
+        uart.set_baudrate(baud);
+        if await_nmea(uart, Duration::from_secs(3)).await {
+            return Some(baud);
+        }
+    }
+    None
+}
+
+/// NMEA センテンスが 1 本組み立つまで読む。中身は問わない — **framing が成立すること自体**が
+/// 「このレートで合っている」の証拠で、それはレートが違えば真っ先に壊れる性質だから。
+async fn await_nmea(uart: &mut BufferedUart, timeout: Duration) -> bool {
+    let mut assembler = rp_pps::NmeaLineAssembler::new();
+    let mut buf = [0u8; 64];
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        let Ok(read) = with_timeout(remaining, uart.read(&mut buf)).await else {
+            return false;
+        };
+        // レート違いは framing / break エラーとして出る。切替直後は数個出るのが普通なので、
+        // 判定材料にせず読み続ける。
+        let Ok(n) = read else { continue };
+        for &b in &buf[..n] {
+            if let Some(sentence) = assembler.push(b)
+                && sentence.starts_with(b"$G")
+            {
+                return true;
+            }
+        }
     }
 }
 

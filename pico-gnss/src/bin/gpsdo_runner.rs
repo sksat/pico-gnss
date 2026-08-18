@@ -76,8 +76,8 @@ async fn main(spawner: Spawner) {
     static TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
     static RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
     let mut config = UartConfig::default();
-    config.baudrate = 9600;
-    let uart = BufferedUart::new(
+    config.baudrate = pico_gnss::mt3333::GNSS_BAUD;
+    let mut uart = BufferedUart::new(
         p.UART0,
         p.PIN_0,
         p.PIN_1,
@@ -86,6 +86,9 @@ async fn main(spawner: Spawner) {
         RX_BUF.init([0; 256]),
         config,
     );
+    // 受信機のボーレート設定は firmware の再フラッシュを跨いで残るので、既定決め打ちで開くと、
+    // 一度でも引き上げた受信機からは何も受け取れない。設定は変えず、今のレートに合わせるだけ。
+    pico_gnss::mt3333::follow_baud(&mut uart).await;
     let (_tx, rx) = uart.split();
 
     // Spawn the two rp-pps runners; they discipline `CLOCK` on their own.
