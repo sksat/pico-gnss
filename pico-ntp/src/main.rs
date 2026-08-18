@@ -86,8 +86,9 @@ bind_interrupts!(struct Irqs {
 /// Locally-administered MAC (the `02:` prefix marks it as such, so it cannot collide with a real
 /// assignment).
 const SRC_MAC: MacAddr = MacAddr([0x02, 0x00, 0x00, 0xC0, 0xFF, 0xEE]);
-/// Our address. **Change this to something on your LAN.**
-const SRC_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 200);
+/// Our address. **Change this to something on your LAN.** A client identifies the source by this,
+/// and will ignore one that cannot belong to its own subnet.
+const SRC_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 200);
 /// Limited broadcast. Never forwarded by a router, and far easier to debug than multicast — no
 /// IGMP, no switch snooping, no per-client group membership. `Ipv4Addr::NTP_MULTICAST` (224.0.1.1)
 /// is the other legitimate choice once this works.
@@ -123,6 +124,14 @@ const CFG: ServerConfig = ServerConfig {
 
 const FRAME_LEN: usize = frame_len(PACKET_LEN);
 const SYMBOL_WORDS: usize = encoded_words(FRAME_LEN);
+
+/// How many outgoing frames to hexdump over RTT at start-up.
+///
+/// Debugging a transmit-only PHY is awkward: with no wired NIC to capture on and no scope on the
+/// pair, the probe is the only window onto what was actually sent. Feeding these bytes to
+/// `text2pcap` and `tshark` on the host checks the whole firmware path — real disciplined
+/// timestamps, real framing, real checksums — with only the line coding and the wire left over.
+const FRAME_DUMPS: u32 = 3;
 
 /// The disciplined clock. The two rp-pps runners write it; the NTP task reads it.
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<PpsGpsdo>> =
@@ -244,6 +253,13 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
                 let after = now_ns();
 
                 sent = sent.wrapping_add(1);
+                // Dump the first few frames over RTT. This is the only way to inspect what actually
+                // went out when there is no wired NIC to capture on and no scope on the pair: the
+                // host can turn these bytes into a pcap (`text2pcap`) and let Wireshark judge them,
+                // which covers everything except the Manchester coding and the pair itself.
+                if sent <= FRAME_DUMPS {
+                    info!("NTPFRAME n={} bytes={=[u8]:02x}", sent, &frame[..len]);
+                }
                 // Everything a host-side measurement needs to line its receive timestamps up with
                 // what we believed we were sending, and to see the scheduling error separately from
                 // the path delay.
