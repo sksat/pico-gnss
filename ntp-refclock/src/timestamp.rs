@@ -201,7 +201,15 @@ mod tests {
     #[test]
     fn nanosecond_round_trip_is_exact_within_a_second() {
         // Distinct ns map to distinct fractions (see above), so rounding back must recover them.
-        for ns in [0i64, 1, 999, 1_000_000, 123_456_789, 999_999_998, 999_999_999] {
+        for ns in [
+            0i64,
+            1,
+            999,
+            1_000_000,
+            123_456_789,
+            999_999_998,
+            999_999_999,
+        ] {
             let t = NtpTimestamp::from_unix_ns(ns);
             assert_eq!(t.to_unix_ns_in_era(0), ns, "ns={ns}");
         }
@@ -241,7 +249,10 @@ mod tests {
         const NOW: i64 = 1_787_020_967; // 2026-08-18, era 0
         const ONE_ERA_LATER: i64 = NOW + 4_294_967_296; // same 32 bits, ~2162
         let wire = NtpTimestamp::from_unix_ns(NOW * 1_000_000_000);
-        assert_eq!(wire.to_unix_ns_near(NOW * 1_000_000_000), NOW * 1_000_000_000);
+        assert_eq!(
+            wire.to_unix_ns_near(NOW * 1_000_000_000),
+            NOW * 1_000_000_000
+        );
         // Identical wire bits, read from a vantage point one era later, resolve to that era.
         assert_eq!(
             wire.to_unix_ns_near(ONE_ERA_LATER * 1_000_000_000),
@@ -278,7 +289,10 @@ mod tests {
         // small value (which would advertise a *better* clock than we have).
         let huge = NtpShort::from_nanos(u64::MAX);
         assert_eq!(huge.to_bits(), u32::MAX);
-        assert_eq!(NtpShort::from_nanos(65_536 * 1_000_000_000).to_bits(), u32::MAX);
+        assert_eq!(
+            NtpShort::from_nanos(65_536 * 1_000_000_000).to_bits(),
+            u32::MAX
+        );
         // Just under the ceiling still encodes normally.
         assert!(NtpShort::from_nanos(65_535 * 1_000_000_000).to_bits() < u32::MAX);
     }
@@ -287,7 +301,11 @@ mod tests {
     fn short_round_trip_is_exact_at_representable_values() {
         for bits in [0u32, 1, 0x0001_0000, 0x1234_5678, 0xFFFF_0000] {
             let s = NtpShort::from_bits(bits);
-            assert_eq!(NtpShort::from_nanos(s.to_nanos()).to_bits(), bits, "bits={bits:#x}");
+            assert_eq!(
+                NtpShort::from_nanos(s.to_nanos()).to_bits(),
+                bits,
+                "bits={bits:#x}"
+            );
         }
     }
 }

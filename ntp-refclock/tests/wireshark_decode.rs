@@ -138,8 +138,14 @@ fn wireshark_reads_back_every_field_we_wrote() {
     assert_eq!(got[6], "0", "root delay");
     assert_eq!(got[7], "47505300", "refid is ASCII \"GPS\\0\"");
     // The one that catches a wrong prime-epoch offset or byte order.
-    assert_eq!(got[8], "2026-08-18T02:42:47.000000000Z", "reference timestamp");
-    assert_eq!(got[9], "2026-08-18T02:42:47.500000000Z", "transmit timestamp");
+    assert_eq!(
+        got[8], "2026-08-18T02:42:47.000000000Z",
+        "reference timestamp"
+    );
+    assert_eq!(
+        got[9], "2026-08-18T02:42:47.500000000Z",
+        "transmit timestamp"
+    );
 }
 
 #[test]

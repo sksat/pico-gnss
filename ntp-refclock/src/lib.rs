@@ -7,6 +7,7 @@
 //!
 //! - [`timestamp`] — NTP's two fixed-point time formats and their Unix-ns conversions.
 //! - [`packet`] — the 48-byte header and its wire encoding.
+//! - [`server`] — Stratum-1 policy: when we may serve at all, and what to claim.
 //!
 //! # Where the other pieces live
 //!
@@ -22,7 +23,9 @@
 #![no_std]
 
 pub mod packet;
+pub mod server;
 pub mod timestamp;
 
 pub use packet::{LeapIndicator, Mode, NtpPacket, PACKET_LEN};
+pub use server::{ClockState, ServeDecision, ServerConfig, SilentReason};
 pub use timestamp::{NTP_UNIX_OFFSET_SECS, NtpShort, NtpTimestamp};
