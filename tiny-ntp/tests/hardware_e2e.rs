@@ -8,7 +8,7 @@
 //! # terminal 1 — with DST_PORT set to the measurement port
 //! cd pico-ntp && cargo run --release
 //! # terminal 2
-//! cargo test -p ntp-refclock --test hardware_e2e -- --ignored --nocapture
+//! cargo test -p tiny-ntp --test hardware_e2e -- --ignored --nocapture
 //! ```
 //!
 //! # Why it is shaped like this
@@ -36,8 +36,8 @@ use std::net::UdpSocket;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ntp_refclock::packet::{Mode, NtpPacket};
-use ntp_refclock::server::{ClockState, ServeDecision, ServerConfig, respond};
+use tiny_ntp::packet::{Mode, NtpPacket};
+use tiny_ntp::server::{ClockState, ServeDecision, ServerConfig, respond};
 
 /// Where the firmware broadcasts while `DST_PORT` is set to the measurement port.
 const HARDWARE_PORT: u16 = 10123;
@@ -137,7 +137,10 @@ fn a_real_ntp_client_synchronises_to_the_hardware() {
         );
     };
 
-    assert_eq!(hw.stratum, 1, "the hardware should claim a primary reference");
+    assert_eq!(
+        hw.stratum, 1,
+        "the hardware should claim a primary reference"
+    );
     let hardware_utc = hw.unix_ns;
     let host_utc_at_receipt = unix_ns_now();
 
@@ -151,8 +154,11 @@ fn a_real_ntp_client_synchronises_to_the_hardware() {
 
     // What the client concluded, from time that came off the wire.
     let offset_s = result.clock_offset().as_secs_f64();
-    println!("rsntp synchronised: stratum {}, offset {:+.1} ms from this host's clock",
-        result.stratum(), offset_s * 1000.0);
+    println!(
+        "rsntp synchronised: stratum {}, offset {:+.1} ms from this host's clock",
+        result.stratum(),
+        offset_s * 1000.0
+    );
 
     assert_eq!(result.stratum(), 1, "client sees a primary reference");
     assert_eq!(

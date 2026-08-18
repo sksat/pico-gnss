@@ -1,9 +1,9 @@
 [package]
-name = "ntp-refclock"
+name = "tiny-ntp"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-description = "no_std NTP (RFC 5905) reference-clock server core: NTP timestamp conversion with era handling, 48-byte packet encode/decode, and Stratum-1 server packet construction — unicast replies and broadcast — gated on clock discipline with holdover-aware root dispersion. Integer-only, zero-dependency."
+description = "NTP (RFC 5905) for no_std targets: timestamp conversion with era handling and 48-byte packet encode/decode, plus a Stratum-1 reference-clock server — unicast replies and broadcast — gated on clock discipline with holdover-aware root dispersion. Integer-only, zero-dependency. Server side only so far; no client yet."
 keywords = ["ntp", "stratum1", "refclock", "no_std", "gpsdo"]
 categories = ["embedded", "no-std", "network-programming"]
 license.workspace = true
@@ -11,7 +11,7 @@ readme = "README.md"
 repository.workspace = true
 
 [lib]
-name = "ntp_refclock"
+name = "tiny_ntp"
 
 # No runtime dependencies: pure integer logic, mirroring `gnssdo`. Ethernet/IPv4/UDP framing and the
 # PHY deliberately live in the sibling `pico-10base-t` crate, so NTP stays L2/L3/L4-agnostic.

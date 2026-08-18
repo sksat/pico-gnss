@@ -1,7 +1,7 @@
-# ntp-refclock
+# tiny-ntp
 
 `no_std`, integer-only, **zero-dependency** NTP ([RFC 5905](https://www.rfc-editor.org/info/rfc5905))
-reference-clock server core.
+for embedded targets. Server side only so far: a Stratum-1 reference clock, no client yet.
 
 This crate turns a **disciplined UTC instant (Unix nanoseconds)** into the bytes of an NTP packet,
 and back. It knows nothing about Ethernet, IPv4, UDP or any HAL — only integer nanosecond timestamps

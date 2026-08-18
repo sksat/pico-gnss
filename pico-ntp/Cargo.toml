@@ -31,7 +31,7 @@ bench = []
 # The three layers this firmware wires together.
 gnssdo = { version = "0.1.0", path = "../gnssdo" }
 rp-pps = { version = "0.1.0", path = "../rp-pps", features = ["embassy-rp", "gnssdo"] }
-ntp-refclock = { version = "0.1.0", path = "../ntp-refclock" }
+tiny-ntp = { version = "0.1.0", path = "../tiny-ntp" }
 pico-10base-t = { version = "0.1.0", path = "../pico-10base-t", features = ["embassy-rp"] }
 
 cortex-m = "0.7.7"

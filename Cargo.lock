@@ -1122,14 +1122,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ntp-refclock"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "rsntp",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1286,12 +1278,12 @@ dependencies = [
  "embedded-io-async 0.7.0",
  "gnssdo",
  "heapless 0.9.3",
- "ntp-refclock",
  "panic-probe",
  "pico-10base-t",
  "portable-atomic",
  "rp-pps",
  "static_cell",
+ "tiny-ntp",
 ]
 
 [[package]]
@@ -1914,6 +1906,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tiny-ntp"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rsntp",
 ]
 
 [[package]]

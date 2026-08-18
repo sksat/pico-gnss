@@ -16,8 +16,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use ntp_refclock::packet::{LeapIndicator, Mode, NtpPacket};
-use ntp_refclock::timestamp::{NtpShort, NtpTimestamp};
+use tiny_ntp::packet::{LeapIndicator, Mode, NtpPacket};
+use tiny_ntp::timestamp::{NtpShort, NtpTimestamp};
 
 fn have(tool: &str) -> bool {
     Command::new(tool)
@@ -42,7 +42,7 @@ fn hexdump(bytes: &[u8]) -> String {
 
 /// Run the packet through text2pcap + tshark and return the requested field values, in order.
 fn dissect(packet: &NtpPacket, fields: &[&str], tag: &str) -> Vec<String> {
-    let dir = std::env::temp_dir().join(format!("ntp-refclock-{}-{tag}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tiny-ntp-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let hex: PathBuf = dir.join("ntp.hex");
     let pcap: PathBuf = dir.join("ntp.pcap");

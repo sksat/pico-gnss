@@ -22,8 +22,8 @@ use std::net::UdpSocket;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ntp_refclock::packet::{Mode, NtpPacket};
-use ntp_refclock::server::{ClockState, ServeDecision, ServerConfig, respond};
+use tiny_ntp::packet::{Mode, NtpPacket};
+use tiny_ntp::server::{ClockState, ServeDecision, ServerConfig, respond};
 
 fn unix_ns_now() -> i64 {
     SystemTime::now()

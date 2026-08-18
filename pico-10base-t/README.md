@@ -52,7 +52,7 @@ resistors is a far more interesting way to do it than an Ethernet module.
 | Concern | Crate |
 |---|---|
 | Disciplined UTC + holdover | [`gnssdo`](https://docs.rs/gnssdo) |
-| NTP wire format + Stratum-1 policy | `ntp-refclock` |
+| NTP wire format + Stratum-1 policy | `tiny-ntp` |
 | **Ethernet framing + 10BASE-T PHY** | **this crate** |
 | Wiring it together on real hardware | `pico-ntp` |
 

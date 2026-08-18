@@ -10,7 +10,7 @@
 //! GNSS module ──NMEA──> UART0 RX (GP1)  ──┐
 //!             ──1PPS──> GP2 (PIO0 SM0)  ──┴─> PpsGpsdo ──> disciplined UTC
 //!                                                            │
-//!                                    ntp-refclock ───────────┘  (48-byte NTP packet)
+//!                                    tiny-ntp ───────────┘  (48-byte NTP packet)
 //!                                          │
 //!                                    pico-10base-t            (Ethernet/IPv4/UDP + Manchester)
 //!                                          │
@@ -36,7 +36,7 @@
 //!
 //! Broadcast (RFC 5905 mode 5) is one-way, which is all the present wiring can do — **not** where
 //! this is meant to end up. The unicast exchange is the better protocol in every respect: it lets a
-//! client measure the path instead of assuming it. [`ntp_refclock::server::respond`] already builds
+//! client measure the path instead of assuming it. [`tiny_ntp::server::respond`] already builds
 //! those replies and is tested; what is missing is a receive path in the hardware.
 //!
 //! Meanwhile, note that **chrony and systemd-timesyncd do not implement broadcast client mode at
@@ -63,8 +63,8 @@ use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::Read as _;
 use static_cell::StaticCell;
 
-use ntp_refclock::packet::PACKET_LEN;
-use ntp_refclock::server::{ClockState, ServeDecision, ServerConfig, broadcast};
+use tiny_ntp::packet::PACKET_LEN;
+use tiny_ntp::server::{ClockState, ServeDecision, ServerConfig, broadcast};
 use pico_10base_t::embassy::Tx10BaseT;
 use pico_10base_t::frame::{Ipv4Addr, MacAddr, UdpFrameSpec, build_udp_frame, frame_len};
 use pico_10base_t::phy::{NLP_INTERVAL_US, encode_frame, encoded_words};
@@ -343,7 +343,7 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
                     (after - before) / 1000,
                     len,
                     words,
-                    ntp_refclock::server::root_dispersion_ns(&CFG, state.holdover_ns),
+                    tiny_ntp::server::root_dispersion_ns(&CFG, state.holdover_ns),
                     state.holdover_ns,
                 );
             }

@@ -11,7 +11,7 @@ env:
 
 jobs:
   cores:
-    name: cores (host) — gnssdo + rp-pps + ntp-refclock
+    name: cores (host) — gnssdo + rp-pps + tiny-ntp
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.0
@@ -20,18 +20,18 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.9.1
-      # ntp-refclock cross-checks its wire encoding against Wireshark's dissector. Without these
+      # tiny-ntp cross-checks its wire encoding against Wireshark's dissector. Without these
       # the test skips itself, which would leave the check silently unexercised in CI — the one
       # place it most needs to run. `tshark` pulls in `text2pcap` via wireshark-common.
       - run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
       - run: cargo fmt -p gnssdo --check
       - run: cargo fmt -p rp-pps --check
-      - run: cargo fmt -p ntp-refclock --check
+      - run: cargo fmt -p tiny-ntp --check
       - run: cargo fmt -p pico-10base-t --check
       - run: cargo clippy -p gnssdo --all-features -- -D warnings
       # rp-pps core only on the host; its HAL backends need a target + the downstream chip feature.
       - run: cargo clippy -p rp-pps -- -D warnings
-      - run: cargo clippy -p ntp-refclock --all-targets -- -D warnings
+      - run: cargo clippy -p tiny-ntp --all-targets -- -D warnings
       # pico-10base-t's framing core is HAL-free; its backend needs a target (see the embedded job).
       - run: cargo clippy -p pico-10base-t --all-targets -- -D warnings
       - run: cargo test -p gnssdo
@@ -41,7 +41,7 @@ jobs:
       # sentence establishes the epoch. Without this they compile nowhere in CI and can rot.
       # (Not --all-features: the HAL backends need a target.)
       - run: cargo test -p rp-pps --features gnssdo
-      - run: cargo test -p ntp-refclock
+      - run: cargo test -p tiny-ntp
       - run: cargo test -p pico-10base-t
 
   embedded:
@@ -84,8 +84,8 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo publish --dry-run -p gnssdo
-      # ntp-refclock and pico-10base-t have no path dependencies, so their dry-runs stand alone.
-      - run: cargo publish --dry-run -p ntp-refclock
+      # tiny-ntp and pico-10base-t have no path dependencies, so their dry-runs stand alone.
+      - run: cargo publish --dry-run -p tiny-ntp
       - run: cargo publish --dry-run -p pico-10base-t
       # rp-pps は gnssdo が crates.io に公開されるまで dry-run が原理的に通らない
       # ([patch.crates-io] は publish で無視される。root Cargo.toml のコメント参照)。
@@ -110,4 +110,4 @@ jobs:
       - run: cargo test -p rp-pps
       # No tshark here on purpose: the Wireshark cross-check skips itself, and this job is about the
       # compiler floor rather than re-running the interop check.
-      - run: cargo test -p ntp-refclock
+      - run: cargo test -p tiny-ntp

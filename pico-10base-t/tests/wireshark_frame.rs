@@ -43,7 +43,7 @@ fn dissect(frame: &[u8], fields: &[&str], tag: &str) -> Vec<String> {
 
     std::fs::write(&hex, hexdump(frame)).expect("write hex");
 
-    // No -u here (unlike the ntp-refclock test): these bytes are already a complete Ethernet frame,
+    // No -u here (unlike the tiny-ntp test): these bytes are already a complete Ethernet frame,
     // so text2pcap's default Ethernet linktype is exactly right.
     let out = Command::new("text2pcap")
         .arg(&hex)

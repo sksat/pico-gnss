@@ -1,9 +1,16 @@
-//! `ntp-refclock` — portable NTP (RFC 5905) **reference-clock server** core.
+//! `tiny-ntp` — NTP (RFC 5905) for `no_std` targets.
 //!
-//! `no_std`, integer-only, zero-dependency. This crate turns a **disciplined UTC instant (Unix
-//! nanoseconds)** into the 48 bytes of an NTP packet, and back. It deliberately knows nothing about
-//! Ethernet, IPv4, UDP or any HAL — the only things crossing into it are integer nanosecond
-//! timestamps and a UTC epoch, which is the same layer boundary the rest of this workspace uses.
+//! Integer-only, zero-dependency. This crate turns a **disciplined UTC instant (Unix
+//! nanoseconds)** into the 48 bytes of an NTP packet, and back.
+//!
+//! It deliberately knows nothing about Ethernet, IPv4, UDP or any HAL — the only things crossing
+//! into it are integer nanosecond timestamps and a UTC epoch, which is the same layer boundary the
+//! rest of this workspace uses.
+//!
+//! **Scope today is the server side**, and only as a Stratum-1 reference clock. [`timestamp`] and
+//! [`packet`] are what any NTP role needs, but there is no client and the stratum is not
+//! configurable. The name is deliberately broader than that — a client belongs beside [`server`]
+//! rather than in another crate — but nothing here implements one yet.
 //!
 //! - [`timestamp`] — NTP's two fixed-point time formats and their Unix-ns conversions.
 //! - [`packet`] — the 48-byte header and its wire encoding.
