@@ -1,0 +1,21 @@
+[package]
+name = "ntp-refclock"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "no_std NTP (RFC 5905) reference-clock server core: NTP timestamp conversion with era handling, 48-byte packet encode/decode, and Stratum-1 broadcast packet construction gated on clock discipline with holdover-aware root dispersion. Integer-only, zero-dependency."
+keywords = ["ntp", "stratum1", "refclock", "no_std", "gpsdo"]
+categories = ["embedded", "no-std", "network-programming"]
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+
+[lib]
+name = "ntp_refclock"
+
+# No runtime dependencies: pure integer logic, mirroring `gnssdo`. Ethernet/IPv4/UDP framing and the
+# PHY deliberately live in the sibling `pico-10base-t` crate, so NTP stays L2/L3/L4-agnostic.
+
+# Dev-only: property tests for the timestamp conversions (round-trip, monotonicity, era wrap).
+[dev-dependencies]
+proptest = "1"
