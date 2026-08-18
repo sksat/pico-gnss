@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 350" width="760" height="350" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="エッジが数十 ns で重なっていても、firmware がそのエッジに付けている秒は真の時刻と一致するとは限らない">
+  <rect width="760" height="350" fill="#ffffff"/>
+  <defs>
+    <marker id="d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#888"/>
+    </marker>
+  </defs>
+
+  <!-- 真の秒境界。GPS-R の 1PPS が基準である -->
+  <text x="380" y="26" font-size="12.5" fill="#333" text-anchor="middle">真の秒境界 = 12:00:01</text>
+  <line x1="380" y1="36" x2="380" y2="178" stroke="#333" stroke-width="0.9" stroke-dasharray="4 4"/>
+  <line x1="386" y1="36" x2="386" y2="178" stroke="#2e7d5b" stroke-width="0.9" stroke-dasharray="4 4"/>
+
+  <text x="204" y="62" font-size="11.5" fill="#333">GPS-R 1PPS (基準)</text>
+  <path fill="none" stroke="#333" stroke-width="2.2" d="M200,96 L380,96 L380,74 L428,74 L428,96 L620,96"/>
+
+  <text x="204" y="128" font-size="11.5" fill="#2e7d5b">GPSDO 1PPS</text>
+  <path fill="none" stroke="#2e7d5b" stroke-width="2.2" d="M200,164 L386,164 L386,142 L434,142 L434,164 L620,164"/>
+
+  <!-- 位相差 -->
+  <g stroke="#888" stroke-width="1">
+    <line x1="380" y1="118" x2="386" y2="118"/>
+    <line x1="380" y1="114" x2="380" y2="122"/>
+    <line x1="386" y1="114" x2="386" y2="122"/>
+    <line x1="386" y1="118" x2="452" y2="118"/>
+  </g>
+  <text x="456" y="122" font-size="11" fill="#888">位相差 数十 ns</text>
+
+  <text x="380" y="204" font-size="12.5" fill="#333" text-anchor="middle">重なりが決めるのは、出力が基準からどれだけずれているかだけである。</text>
+
+  <!-- 分岐 -->
+  <g stroke="#888" stroke-width="1.4" fill="none" marker-end="url(#d)">
+    <path d="M330,214 C300,232 260,232 222,246"/>
+    <path d="M430,214 C460,232 500,232 538,246"/>
+  </g>
+
+  <rect x="60" y="252" width="284" height="66" rx="4" fill="#2e7d5b" fill-opacity="0.08" stroke="#2e7d5b"/>
+  <text x="202" y="276" font-size="12.5" fill="#333" text-anchor="middle">firmware はこのエッジを</text>
+  <text x="202" y="296" font-size="13" fill="#2e7d5b" text-anchor="middle">12:00:01 と呼ぶ (真の時刻と一致)</text>
+
+  <rect x="416" y="252" width="284" height="66" rx="4" fill="#c1442e" fill-opacity="0.08" stroke="#c1442e"/>
+  <text x="558" y="276" font-size="12.5" fill="#333" text-anchor="middle">firmware はこのエッジを</text>
+  <text x="558" y="296" font-size="13" fill="#c1442e" text-anchor="middle">12:00:00 と呼ぶ (1 秒遅れ)</text>
+
+  <text x="380" y="340" font-size="12.5" fill="#333" text-anchor="middle">波形はどちらでも同じである。秒の名前は、外部の時計と比べて初めて決まる。</text>
+</svg>

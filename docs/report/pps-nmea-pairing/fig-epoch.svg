@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 270" width="760" height="270" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="1PPS のエッジが UTC の秒境界を指し、直後の NMEA センテンスがその秒の値を伝える">
+  <rect width="760" height="270" fill="#ffffff"/>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c1442e"/>
+    </marker>
+  </defs>
+
+  <!-- 秒境界 -->
+  <g stroke="#888" stroke-width="1" stroke-dasharray="4 4">
+    <line x1="110" y1="46" x2="110" y2="196"/>
+    <line x1="300" y1="46" x2="300" y2="196"/>
+    <line x1="490" y1="46" x2="490" y2="196"/>
+    <line x1="680" y1="46" x2="680" y2="196"/>
+  </g>
+  <g font-size="12" fill="#333" text-anchor="middle">
+    <text x="110" y="38">12:00:00</text>
+    <text x="300" y="38">12:00:01</text>
+    <text x="490" y="38">12:00:02</text>
+    <text x="680" y="38">12:00:03</text>
+  </g>
+
+  <!-- 1PPS 波形 -->
+  <text x="72" y="94" font-size="13" fill="#333" text-anchor="end">1PPS</text>
+  <path fill="none" stroke="#333" stroke-width="2.2"
+        d="M80,110 L110,110 L110,66 L129,66 L129,110 L300,110 L300,66 L319,66 L319,110
+           L490,110 L490,66 L509,66 L509,110 L680,110 L680,66 L699,66 L699,110 L740,110"/>
+  <text x="118" y="128" font-size="11.5" fill="#333">立ち上がりが UTC の秒境界</text>
+
+  <!-- NMEA センテンス -->
+  <text x="72" y="176" font-size="13" fill="#333" text-anchor="end">NMEA</text>
+  <g fill="#c1442e" opacity="0.16">
+    <rect x="150" y="158" width="76" height="24" rx="3"/>
+    <rect x="340" y="158" width="76" height="24" rx="3"/>
+    <rect x="530" y="158" width="76" height="24" rx="3"/>
+  </g>
+  <g font-size="11.5" fill="#c1442e" text-anchor="middle">
+    <text x="188" y="175">12:00:00</text>
+    <text x="378" y="175">12:00:01</text>
+    <text x="568" y="175">12:00:02</text>
+  </g>
+
+  <!-- 対応付け -->
+  <g stroke="#c1442e" stroke-width="1.6" fill="none" marker-end="url(#a)">
+    <path d="M150,166 C130,166 114,158 111,142"/>
+    <path d="M340,166 C320,166 304,158 301,142"/>
+    <path d="M530,166 C510,166 494,158 491,142"/>
+  </g>
+
+  <text x="80" y="216" font-size="12.5" fill="#333">エッジがその瞬間を指し、直後に届くセンテンスがその秒の値を伝える。</text>
+  <text x="80" y="238" font-size="12.5" fill="#333">両方そろって初めて、この 1 本のパルスが「12:00:01 のパルス」になる。</text>
+</svg>
