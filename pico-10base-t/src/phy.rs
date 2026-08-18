@@ -121,10 +121,30 @@ pub const fn manchester_word(byte: u8) -> u32 {
 
 /// [`manchester_word`] for every byte, generated at compile time — 1 KB of flash, no runtime setup.
 ///
-/// [`encode_frame`] uses this rather than computing, and the reason is measurement on the target
-/// rather than taste: encoding is 2x faster from a table on a Cortex-M0+, and on that part the
-/// whole prepare step was consuming 97% of the time a frame occupies the wire. Upstream ships the
-/// same table for the same reason.
+/// # Why this table exists
+///
+/// **The state it was added to fix.** `encode_frame` originally computed each word with
+/// [`manchester_word`], eight shifts per byte. On the RP2040 that made *preparing* a frame cost 97%
+/// of the time the frame occupies the wire (`pico-ntp`'s `bench_tx`, 1472 B payload: 1194 µs of
+/// prepare against 1220 µs of wire). At that ratio the CPU is the limit rather than the link:
+/// there is no room to encode the next frame while the current one is going out, so back-to-back
+/// transmission is impossible and the effective rate sat at 4.85 Mbit/s against a 9.57 Mbit/s
+/// protocol ceiling.
+///
+/// **What was done.** Both hot loops became table lookups — this one and
+/// [`crate::frame::crc32`] — each a 256-entry table built in a `const` block, so there is no
+/// runtime initialisation and nothing to get wrong at start-up.
+///
+/// **What it bought.** Prepare time fell 2.27x (1194 → 527 µs at MTU), CPU cost fell from 97% to
+/// 43% of wire time, and the effective rate rose from 4.85 to 6.69 Mbit/s. The number that matters
+/// is the 43%: below 50%, preparing the next frame fits inside sending the current one, so double
+/// buffering can now reach the protocol ceiling. Cost was 2 KB of flash across both tables.
+///
+/// **Why it was not done sooner.** The host benchmark said the opposite — that framing was 0.37% of
+/// wire time and a table was not worth 1 KB. It was wrong in direction, not just magnitude: at -O3
+/// LLVM rewrites the bitwise CRC into a table by itself, so the host was comparing a table against
+/// a table. Only the on-target measurement showed the real cost. (Upstream ships this same table,
+/// which in hindsight was the hint.)
 const MANCHESTER_TABLE: [u32; 256] = {
     let mut table = [0u32; 256];
     let mut i = 0;

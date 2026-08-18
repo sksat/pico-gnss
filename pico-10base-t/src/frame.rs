@@ -77,18 +77,24 @@ pub struct UdpFrameSpec<'a> {
 
 /// The Ethernet FCS: CRC-32 (reflected, polynomial `0xEDB88320`), as used by IEEE 802.3.
 ///
-/// Table-driven, for 1 KB of flash — and that decision was made by the target, not the host.
+/// Table-driven, for 1 KB of flash — a decision made by the target, not the host.
 ///
-/// The host benchmark says framing costs ~0.26% of the time a frame occupies the wire, which makes
-/// a table look like a waste. On the actual Cortex-M0+ the same work costs **97%** of wire time
-/// (`pico-ntp`'s `bench_tx`), because none of what makes it cheap on x86 exists there: no barrel
-/// shifter, no superscalar issue, and no LLVM CRC-idiom recognition (which on an `-O3` host build
-/// silently rewrites the bitwise loop into a table anyway, hiding the difference entirely — at
-/// `-O0` the table is 4.3x faster).
+/// **The state it was added to fix.** This was a bitwise loop, eight iterations per byte, and it
+/// accounted for ~94% of the cost of building a frame. Together with the Manchester encoding that
+/// put frame preparation at 97% of the time a frame occupies the wire on an RP2040, making the CPU
+/// the bottleneck rather than the 10 Mbit/s link.
 ///
-/// So the host measurement was not merely imprecise, it pointed the wrong way. The optimisation
-/// that "obviously" was not worth 1 KB is what puts the effective transmit rate near the wire's
-/// limit instead of half of it.
+/// **What was done, and what it bought.** A 256-entry table, built in a `const` block so there is
+/// no runtime setup to get wrong. Prepare time at MTU fell from 1194 µs to 527 µs, CPU cost from
+/// 97% to 43% of wire time, and the effective transmit rate from 4.85 to 6.69 Mbit/s. See the
+/// Manchester table in [`crate::phy`] for the full before/after — the two were changed together
+/// because either alone leaves the other dominating.
+///
+/// **Why the host benchmark said not to bother.** It reported framing at 0.26% of wire time and no
+/// measurable difference between the implementations — because at `-O3` LLVM recognises the bitwise
+/// CRC idiom and rewrites it into a table, so the host was timing a table against a table. At `-O0`
+/// the same comparison shows 4.3x. The host was wrong in direction, not merely in magnitude, and
+/// following it would have left the transmit rate at half of what the wire allows.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
