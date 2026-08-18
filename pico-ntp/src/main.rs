@@ -34,10 +34,14 @@
 //!
 //! # Receiving this
 //!
-//! Broadcast mode (RFC 5905 mode 5) is one-way, which is all a transmit-only PHY can do. Note that
-//! **chrony and systemd-timesyncd do not implement broadcast client mode at all** — the reference
-//! `ntpd` does, with `broadcastclient` (and, since we cannot answer the calibration exchange it
-//! would like to make, `disable auth` and an explicit `broadcastdelay`).
+//! Broadcast (RFC 5905 mode 5) is one-way, which is all the present wiring can do — **not** where
+//! this is meant to end up. The unicast exchange is the better protocol in every respect: it lets a
+//! client measure the path instead of assuming it. [`ntp_refclock::server::respond`] already builds
+//! those replies and is tested; what is missing is a receive path in the hardware.
+//!
+//! Meanwhile, note that **chrony and systemd-timesyncd do not implement broadcast client mode at
+//! all** — the reference `ntpd` does, with `broadcastclient` (and, since we cannot answer the
+//! calibration exchange it would like to make, `disable auth` and an explicit `broadcastdelay`).
 
 use core::cell::RefCell;
 

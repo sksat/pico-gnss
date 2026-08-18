@@ -11,18 +11,23 @@ unchanged.
 It is built for the case where **you are the reference clock**: a GNSS/PPS-disciplined oscillator
 serving Stratum 1, rather than a client asking someone else for the time.
 
-## Status
-
-Early. Implemented so far:
+## What it does
 
 - `timestamp` — NTP's two fixed-point formats and their Unix-ns conversions:
   - `NtpTimestamp` (32.32, seconds since the 1900 prime epoch) with **era** handling, so decoding
     still works across the 2036-02-07 wrap.
   - `NtpShort` (16.16) for root delay / root dispersion, **saturating** rather than wrapping — a
     wrapped dispersion would advertise a better clock than you have.
+- `packet` — the 48-byte header, encoded and decoded.
+- `server` — Stratum-1 policy. Both service modes:
+  - `respond` for a unicast client exchange (mode 3 → 4), echoing the client's timestamps so it can
+    separate offset from round-trip delay.
+  - `broadcast` for one-way announcement (mode 5), for a link where nothing can be received.
 
-Planned: 48-byte packet encode/decode, and Stratum-1 broadcast packet construction gated on the
-clock's discipline state with holdover-aware root dispersion.
+  Both are gated on the clock's discipline state and grow root dispersion through a holdover.
+
+The encoding is cross-checked against Wireshark's dissector rather than only against itself; see
+`tests/wireshark_decode.rs`.
 
 ## Where the other pieces live
 

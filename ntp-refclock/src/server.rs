@@ -89,20 +89,27 @@ pub fn root_dispersion_ns(cfg: &ServerConfig, holdover_ns: u64) -> u64 {
 /// The transmit timestamp is **passed in, not read from a clock**: for a one-way broadcast the
 /// client cannot measure the path, so the value must describe when the frame actually leaves,
 /// which is decided by the transmit schedule rather than by when this function ran.
-pub fn broadcast(cfg: &ServerConfig, state: &ClockState, transmit_unix_ns: i64) -> ServeDecision {
-    // Order matters: not knowing the time at all is a different (and prior) failure to knowing it
-    // but being unable to bound how fast we are losing it.
+/// The gates every service mode shares. `Ok` carries the UTC of the last discipline update, which
+/// becomes the reference timestamp.
+///
+/// Order matters: not knowing the time at all is a different (and prior) failure to knowing it but
+/// being unable to bound how fast we are losing it.
+fn gate(cfg: &ServerConfig, state: &ClockState) -> Result<i64, SilentReason> {
     let Some(last_update) = state.last_update_unix_ns else {
-        return ServeDecision::Silent(SilentReason::NoEpoch);
+        return Err(SilentReason::NoEpoch);
     };
     if !state.frequency_locked {
-        return ServeDecision::Silent(SilentReason::FrequencyUnlocked);
+        return Err(SilentReason::FrequencyUnlocked);
     }
     if state.holdover_ns > cfg.max_holdover_ns {
-        return ServeDecision::Silent(SilentReason::HoldoverExceeded);
+        return Err(SilentReason::HoldoverExceeded);
     }
+    Ok(last_update)
+}
 
-    ServeDecision::Serve(NtpPacket {
+/// The fields that describe *this clock* rather than the exchange, shared by both service modes.
+fn base_packet(cfg: &ServerConfig, state: &ClockState, last_update: i64) -> NtpPacket {
+    NtpPacket {
         leap: LeapIndicator::NoWarning,
         version: NTP_VERSION,
         mode: Mode::Broadcast,
@@ -114,10 +121,56 @@ pub fn broadcast(cfg: &ServerConfig, state: &ClockState, transmit_unix_ns: i64) 
         root_dispersion: NtpShort::from_nanos(root_dispersion_ns(cfg, state.holdover_ns)),
         reference_id: cfg.reference_id,
         reference_timestamp: NtpTimestamp::from_unix_ns(last_update),
-        // A broadcast answers no request, so there is no origin to echo and no arrival to report.
         origin_timestamp: NtpTimestamp::ZERO,
         receive_timestamp: NtpTimestamp::ZERO,
+        transmit_timestamp: NtpTimestamp::ZERO,
+    }
+}
+
+pub fn broadcast(cfg: &ServerConfig, state: &ClockState, transmit_unix_ns: i64) -> ServeDecision {
+    let last_update = match gate(cfg, state) {
+        Ok(t) => t,
+        Err(reason) => return ServeDecision::Silent(reason),
+    };
+    ServeDecision::Serve(NtpPacket {
+        mode: Mode::Broadcast,
+        // A broadcast answers no request, so there is no origin to echo and no arrival to report.
         transmit_timestamp: NtpTimestamp::from_unix_ns(transmit_unix_ns),
+        ..base_packet(cfg, state, last_update)
+    })
+}
+
+/// Build a reply to a client's request (RFC 5905 mode 3 → mode 4).
+///
+/// `receive_unix_ns` is when the request arrived and `transmit_unix_ns` when the reply will leave;
+/// together with the client's own two timestamps they are what lets the client separate offset from
+/// round-trip delay — the thing a one-way [`broadcast`] can never give it.
+///
+/// Gated identically to [`broadcast`]: an undisciplined clock answers nothing.
+pub fn respond(
+    cfg: &ServerConfig,
+    state: &ClockState,
+    request: &NtpPacket,
+    receive_unix_ns: i64,
+    transmit_unix_ns: i64,
+) -> ServeDecision {
+    let last_update = match gate(cfg, state) {
+        Ok(t) => t,
+        Err(reason) => return ServeDecision::Silent(reason),
+    };
+    ServeDecision::Serve(NtpPacket {
+        mode: Mode::Server,
+        // Answer in the client's version and echo its poll — RFC 5905 §7.3. Substituting our own
+        // would make the reply look like it belongs to a different association.
+        version: request.version,
+        poll: request.poll,
+        // The client's own departure time, handed straight back. This is how it matches a reply to
+        // its request; substitute anything else and every client discards every answer as bogus.
+        origin_timestamp: request.transmit_timestamp,
+        // The two ends of our processing, so the client can take it out of the delay it computes.
+        receive_timestamp: NtpTimestamp::from_unix_ns(receive_unix_ns),
+        transmit_timestamp: NtpTimestamp::from_unix_ns(transmit_unix_ns),
+        ..base_packet(cfg, state, last_update)
     })
 }
 
@@ -282,5 +335,134 @@ mod tests {
             "must not wrap below the floor"
         );
         assert_eq!(NtpShort::from_nanos(ns).to_bits(), u32::MAX);
+    }
+
+    // --- Unicast server mode (mode 3 -> 4) ---
+
+    fn client_request() -> NtpPacket {
+        NtpPacket {
+            leap: LeapIndicator::NoWarning,
+            version: 4,
+            mode: Mode::Client,
+            stratum: 0,
+            poll: 6,
+            precision: -20,
+            root_delay: NtpShort::ZERO,
+            root_dispersion: NtpShort::ZERO,
+            reference_id: [0; 4],
+            reference_timestamp: NtpTimestamp::ZERO,
+            origin_timestamp: NtpTimestamp::ZERO,
+            receive_timestamp: NtpTimestamp::ZERO,
+            // The client's departure time, which it will look for coming back.
+            transmit_timestamp: NtpTimestamp::from_unix_ns(REF_UNIX_NS - 3_000_000),
+        }
+    }
+
+    #[test]
+    fn a_reply_is_mode_server_at_stratum_1() {
+        let p = served(respond(
+            &cfg(),
+            &disciplined(),
+            &client_request(),
+            REF_UNIX_NS,
+            REF_UNIX_NS + 100_000,
+        ));
+        assert_eq!(p.mode, Mode::Server);
+        assert_eq!(p.stratum, 1);
+        assert_eq!(p.reference_id, *b"GPS\0");
+        assert_eq!(p.root_delay, NtpShort::ZERO);
+    }
+
+    #[test]
+    fn the_origin_timestamp_echoes_the_clients_transmit_timestamp() {
+        // This is how a client matches a reply to its request; get it wrong and every client on the
+        // network discards every answer as bogus.
+        let req = client_request();
+        let p = served(respond(
+            &cfg(),
+            &disciplined(),
+            &req,
+            REF_UNIX_NS,
+            REF_UNIX_NS + 100_000,
+        ));
+        assert_eq!(p.origin_timestamp, req.transmit_timestamp);
+    }
+
+    #[test]
+    fn receive_and_transmit_timestamps_are_the_two_moments_we_were_given() {
+        // The client subtracts these to take our processing time out of its delay estimate, so they
+        // must be the real arrival and departure rather than the same instant twice.
+        let p = served(respond(
+            &cfg(),
+            &disciplined(),
+            &client_request(),
+            REF_UNIX_NS,
+            REF_UNIX_NS + 250_000,
+        ));
+        assert_eq!(p.receive_timestamp, NtpTimestamp::from_unix_ns(REF_UNIX_NS));
+        assert_eq!(
+            p.transmit_timestamp,
+            NtpTimestamp::from_unix_ns(REF_UNIX_NS + 250_000)
+        );
+        assert_ne!(p.receive_timestamp, p.transmit_timestamp);
+    }
+
+    #[test]
+    fn the_reply_speaks_the_version_the_client_used() {
+        // RFC 5905: a server answers in the client's version, not its own preference.
+        let mut req = client_request();
+        req.version = 3;
+        let p = served(respond(
+            &cfg(),
+            &disciplined(),
+            &req,
+            REF_UNIX_NS,
+            REF_UNIX_NS + 1,
+        ));
+        assert_eq!(p.version, 3);
+    }
+
+    #[test]
+    fn the_reply_echoes_the_clients_poll_interval() {
+        let req = client_request();
+        let p = served(respond(
+            &cfg(),
+            &disciplined(),
+            &req,
+            REF_UNIX_NS,
+            REF_UNIX_NS + 1,
+        ));
+        assert_eq!(p.poll, req.poll, "not our broadcast interval");
+    }
+
+    #[test]
+    fn an_undisciplined_clock_answers_nothing() {
+        let st = ClockState {
+            frequency_locked: false,
+            ..disciplined()
+        };
+        assert_eq!(
+            respond(&cfg(), &st, &client_request(), REF_UNIX_NS, REF_UNIX_NS),
+            ServeDecision::Silent(SilentReason::FrequencyUnlocked)
+        );
+    }
+
+    #[test]
+    fn a_reply_carries_the_same_holdover_dispersion_as_a_broadcast() {
+        let st = ClockState {
+            holdover_ns: 600 * 1_000_000_000,
+            ..disciplined()
+        };
+        let p = served(respond(
+            &cfg(),
+            &st,
+            &client_request(),
+            REF_UNIX_NS,
+            REF_UNIX_NS,
+        ));
+        assert_eq!(
+            p.root_dispersion,
+            NtpShort::from_nanos(root_dispersion_ns(&cfg(), st.holdover_ns))
+        );
     }
 }

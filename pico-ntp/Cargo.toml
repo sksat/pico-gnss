@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "RP2040 Stratum-1 NTP broadcast server firmware: a GNSS-disciplined clock serving time over 10BASE-T Ethernet driven straight from two GPIO pins."
+description = "RP2040 Stratum-1 NTP server firmware: a GNSS-disciplined clock serving time over 10BASE-T Ethernet driven straight from two GPIO pins. Currently announces by broadcast, because the present wiring cannot receive."
 publish = false
 
 [[bin]]
