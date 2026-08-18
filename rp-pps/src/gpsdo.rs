@@ -11,8 +11,25 @@
 //! `on_pps_edge` from a PPS task and [`feed_nmea`](PpsGpsdo::feed_nmea) from the UART task, behind a
 //! mutex. Logging, receiver config and pin/SM assignment stay the caller's.
 
-use crate::{TimedEdge, parse_rmc_time_date};
+use crate::{TimedEdge, parse_rmc_time_date, parse_zda_time_date};
 use gnssdo::{Gnssdo, GnssdoStep};
+
+/// Which NMEA sentence supplies the UTC second that gets paired with a PPS edge.
+///
+/// This is not a matter of taste. **ZDA is the only sentence specified against the timing pulse**:
+/// the MT3333 platform NMEA specification lists it as the "PPS timing message (synchronized to
+/// PPS)" and states that it "outputs the time associated with the current 1PPS pulse … and tells
+/// the time of the pulse that just occurred". RMC also carries a time, but no specification ties it
+/// to the pulse — it is a navigation sentence that happens to contain a clock, and it sits near the
+/// end of the NMEA burst where, at 9600 baud, it can arrive *after the next edge*.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum NmeaTimeSource {
+    /// Recommended Minimum. The historical default here, kept so existing users are unaffected.
+    #[default]
+    Rmc,
+    /// Time & Date — the sentence the receiver defines relative to its 1PPS output.
+    Zda,
+}
 
 /// Diagnostics from the sync that [`PpsGpsdo::feed_nmea`] establishes (computed on the pre-update
 /// clock, then the epoch is applied). All ns; the caller decides what/whether to log.
@@ -46,16 +63,42 @@ pub struct SyncReport {
 pub struct PpsGpsdo {
     clock: Gnssdo,
     sync: crate::PpsTimeSync,
+    source: NmeaTimeSource,
 }
 
 impl PpsGpsdo {
     /// Create with the default discipline and [`SameSecond`](crate::PpsNmeaAssociation::SameSecond)
     /// PPS↔NMEA association.
     pub const fn new() -> Self {
+        Self::with_association(crate::PpsNmeaAssociation::SameSecond)
+    }
+
+    /// Create with an explicit time source and PPS↔NMEA association.
+    ///
+    /// See [`NmeaTimeSource`] — on a receiver that emits ZDA, preferring it is the more defensible
+    /// choice, because ZDA is the only sentence specified against the timing pulse.
+    pub const fn with_config(
+        source: NmeaTimeSource,
+        association: crate::PpsNmeaAssociation,
+    ) -> Self {
         Self {
             clock: Gnssdo::new(),
-            sync: crate::PpsTimeSync::new(),
+            sync: crate::PpsTimeSync::with_association(association),
+            source,
         }
+    }
+
+    /// Create with an explicit PPS↔NMEA association.
+    ///
+    /// Worth reaching for: [`PpsNmeaAssociation`](crate::PpsNmeaAssociation) is documented as the
+    /// biggest footgun in this library, because getting it wrong shifts the whole UTC epoch by a
+    /// second while every *phase* measurement still looks perfect. Until this existed, the turn-key
+    /// bundle was the one path that could not change it.
+    ///
+    /// The symptom is invisible without an external time reference — a disciplined 1PPS output can
+    /// sit on the GPS edge to nanoseconds and still be labelled with the wrong second.
+    pub const fn with_association(association: crate::PpsNmeaAssociation) -> Self {
+        Self::with_config(NmeaTimeSource::Rmc, association)
     }
 
     /// Feed a timed PPS edge, timestamped on the query timebase (e.g. embassy `Instant`) as
@@ -67,11 +110,25 @@ impl PpsGpsdo {
             .on_pps(edge.edge_ns / 1000, edge.interval_ns as i64)
     }
 
-    /// Feed a framed NMEA sentence. On an RMC paired with a fresh PPS edge, establishes/refreshes
-    /// the UTC epoch and returns a [`SyncReport`]; otherwise (non-RMC, no fresh edge, parse failure)
-    /// returns `None`.
+    /// Feed a framed NMEA sentence.
+    ///
+    /// Only the sentence named by the configured [`NmeaTimeSource`] is considered — RMC by default,
+    /// ZDA with [`with_config`](Self::with_config). When that sentence arrives and a fresh PPS edge
+    /// is pending, the UTC epoch is established or refreshed and a [`SyncReport`] is returned.
+    ///
+    /// `None` otherwise, which covers three different situations that a caller may want to tell
+    /// apart by other means: the sentence is not the configured one (including the *other* time
+    /// sentence, which is ignored rather than used), no fresh edge is pending, or the sentence
+    /// failed to parse. In none of these is the pending edge consumed, so a later matching sentence
+    /// can still pair with it.
     pub fn feed_nmea(&mut self, sentence: &str) -> Option<SyncReport> {
-        let ((h, mi, s), (day, month, year)) = parse_rmc_time_date(sentence)?;
+        // Only the configured sentence is parsed, never "whichever arrives first". Both RMC and ZDA
+        // appear in the same burst, and `on_time` consumes the pending edge — so accepting both
+        // would silently let the earlier one win and make the choice meaningless.
+        let ((h, mi, s), (day, month, year)) = match self.source {
+            NmeaTimeSource::Rmc => parse_rmc_time_date(sentence)?,
+            NmeaTimeSource::Zda => parse_zda_time_date(sentence)?,
+        };
         self.sync.set_date(year, month, day);
         let epoch = self.sync.on_time(h, mi, s)?;
         // Residuals are computed on the pre-update clock (the self-diagnostic of the correction).
@@ -224,6 +281,87 @@ mod tests {
         assert_eq!(g.now_from_query_ns(1_000_000_000), Some(want));
         // A stale edge is not re-paired (no new on_pps_edge): no second sync.
         assert!(g.feed_nmea(RMC).is_none());
+    }
+
+    // --- The configured time source, end to end ---
+    //
+    // The parser tests next door only prove `parse_zda_time_date` reads a sentence. These prove the
+    // thing this configuration exists for: that selecting ZDA actually changes which sentence
+    // establishes the epoch, and that the *other* time sentence is passed over rather than used.
+
+    /// The same instant as `RMC` above, as ZDA. Checksum is genuine, though the built-in parser
+    /// does not validate it.
+    const ZDA: &str = "$GPZDA,170658.000,07,06,2026,,*5C";
+
+    #[test]
+    fn zda_source_establishes_utc_from_zda() {
+        let mut g =
+            PpsGpsdo::with_config(NmeaTimeSource::Zda, crate::PpsNmeaAssociation::SameSecond);
+        g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);
+        let report = g
+            .feed_nmea(ZDA)
+            .expect("ZDA + fresh edge establishes a sync");
+        let want = crate::civil_to_unix(2026, 6, 7, 17, 6, 58) * 1_000_000_000;
+        assert_eq!(report.unix_ns, want);
+        assert_eq!(g.now_from_query_ns(1_000_000_000), Some(want));
+    }
+
+    #[test]
+    fn zda_source_passes_over_rmc_without_consuming_the_edge() {
+        // RMC arrives *earlier* in the burst than ZDA. If it were accepted — or if rejecting it
+        // still consumed the pending edge — the ZDA that follows would find nothing to pair with
+        // and the whole selection would be decorative.
+        let mut g =
+            PpsGpsdo::with_config(NmeaTimeSource::Zda, crate::PpsNmeaAssociation::SameSecond);
+        g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);
+        assert!(
+            g.feed_nmea(RMC).is_none(),
+            "RMC must not establish an epoch"
+        );
+        assert!(
+            g.now_from_query_ns(1_000_000_000).is_none(),
+            "and must not have established one behind our back"
+        );
+        // The edge survived, so the sentence we actually asked for can still use it.
+        let report = g
+            .feed_nmea(ZDA)
+            .expect("the edge was still pending for ZDA");
+        assert_eq!(
+            report.unix_ns,
+            crate::civil_to_unix(2026, 6, 7, 17, 6, 58) * 1_000_000_000
+        );
+    }
+
+    #[test]
+    fn rmc_source_passes_over_zda_symmetrically() {
+        let mut g = PpsGpsdo::new(); // RMC is the default
+        g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);
+        assert!(
+            g.feed_nmea(ZDA).is_none(),
+            "ZDA must not establish an epoch"
+        );
+        assert!(g.feed_nmea(RMC).is_some(), "the edge was still pending");
+    }
+
+    #[test]
+    fn the_configured_association_shifts_the_epoch() {
+        // The ±1 s correction is the setting this crate calls its biggest footgun, and until
+        // `with_config`/`with_association` existed the bundle could not reach it at all. Prove it
+        // arrives: the same sentence and edge must land a second later.
+        let mut g = PpsGpsdo::with_config(
+            NmeaTimeSource::Zda,
+            crate::PpsNmeaAssociation::NmeaIsPreviousSecond,
+        );
+        g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);
+        let report = g
+            .feed_nmea(ZDA)
+            .expect("ZDA + fresh edge establishes a sync");
+        let same_second = crate::civil_to_unix(2026, 6, 7, 17, 6, 58) * 1_000_000_000;
+        assert_eq!(
+            report.unix_ns,
+            same_second + 1_000_000_000,
+            "NmeaIsPreviousSecond puts the edge one second after the sentence"
+        );
     }
 
     #[test]

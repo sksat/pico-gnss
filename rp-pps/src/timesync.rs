@@ -83,6 +83,62 @@ pub fn parse_rmc_time_date(sentence: &str) -> Option<RmcTimeDate> {
     Some((time, date))
 }
 
+/// Extract `((hour,min,sec),(day,month,year))` from a **ZDA** sentence.
+///
+/// `$GPZDA,hhmmss.sss,dd,mm,yyyy,zh,zm*CS` — time, then day, month and a **four-digit** year, so
+/// unlike RMC there is no two-digit year to guess a century for.
+///
+/// # Why this sentence in particular
+///
+/// ZDA is the one NMEA sentence defined *against the timing pulse*. The MT3333 platform NMEA
+/// specification lists it as the "PPS timing message (synchronized to PPS)" and says it "outputs the
+/// time associated with the current 1PPS pulse … and tells the time of the pulse that just
+/// occurred". RMC carries a time too, but nothing in any specification ties it to the pulse — it is
+/// a navigation sentence that happens to contain a clock.
+///
+/// Pairing on a sentence with no defined relationship to the edge is how a receiver ends up
+/// labelling the pulse with the wrong second.
+pub fn parse_zda_time_date(sentence: &str) -> Option<RmcTimeDate> {
+    if sentence.get(3..6) != Some("ZDA") {
+        return None;
+    }
+    let mut f = sentence.split(',');
+    let time = f.nth(1).and_then(parse_hhmmss)?;
+    let day: u8 = f.next()?.parse().ok()?;
+    let month: u8 = f.next()?.parse().ok()?;
+    let year_field = f.next()?;
+    // ZDA's year is four digits by definition; anything else is not the field we think it is.
+    if year_field.len() != 4 {
+        return None;
+    }
+    let year: u16 = year_field.parse().ok()?;
+    if year < 1980 {
+        return None;
+    }
+    // Check the real length of the month, leap years included. A bare `day <= 31` would accept
+    // 31 February, and `civil_to_unix` normalises that into 3 March without complaint — quietly
+    // establishing a UTC epoch two days off. Rejecting is the only safe answer: a receiver that
+    // emits an impossible date is not one whose time should be believed.
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(month, year) {
+        return None;
+    }
+    Some((time, (day, month, year)))
+}
+
+/// Length of a Gregorian month, leap years included. 0 for an invalid month.
+const fn days_in_month(month: u8, year: u16) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap =
+                (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
 /// Extract `((hour,min,sec),(day,month,year))` from RMC (nmea crate backend). See the default
 /// version's docs. `nmea::parse_str` **validates the checksum** before extracting RMC
 /// (mismatch → `None`).
@@ -233,6 +289,65 @@ mod tests {
         assert_eq!(parse_hhmmss("12345"), None); // too short
         assert_eq!(parse_hhmmss("99xxss"), None);
         assert_eq!(parse_hhmmss("250000"), None); // hour > 23
+    }
+
+    #[test]
+    fn parse_zda_extracts_time_and_a_four_digit_year() {
+        // A real sentence from the receiver this was developed against.
+        let s = "$GPZDA,024247.000,18,08,2026,,*56";
+        let r = parse_zda_time_date(s).unwrap();
+        assert_eq!(r.0, (2, 42, 47));
+        // No century to guess at, unlike RMC's two-digit year.
+        assert_eq!(r.1, (18, 8, 2026));
+    }
+
+    #[test]
+    fn parse_zda_ignores_other_sentences() {
+        // Both appear in the same burst, so a parser that accepted either would make the choice of
+        // time source meaningless — whichever arrived first would win.
+        let rmc = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
+        assert!(parse_zda_time_date(rmc).is_none());
+        assert!(
+            parse_zda_time_date("$GPGGA,024247.000,3605.7502,N,1,11,1.11,30.9,M,,,*5A").is_none()
+        );
+    }
+
+    #[test]
+    fn parse_zda_rejects_impossible_dates() {
+        assert!(parse_zda_time_date("$GPZDA,024247.000,32,08,2026,,*00").is_none());
+        assert!(parse_zda_time_date("$GPZDA,024247.000,18,13,2026,,*00").is_none());
+        assert!(parse_zda_time_date("$GPZDA,024247.000,00,08,2026,,*00").is_none());
+        // A year before GPS existed means the field is not what we think it is.
+        assert!(parse_zda_time_date("$GPZDA,024247.000,18,08,1970,,*00").is_none());
+        // ZDA's year is four digits; other widths mean the fields are not where we think.
+        assert!(parse_zda_time_date("$GPZDA,024247.000,18,08,26,,*00").is_none());
+        assert!(parse_zda_time_date("$GPZDA,024247.000,18,08,20260,,*00").is_none());
+    }
+
+    #[test]
+    fn parse_zda_rejects_a_day_past_the_end_of_its_month() {
+        // `day <= 31` alone would let these through, and `civil_to_unix` normalises them into the
+        // following month rather than failing — an epoch silently days off.
+        assert!(parse_zda_time_date("$GPZDA,024247.000,31,02,2026,,*00").is_none());
+        assert!(parse_zda_time_date("$GPZDA,024247.000,31,04,2026,,*00").is_none());
+        assert!(parse_zda_time_date("$GPZDA,024247.000,31,09,2026,,*00").is_none());
+        // The last valid day of a 30-day month still parses.
+        assert!(parse_zda_time_date("$GPZDA,024247.000,30,04,2026,,*00").is_some());
+    }
+
+    #[test]
+    fn parse_zda_knows_which_februaries_have_29_days() {
+        // 2024 is a leap year, 2026 is not, 2000 is (divisible by 400), 1900 would not be.
+        assert!(parse_zda_time_date("$GPZDA,024247.000,29,02,2024,,*00").is_some());
+        assert!(parse_zda_time_date("$GPZDA,024247.000,29,02,2026,,*00").is_none());
+        assert!(parse_zda_time_date("$GPZDA,024247.000,29,02,2000,,*00").is_some());
+        assert!(parse_zda_time_date("$GPZDA,024247.000,29,02,2100,,*00").is_none());
+    }
+
+    #[test]
+    fn parse_zda_rejects_a_truncated_sentence() {
+        assert!(parse_zda_time_date("$GPZDA,024247.000,18").is_none());
+        assert!(parse_zda_time_date("$GPZDA").is_none());
     }
 
     #[test]

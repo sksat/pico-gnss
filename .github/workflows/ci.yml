@@ -28,6 +28,10 @@ jobs:
       - run: cargo test -p gnssdo
       - run: cargo test -p gnssdo --all-features
       - run: cargo test -p rp-pps
+      # `gnssdo` gates the PpsGpsdo bundle and its tests — including the ones covering which NMEA
+      # sentence establishes the epoch. Without this they compile nowhere in CI and can rot.
+      # (Not --all-features: the HAL backends need a target.)
+      - run: cargo test -p rp-pps --features gnssdo
 
   embedded:
     name: embedded (thumbv6m-none-eabi)
