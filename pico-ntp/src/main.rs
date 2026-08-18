@@ -44,6 +44,7 @@
 //! calibration exchange it would like to make, `disable auth` and an explicit `broadcastdelay`).
 
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use defmt::{info, warn};
 use defmt_rtt as _;
@@ -149,17 +150,20 @@ const GNSS_BOOT_BAUD: u32 = 9600;
 /// What it would be raised to, to get the NMEA burst out of the way of the next PPS edge.
 const GNSS_FAST_BAUD: u32 = 115_200;
 
-/// **Off, because it did not work.** Sending `PMTK251,115200` and switching the UART leaves the
-/// link producing nothing but framing and break errors, i.e. the module kept transmitting at 9600
-/// and did not accept the command. Not yet established whether it needs longer after power-up
-/// before it will take configuration, whether this module's firmware supports PMTK251 at all, or
-/// whether the switch has to be sequenced differently.
+/// Whether to raise the receiver's baud rate at boot.
 ///
-/// Kept rather than deleted because the *reason* to want it is sound and unchanged: at 9600 baud
-/// the NMEA burst lands on top of the next PPS edge (margin: mean 490 ms, sd 460 ms, **min 2 ms**),
-/// which is what makes the second-pairing a coin toss. Trimming the sentence set with `PMTK314` is
-/// the other route to the same margin and may prove easier, since it does not require both ends to
-/// change rate in step.
+/// On, and effectively required: at 9600 the NMEA burst lands on top of the next PPS edge (margin
+/// mean 490 ms, sd 460 ms, **min 2 ms**), which makes the second-pairing a coin toss. Turning this
+/// off leaves the receiver at 9600, and [`SOURCE_TRUSTED`] then keeps the server silent rather than
+/// letting it announce a second it cannot vouch for.
+///
+/// An earlier attempt at this did fail — sending `PMTK251,115200` and switching the UART left the
+/// link producing nothing but framing errors, because the module needs time after power-up before
+/// it will take configuration and because the setting survives a reflash. Both are handled by
+/// probing the port either side of the command rather than assuming; see `establish_gnss_link`.
+///
+/// `PMTK314` is the other route to the same margin, trimming the sentence set instead, and does not
+/// require both ends to change rate in step. Untried.
 const RAISE_BAUD: bool = true;
 
 /// How the disciplined clock is configured, pinned rather than inherited.
@@ -197,6 +201,14 @@ const TIME_SOURCE: rp_pps::NmeaTimeSource = rp_pps::NmeaTimeSource::Zda;
 /// The disciplined clock. The two rp-pps runners write it; the NTP task reads it.
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<PpsGpsdo>> =
     BlockingMutex::new(RefCell::new(PpsGpsdo::with_config(TIME_SOURCE, PPS_NMEA)));
+
+/// Whether the receiver ended up in the configuration this server's correctness rests on.
+///
+/// Raising the baud rate is a *correctness* measure, not a throughput one: at 9600 the timing
+/// sentence lands on the next PPS edge and the second can flip at runtime. A clock built on that
+/// pairing may be a whole second out, and a stratum-1 server is believed — so if the upgrade did
+/// not take, we keep the link alive and say nothing rather than announce a time we cannot vouch for.
+static SOURCE_TRUSTED: AtomicBool = AtomicBool::new(false);
 
 /// `Instant` as nanoseconds (µs resolution) — the query timebase for the disciplined clock.
 fn now_ns() -> u64 {
@@ -253,6 +265,15 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
     let mut last_target_ns: i64 = i64::MIN;
 
     loop {
+        // The receiver never reached the rate the pairing depends on, so the second this clock is
+        // built on may be wrong. Hold the link up — a dropped link is harder to diagnose than a
+        // quiet one — and serve nothing. `main` has already said why on RTT.
+        if !SOURCE_TRUSTED.load(Ordering::Relaxed) {
+            tx.link_pulse();
+            Timer::after_micros(nlp_us).await;
+            continue;
+        }
+
         let (now, state) = clock_state();
 
         // Without a UTC epoch there is no second boundary to aim at. Keep the link up and wait.
@@ -541,8 +562,20 @@ async fn main(spawner: Spawner) {
     // milliseconds clear of the next edge and turns a coin toss into a margin.
     //
     // Not persistent: the module reverts to 9600 on power loss, so this runs on every boot.
-    if RAISE_BAUD {
-        establish_gnss_link(&mut uart).await;
+    // Whether that succeeded decides whether we may serve at all: the pairing this clock is built
+    // on is only trustworthy at the fast rate, and every fallback below leaves us at the slow one.
+    let gnss_baud = if RAISE_BAUD {
+        establish_gnss_link(&mut uart).await
+    } else {
+        GNSS_BOOT_BAUD
+    };
+    if gnss_baud == GNSS_FAST_BAUD {
+        SOURCE_TRUSTED.store(true, Ordering::Relaxed);
+    } else {
+        warn!(
+            "NTP disabled: receiver at {} baud, where the PPS-NMEA pairing can be a second out",
+            gnss_baud
+        );
     }
 
     let (_uart_tx, uart_rx) = uart.split();
