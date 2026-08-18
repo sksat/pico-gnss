@@ -101,3 +101,16 @@ error, crystal ppb, and temperature with its feed-forward contribution:
 ![GPSDO/GNSSDO pull-in from boot — scope + parameters, per-PPS](docs/report/precision-ladder/precision-figs/combo-gpsdo-fromboot.gif)
 
 See [`docs/report/precision-ladder/README.md`](docs/report/precision-ladder/README.md) for the full methodology and figures (Japanese).
+
+Phase is not the whole story, though. A disciplined 1PPS can sit on the GPS edge to within
+nanoseconds while being labelled with the *wrong second* — an error no oscilloscope can show you,
+because the waveform is right and only the name is wrong. That is exactly what was happening here,
+and finding it took comparing against an external clock rather than against the GPS edge:
+
+![how much room the time sentence has before the next PPS edge](docs/report/pps-nmea-pairing/fig-margin.png)
+
+At 9600 baud the receiver's NMEA output occupies 82% of the link, so the sentence carrying the UTC
+second arrives within a couple of milliseconds of the *next* pulse — and the distribution above
+straddles that boundary. See
+[`docs/report/pps-nmea-pairing/README.md`](docs/report/pps-nmea-pairing/README.md) for how it was
+found and fixed (Japanese).
