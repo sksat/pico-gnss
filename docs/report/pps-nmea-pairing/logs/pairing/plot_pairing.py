@@ -32,14 +32,14 @@ OUT = Path(__file__).resolve().parents[2]
 
 TIME_RE = re.compile(r"^(\d+\.\d+)\s")
 PPS_RE = re.compile(r"PPS count=\d+ ")
-NMEA_RE = re.compile(r"NMEA \$([A-Z]{2})([A-Z]{3})")
+NMEA_RE = re.compile(r"NMEA (\$([A-Z]{2})([A-Z]{3})\S*)")
 
 # 見やすさのため、図の色は 2 つの条件で固定する。
 SLOW_C, FAST_C = "#c1442e", "#2e7d5b"
 
 
 def load(path: Path):
-    """(PPS エッジ時刻, [(センテンス時刻, 種別)]) を返す。"""
+    """(PPS エッジ時刻, [(センテンス時刻, 種別, バイト長)]) を返す。"""
     edges, sentences = [], []
     for line in path.read_text(errors="replace").splitlines():
         m = TIME_RE.match(line)
@@ -51,14 +51,15 @@ def load(path: Path):
             continue
         n = NMEA_RE.search(line)
         if n:
-            sentences.append((t, n.group(2)))
+            # 中身は座標を含むので保持しない。占有率に要るのは長さだけである (+2 は CRLF)。
+            sentences.append((t, n.group(3), len(n.group(1)) + 2))
     return edges, sentences
 
 
 def margins(edges, sentences, kind):
     """種別 `kind` のセンテンスについて (直前エッジからの経過, 次エッジまでの残り)。"""
     out = []
-    for t, k in sentences:
+    for t, k, _n in sentences:
         if k != kind:
             continue
         prev = [e for e in edges if e <= t]
@@ -75,7 +76,7 @@ def one_second(edges, sentences, want=("RMC", "ZDA")):
     中央値の区間」で、たまたま短い/長い秒を代表にしないようにする。
     """
     per_edge: dict[int, list[tuple[float, str]]] = {}
-    for t, k in sentences:
+    for t, k, _n in sentences:
         prev = [i for i, e in enumerate(edges) if e <= t]
         if prev and prev[-1] + 1 < len(edges):
             per_edge.setdefault(prev[-1], []).append((t - edges[prev[-1]], k))
@@ -89,13 +90,19 @@ def one_second(edges, sentences, want=("RMC", "ZDA")):
     return sorted(next(iter(per_edge.values())))
 
 
-def occupancy(sentences, span, baud):
-    """NMEA が UART をどれだけ占有しているか (0..1)。1 文字 10 bit で数える。"""
-    chars = sum(len(k) + 8 for _, k in sentences)  # talker+type+本体のおおよそ
-    return chars * 10 / span / baud
+def occupancy(edges, sentences, baud):
+    """NMEA が UART を毎秒どれだけ占有しているか。(占有率, 1 秒あたりの文字数) を返す。
+
+    長さは実際に届いたセンテンスそのものから取る。種別名から概算していたこともあったが、
+    GSV のように衛星数で伸びる文があるので、それでは占有率が当たらない。1 文字 10 bit
+    (8N1) で数える。
+    """
+    span = edges[-1] - edges[0]
+    n = sum(b for t, _k, b in sentences if edges[0] <= t <= edges[-1])
+    return n * 10 / span / baud, n / span
 
 
-def fig_timeline(slow, fast, path: Path):
+def fig_timeline(slow, fast, notes, path: Path):
     """代表的な 1 秒に、実測のセンテンス到着をそのまま並べる。
 
     注釈は全部 axes の内側に置く。外に出すと x 軸ラベルや目盛と重なるし、右端の
@@ -105,8 +112,8 @@ def fig_timeline(slow, fast, path: Path):
     for ax, (label, items, colour, note) in zip(
         axes,
         [
-            ("9600 baud", slow, SLOW_C, "82% of the link is NMEA"),
-            ("115200 baud", fast, FAST_C, "7% of the link is NMEA"),
+            ("9600 baud", slow, SLOW_C, notes[0]),
+            ("115200 baud", fast, FAST_C, notes[1]),
         ],
     ):
         for x, text, ha, dx in (
@@ -228,9 +235,28 @@ def main() -> int:
     print(f"9600   ZDA {stats(slow_zda)}")
     print(f"115200 RMC {stats(fast_rmc)}")
 
+    slow_u, slow_c = occupancy(slow_e, slow_s, 9600)
+    fast_u, fast_c = occupancy(fast_e, fast_s, 115200)
+    print(f"9600   {slow_c:.0f} chars/s -> {slow_u * 100:.0f}% of the link")
+    print(f"115200 {fast_c:.0f} chars/s -> {fast_u * 100:.0f}% of the link")
+
+    for name, e, s in (("9600  ", slow_e, slow_s), ("115200", fast_e, fast_s)):
+        it = one_second(e, s)
+        gaps = [b[0] - a[0] for a, b in zip(it, it[1:])]
+        print(
+            f"{name} burst {it[0][0] * 1000:.0f}..{it[-1][0] * 1000:.0f} ms "
+            f"(span {(it[-1][0] - it[0][0]) * 1000:.0f} ms, n={len(it)}, "
+            f"max gap {max(gaps) * 1000:.0f} ms)"
+        )
+        for kind in ("RMC", "ZDA"):
+            hit = [o for o, k in it if k == kind]
+            if hit:
+                print(f"{name}   {kind} at {hit[0] * 1000:.0f} ms, {(1 - hit[0]) * 1000:.0f} ms to next edge")
+
     fig_timeline(
         one_second(slow_e, slow_s),
         one_second(fast_e, fast_s),
+        [f"{slow_u * 100:.0f}% of the link is NMEA", f"{fast_u * 100:.0f}% of the link is NMEA"],
         OUT / "fig-burst-timing.png",
     )
     fig_margin(slow_rmc, fast_rmc, OUT / "fig-margin.png")
