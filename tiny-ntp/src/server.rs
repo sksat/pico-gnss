@@ -166,14 +166,15 @@ fn gate(cfg: &ServerConfig, state: &ClockState) -> Result<i64, SilentReason> {
     Ok(last_update)
 }
 
-/// Whether the clock is in a state we may serve from, without building a packet to find out.
+/// Why this clock would be refused service right now, or `None` if it would not — the same
+/// judgement [`broadcast`] and [`respond`] make, without building a packet to find out.
 ///
 /// For callers that prepare a frame ahead of the instant it is due to leave: encoding takes time,
 /// and doing it after the transmit timestamp has passed makes that timestamp a lie. Build early,
 /// then ask this immediately before handing the buffer over — the answer can change in between, and
 /// what matters is the answer at transmission.
-pub fn may_serve(cfg: &ServerConfig, state: &ClockState) -> Result<(), SilentReason> {
-    gate(cfg, state).map(|_| ())
+pub fn silent_reason(cfg: &ServerConfig, state: &ClockState) -> Option<SilentReason> {
+    gate(cfg, state).err()
 }
 
 /// Our stratum: 1 for a reference clock, one more than the upstream otherwise.
@@ -780,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn may_serve_agrees_with_what_the_service_modes_decide() {
+    fn silent_reason_agrees_with_what_the_service_modes_decide() {
         // It exists so a caller can build a frame early and check eligibility late. If it could
         // disagree with the gate the modes use, that caller would send packets the policy refused.
         let cases = [
@@ -800,10 +801,10 @@ mod tests {
         ];
         for state in cases {
             let by_broadcast = match broadcast(&cfg(), &state, REF_UNIX_NS) {
-                ServeDecision::Serve(_) => Ok(()),
-                ServeDecision::Silent(r) => Err(r),
+                ServeDecision::Serve(_) => None,
+                ServeDecision::Silent(r) => Some(r),
             };
-            assert_eq!(may_serve(&cfg(), &state), by_broadcast);
+            assert_eq!(silent_reason(&cfg(), &state), by_broadcast);
         }
     }
 }

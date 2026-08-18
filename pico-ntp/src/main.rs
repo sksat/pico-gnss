@@ -71,7 +71,7 @@ use rp_pps::PpsGpsdo;
 use rp_pps::embassy::{TimedPpsCapture, run_capture, run_nmea};
 use tiny_ntp::packet::PACKET_LEN;
 use tiny_ntp::server::{
-    ClockState, LeapWarning, ServeDecision, ServerConfig, Source, broadcast, may_serve,
+    ClockState, LeapWarning, ServeDecision, ServerConfig, Source, broadcast, silent_reason,
 };
 
 bind_interrupts!(struct Irqs {
@@ -376,7 +376,7 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
                 // moving the build off the critical path would have bought accuracy by paying with
                 // correctness. Cheaper than `broadcast()`: this asks the gate without rebuilding a
                 // packet we would only discard.
-                if let Err(reason) = may_serve(&CFG, &state_at_handover) {
+                if let Some(reason) = silent_reason(&CFG, &state_at_handover) {
                     warn!("NTP silent at handover: {}", defmt::Debug2Format(&reason));
                     tx.link_pulse();
                     Timer::after_micros(nlp_us).await;
