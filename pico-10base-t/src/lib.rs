@@ -18,5 +18,7 @@
 #![no_std]
 
 pub mod frame;
+pub mod phy;
 
 pub use frame::{Ipv4Addr, MacAddr, UdpFrameSpec, build_udp_frame};
+pub use phy::{NLP_WORD, TP_IDL_WORD, encode_frame, encoded_words, manchester_word};

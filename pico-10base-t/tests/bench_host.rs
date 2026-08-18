@@ -1,4 +1,4 @@
-//! Host-side cost measurement for the framing path, swept across frame sizes.
+//! Host-side cost measurement for the transmit path, swept across frame sizes.
 //!
 //! **Not** a substitute for an on-target benchmark — an x86 host has a barrel shifter, a data cache
 //! and a branch predictor the Cortex-M0+ does not. Treat the absolute numbers as an upper bound on
@@ -12,26 +12,27 @@
 //!
 //! # What the numbers mean
 //!
-//! 10BASE-T puts one bit on the wire every 100 ns, so a frame of `N` bytes (plus the 8-byte
-//! preamble/SFD) occupies the wire for `(N + 8) * 800 ns`. The question that decides whether this
-//! crate can stream back-to-back frames is whether the CPU can *prepare* a frame faster than the
-//! wire *drains* one. The `wire%` column below is exactly that: CPU time as a percentage of wire
-//! time. Under 100% means line rate is reachable with double buffering; over 100% means the CPU is
-//! the bottleneck and the link idles.
+//! 10BASE-T puts one bit on the wire every 100 ns — that rate is fixed and nothing here can raise
+//! it. Two separate ceilings decide what a caller actually gets:
 //!
-//! This measures framing only (headers, checksums, FCS). The Manchester symbol encoding is a
-//! separate and larger cost; it belongs in this sweep once it exists.
+//! - **Protocol limit.** Every frame carries a 7+1 byte preamble/SFD, 46 bytes of headers and FCS,
+//!   and is followed by a 96-bit-time (12 byte) interframe gap. Those are pure overhead, so UDP
+//!   goodput tops out well under 10 Mbit/s and collapses for small payloads.
+//! - **CPU limit.** Whether the RP2040 can *prepare* frames faster than the wire *drains* them. If
+//!   it cannot, the link idles waiting and the protocol limit is unreachable.
+//!
+//! The `CPU%` column is preparation time as a percentage of wire time; under 100% means line rate
+//! is reachable given double buffering, and the second table says which ceiling binds.
 
 use std::time::Instant;
 
-use pico_10base_t::frame::{
-    FCS_LEN, IPV4_HEADER_LEN, Ipv4Addr, MacAddr, UDP_HEADER_LEN, UdpFrameSpec, build_udp_frame,
-    crc32, frame_len,
-};
+use pico_10base_t::frame::{Ipv4Addr, MacAddr, UdpFrameSpec, build_udp_frame, crc32, frame_len};
+use pico_10base_t::phy::{encode_frame, encoded_words, manchester_word};
 
-/// Preamble + SFD, which the PHY emits ahead of every frame and which therefore counts against the
-/// wire-time budget even though `build_udp_frame` never sees it.
+/// Preamble + SFD, which the PHY emits ahead of every frame.
 const PREAMBLE_LEN: usize = 8;
+/// Interframe gap: 96 bit times, i.e. 12 bytes of silence between frames.
+const IFG_LEN: usize = 12;
 /// 10BASE-T: 10 Mbit/s, so 100 ns per bit.
 const NS_PER_BIT: f64 = 100.0;
 
@@ -62,6 +63,31 @@ fn crc32_table(data: &[u8]) -> u32 {
         crc = CRC_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     !crc
+}
+
+/// The Manchester equivalent of upstream's `tbl_manchester`, for the same comparison.
+const MANCHESTER_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = manchester_word(i as u8);
+        i += 1;
+    }
+    table
+};
+
+fn encode_frame_table(frame: &[u8], out: &mut [u32]) -> usize {
+    let mut i = 0;
+    for b in pico_10base_t::phy::PREAMBLE_SFD {
+        out[i] = MANCHESTER_TABLE[b as usize];
+        i += 1;
+    }
+    for &b in frame {
+        out[i] = MANCHESTER_TABLE[b as usize];
+        i += 1;
+    }
+    out[i] = pico_10base_t::phy::TP_IDL_WORD;
+    i + 1
 }
 
 fn spec(payload: &[u8]) -> UdpFrameSpec<'_> {
@@ -103,74 +129,113 @@ fn the_two_crc32_implementations_agree() {
 }
 
 #[test]
+fn the_two_manchester_encoders_agree() {
+    let frame = vec![0xA5u8; 94];
+    let mut a = vec![0u32; 256];
+    let mut b = vec![0u32; 256];
+    let n = encode_frame(&frame, &mut a).unwrap();
+    assert_eq!(n, encode_frame_table(&frame, &mut b));
+    assert_eq!(a[..n], b[..n]);
+}
+
+#[test]
 #[ignore = "benchmark; run with --ignored --nocapture"]
-fn framing_cost_across_frame_sizes() {
+fn transmit_path_cost_and_achievable_rate() {
     // UDP payload sizes: the smallest that still pads, an NTP packet, and up to the largest that
     // fits a 1500-byte IP MTU (1500 - 20 IPv4 - 8 UDP).
     const PAYLOADS: [usize; 6] = [1, 48, 256, 512, 1024, 1472];
     let mut out = vec![0u8; 2048];
+    let mut sym = vec![0u32; 2048];
 
     println!();
+    println!("prepare cost vs wire time (CPU% under 100 means line rate is reachable)");
     println!(
-        "{:>8} {:>7} {:>11} {:>11} {:>8} {:>9}",
-        "payload", "frame", "build", "wire", "wire%", "symbolRAM"
+        "{:>8} {:>6} {:>10} {:>10} {:>9} {:>7} {:>8}",
+        "payload", "frame", "build", "encode", "wire", "CPU%", "symRAM"
     );
     for &n in &PAYLOADS {
         let payload = vec![0xA5u8; n];
         let frame = frame_len(n);
         let iters = if n > 512 { 20_000 } else { 200_000 };
-        let t = time_it(iters, || {
+        let build = time_it(iters, || {
             std::hint::black_box(build_udp_frame(
                 std::hint::black_box(&spec(&payload)),
                 &mut out,
             ));
         });
+        let encode = time_it(iters, || {
+            std::hint::black_box(encode_frame(std::hint::black_box(&out[..frame]), &mut sym));
+        });
         let wire = wire_time(frame);
-        // Each data bit becomes two line states, each a 2-bit symbol: 4 bits of buffer per bit.
-        let symbol_ram = (frame + PREAMBLE_LEN) * 4;
+        let symbol_ram = encoded_words(frame) * 4;
         println!(
-            "{n:>8} {frame:>7} {:>9.0} ns {:>9.1} us {:>7.2}% {symbol_ram:>7} B",
-            t * 1e9,
+            "{n:>8} {frame:>6} {:>7.0} ns {:>7.0} ns {:>6.1} us {:>6.2}% {symbol_ram:>6} B",
+            build * 1e9,
+            encode * 1e9,
             wire * 1e6,
-            t / wire * 100.0
+            (build + encode) / wire * 100.0
         );
     }
 
     println!();
+    println!("achievable UDP goodput — which ceiling binds?");
+    println!(
+        "{:>8} {:>9} {:>12} {:>12} {:>11}",
+        "payload", "on-wire B", "proto Mbit/s", "CPU Mbit/s", "bottleneck"
+    );
+    for &n in &PAYLOADS {
+        let payload = vec![0xA5u8; n];
+        let iters = if n > 512 { 20_000 } else { 200_000 };
+        let cpu = time_it(iters, || {
+            let len = build_udp_frame(std::hint::black_box(&spec(&payload)), &mut out).unwrap();
+            std::hint::black_box(encode_frame(&out[..len], &mut sym));
+        });
+        // Every frame also costs a preamble and the interframe gap.
+        let on_wire = frame_len(n) + PREAMBLE_LEN + IFG_LEN;
+        let proto = n as f64 * 8.0 / (on_wire as f64 * 8.0 * NS_PER_BIT * 1e-9) / 1e6;
+        let cpu_mbps = n as f64 * 8.0 / cpu / 1e6;
+        let bottleneck = if cpu_mbps < proto { "CPU" } else { "wire" };
+        println!("{n:>8} {on_wire:>9} {proto:>11.2} {cpu_mbps:>11.0} {bottleneck:>11}");
+    }
+
+    // --- Would a lookup table help? ---
+    println!();
+    let frame_mtu = frame_len(1472);
+    build_udp_frame(&spec(&vec![0xA5u8; 1472]), &mut out).unwrap();
+    let enc_computed = time_it(20_000, || {
+        std::hint::black_box(encode_frame(
+            std::hint::black_box(&out[..frame_mtu]),
+            &mut sym,
+        ));
+    });
+    let enc_table = time_it(20_000, || {
+        std::hint::black_box(encode_frame_table(
+            std::hint::black_box(&out[..frame_mtu]),
+            &mut sym,
+        ));
+    });
     let big = vec![0x5Au8; 1500];
-    let bitwise = time_it(20_000, || {
+    let crc_bitwise = time_it(20_000, || {
         std::hint::black_box(crc32(std::hint::black_box(&big)));
     });
-    let table = time_it(20_000, || {
+    let crc_tab = time_it(20_000, || {
         std::hint::black_box(crc32_table(std::hint::black_box(&big)));
     });
-    println!("crc32 over 1500 B — bitwise {:>7.0} ns", bitwise * 1e9);
-    println!("crc32 over 1500 B — table   {:>7.0} ns", table * 1e9);
+    println!("lookup tables, at MTU (1 KB of flash each):");
     println!(
-        "table/bitwise speedup: {:.1}x for 1 KB of flash",
-        bitwise / table
+        "  manchester  computed {:>7.0} ns   table {:>7.0} ns   {:.2}x",
+        enc_computed * 1e9,
+        enc_table * 1e9,
+        enc_computed / enc_table
     );
     println!(
-        "  (a speedup near 1.0x here is not a measurement error: at -O3 LLVM recognises the\n   \
-         bitwise CRC idiom and rewrites it, erasing the difference. Re-run without --release\n   \
-         to see the algorithmic ratio, which is ~4.3x.)"
+        "  crc32       bitwise  {:>7.0} ns   table {:>7.0} ns   {:.2}x",
+        crc_bitwise * 1e9,
+        crc_tab * 1e9,
+        crc_bitwise / crc_tab
     );
     println!(
-        "crc32 is {:.0}% of build_udp_frame's work at MTU",
-        bitwise
-            / time_it(20_000, || {
-                std::hint::black_box(build_udp_frame(
-                    std::hint::black_box(&spec(&vec![0xA5u8; 1472])),
-                    &mut out,
-                ));
-            })
-            * 100.0
-    );
-
-    println!();
-    println!(
-        "note: an MTU frame is {} B of headers+FCS over {} B of payload",
-        IPV4_HEADER_LEN + UDP_HEADER_LEN + FCS_LEN + 14,
-        1472
+        "  (a crc32 ratio near 1.0 is not an error: at -O3 LLVM recognises the bitwise CRC\n   \
+         idiom and rewrites it. Re-run without --release to see the ~4.3x algorithmic ratio.)"
     );
 }
