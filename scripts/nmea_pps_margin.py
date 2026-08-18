@@ -2,63 +2,84 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""単発 (この試行専用): RMC が次の PPS エッジまでどれだけ余裕を持って届いているかを測る。
+"""NMEA の時刻センテンスが、次の PPS エッジまでどれだけ余裕を持って届いているかを測る。
 
-    uv run --no-project rmc_margin.py <rtt.log>
+    uv run --no-project scripts/nmea_pps_margin.py <rtt.log> [--sentence RMC|ZDA]
 
-なぜ測るか: rp-pps は RMC で PPS エッジと UTC 秒を対応付けるが、RMC は NMEA バーストの
-終盤にいる。9600bps ではバーストが 0.6 秒以上あり、開始も PPS から数百 ms 遅れるので、
-RMC が「次のエッジ」を越えて届くと対応付けが 1 秒ずれる。余裕が薄ければ、衛星数が増えて
-GSV が伸びただけで実行時に 1 秒飛ぶことになる。
+# なぜ測るか
 
-出力は各 RMC について「直前の PPS エッジからの経過」と「次の PPS エッジまでの残り」。
-残りが 0 に近いほど危ない。
+`rp-pps` は PPS エッジと UTC 秒を「エッジ + 直近の時刻センテンス」で対応付ける。センテンスは
+NMEA バーストの終盤にいるので、バーストが長いと**次のエッジを越えて**届き、対応付けが 1 秒ずれる。
+しかも位相しか見ていない限りこれは見えない — 規律 1PPS は GPS エッジ上に ns で乗ったまま、違う秒の
+ラベルを付ける。
+
+余裕が小さいほど危ない。実測例:
+
+    9600 bps    mean 490ms, sd 460ms, min   2ms   (エッジの前後に割れた二峰 = コイン投げ)
+    115200 bps  mean 749ms, sd  26ms, min 718ms   (エッジから遠い一峰 = 余裕)
+
+sd が大きく min が 0 に近ければ、衛星数が増えて GSV が伸びただけで実行時に 1 秒飛ぶ状態にある。
+
+# 入力
+
+firmware の RTT ログ (先頭が `<uptime秒> ` の defmt 行)。`PPS count=` 行と `NMEA $G..<sentence>`
+行の時刻を使う。どちらも出す firmware が要る (`pico-gnss` はどちらも出す)。
 """
 
+import argparse
 import re
 import sys
 from pathlib import Path
 
 TIME_RE = re.compile(r"^(\d+\.\d+)\s")
 PPS_RE = re.compile(r"PPS count=\d+ ")
-RMC_RE = re.compile(r"NMEA \$G[NP]RMC")
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print(__doc__)
-        return 2
-    lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("log", type=Path, help="firmware の RTT ログ")
+    ap.add_argument(
+        "--sentence",
+        default="RMC",
+        help="対応付けに使う時刻センテンス (既定 RMC。ZDA など)",
+    )
+    ap.add_argument("--show", type=int, default=10, help="先頭何件を並べるか")
+    args = ap.parse_args()
 
-    edges, rmcs = [], []
-    for line in lines:
+    sentence_re = re.compile(rf"NMEA \$G[A-Z]{{1,2}}{re.escape(args.sentence.upper())}")
+
+    edges, sentences = [], []
+    for line in args.log.read_text(errors="replace").splitlines():
         m = TIME_RE.match(line)
         if not m:
             continue
         t = float(m.group(1))
         if PPS_RE.search(line):
             edges.append(t)
-        elif RMC_RE.search(line):
-            rmcs.append(t)
+        elif sentence_re.search(line):
+            sentences.append(t)
 
-    if len(edges) < 3 or not rmcs:
-        print(f"not enough data: {len(edges)} edges, {len(rmcs)} RMC", file=sys.stderr)
+    if len(edges) < 3 or not sentences:
+        print(
+            f"not enough data: {len(edges)} PPS edges, {len(sentences)} {args.sentence} "
+            f"— does this firmware log both?",
+            file=sys.stderr,
+        )
         return 1
 
     margins = []
-    for r in rmcs:
-        prev = [e for e in edges if e <= r]
-        nxt = [e for e in edges if e > r]
-        if not prev or not nxt:
-            continue
-        margins.append((r - prev[-1], nxt[0] - r))
+    for s in sentences:
+        prev = [e for e in edges if e <= s]
+        nxt = [e for e in edges if e > s]
+        if prev and nxt:
+            margins.append((s - prev[-1], nxt[0] - s))
 
     if not margins:
-        print("no RMC bracketed by two edges", file=sys.stderr)
+        print(f"no {args.sentence} bracketed by two PPS edges", file=sys.stderr)
         return 1
 
     print(f"{'since prev edge':>16} {'until next edge':>16}")
-    for since, until in margins[:10]:
+    for since, until in margins[: args.show]:
         print(f"{since * 1000:>13.0f} ms {until * 1000:>13.0f} ms")
 
     untils = [u for _, u in margins]
@@ -66,13 +87,14 @@ def main() -> int:
     mean = sum(untils) / n
     sd = (sum((u - mean) ** 2 for u in untils) / n) ** 0.5
     print()
-    print(f"n={n}")
+    print(f"n={n}  sentence={args.sentence.upper()}")
     print(f"margin to the next PPS edge: mean {mean * 1000:.0f} ms, sd {sd * 1000:.0f} ms")
     print(f"                             min  {min(untils) * 1000:.0f} ms")
     print()
     print(
-        "A small minimum means the RMC-to-edge pairing is one longer NMEA burst away from\n"
-        "slipping a whole second — more satellites means more GSV sentences means a later RMC."
+        "A small minimum, or a standard deviation approaching half a second, means the pairing is\n"
+        "one longer NMEA burst away from slipping a whole second — more satellites means more GSV\n"
+        "sentences means a later time sentence."
     )
     return 0
 
