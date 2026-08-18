@@ -8,9 +8,24 @@ repository.workspace = true
 description = "RP2040 Stratum-1 NTP server firmware: a GNSS-disciplined clock serving time over 10BASE-T Ethernet driven straight from two GPIO pins. Currently announces by broadcast, because the present wiring cannot receive."
 publish = false
 
+# `cargo run` picks this without --bin (bench_tx is also a bin, behind a feature).
+default-run = "pico-ntp"
+
 [[bin]]
 name = "pico-ntp"
 path = "src/main.rs"
+
+# On-target transmit benchmark; not built by a normal build.
+# On hardware: cd pico-ntp && cargo run --release --features bench --bin bench_tx
+[[bin]]
+name = "bench_tx"
+path = "src/bin/bench_tx.rs"
+required-features = ["bench"]
+
+[features]
+# Builds the on-target benchmark binary. It needs no extra dependencies — the flag exists so a
+# normal build does not produce a second firmware image that would be easy to flash by accident.
+bench = []
 
 [dependencies]
 # The three layers this firmware wires together.

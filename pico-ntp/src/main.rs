@@ -162,8 +162,27 @@ const FRAME_DUMPS: u32 = 3;
 /// The residual in the second row is the probe's RTT polling latency, not clock error. See
 /// `logs/20260818-ntp-bringup/`.
 ///
-/// This value is for the Taiyo Yuden GYSFFMANC as sold by Akizuki; another MT3333 module with
-/// different firmware could differ, which is exactly why it is a constant here and not a default.
+/// **This is a mitigation, not a fix, and the underlying defect is worse than the offset.**
+///
+/// The MT3333 NMEA specification defines only **ZDA** against the pulse ("outputs the time
+/// associated with the current 1PPS pulse … tells the time of the pulse that just occurred").
+/// `rp-pps` pairs on **RMC**, which carries no such guarantee and sits near the end of the NMEA
+/// burst. At 9600 baud that burst runs ~640 ms and starts a few hundred ms after the edge, so RMC
+/// arrives *approximately on top of the next edge*. Measured over 188 sentences:
+///
+/// ```text
+/// margin from RMC to the next PPS edge: mean 490 ms, sd 460 ms, min 2 ms
+/// ```
+///
+/// The distribution is bimodal — tens of milliseconds before the edge, or tens of milliseconds
+/// after it — which means the pairing crosses the boundary at random. Whichever association is
+/// chosen, the second can still slip by one at runtime; more satellites means more GSV sentences
+/// means a later RMC. Setting this constant only picks which side of the coin toss is currently
+/// right.
+///
+/// The real fix is to give the pairing margin instead of guessing at it: trim the sentence set
+/// (`PMTK314`) or raise the baud rate so the burst finishes long before the next edge, and/or pair
+/// on the first sentence of the burst rather than one near its end.
 const PPS_NMEA: rp_pps::PpsNmeaAssociation = rp_pps::PpsNmeaAssociation::NmeaIsPreviousSecond;
 
 /// The disciplined clock. The two rp-pps runners write it; the NTP task reads it.

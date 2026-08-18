@@ -77,31 +77,47 @@ pub struct UdpFrameSpec<'a> {
 
 /// The Ethernet FCS: CRC-32 (reflected, polynomial `0xEDB88320`), as used by IEEE 802.3.
 ///
-/// Bitwise, with no lookup table, and measurement says that is the right call (see
-/// `tests/bench_host.rs`):
+/// Table-driven, for 1 KB of flash — and that decision was made by the target, not the host.
 ///
-/// - Building a whole frame costs **~0.26% of the time that frame occupies the wire**, flat across
-///   64 B to MTU. The CRC is ~94% of that, so even quadrupling it leaves framing around 1%.
-/// - A 256-entry table would cost 1 KB of flash to buy back a fraction of that 1%.
-/// - Curiously, the comparison cannot even be made on an optimising host build: at `-O0` the table
-///   is 4.3x faster, but at `-O3` the two are indistinguishable, because LLVM recognises the
-///   bitwise CRC idiom and rewrites it. Whether that recognition fires for `thumbv6m-none-eabi` is
-///   unknown — and does not matter, given the margin above.
+/// The host benchmark says framing costs ~0.26% of the time a frame occupies the wire, which makes
+/// a table look like a waste. On the actual Cortex-M0+ the same work costs **97%** of wire time
+/// (`pico-ntp`'s `bench_tx`), because none of what makes it cheap on x86 exists there: no barrel
+/// shifter, no superscalar issue, and no LLVM CRC-idiom recognition (which on an `-O3` host build
+/// silently rewrites the bitwise loop into a table anyway, hiding the difference entirely — at
+/// `-O0` the table is 4.3x faster).
+///
+/// So the host measurement was not merely imprecise, it pointed the wrong way. The optimisation
+/// that "obviously" was not worth 1 KB is what puts the effective transmit rate near the wire's
+/// limit instead of half of it.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            // Reflected algorithm: shift right, and fold the polynomial in when a 1 falls out.
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xEDB8_8320
-            } else {
-                crc >> 1
-            };
-        }
+        crc = CRC32_TABLE[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     !crc
 }
+
+/// Reflected CRC-32 table, generated at compile time (1 KB of flash, no runtime setup).
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            // Reflected algorithm: shift right, and fold the polynomial in when a 1 falls out.
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
+            bit += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+};
 
 /// The ones' complement checksum used by IPv4 and UDP (RFC 1071).
 ///
