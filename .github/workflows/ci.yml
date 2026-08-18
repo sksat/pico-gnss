@@ -27,10 +27,13 @@ jobs:
       - run: cargo fmt -p gnssdo --check
       - run: cargo fmt -p rp-pps --check
       - run: cargo fmt -p ntp-refclock --check
+      - run: cargo fmt -p pico-10base-t --check
       - run: cargo clippy -p gnssdo --all-features -- -D warnings
       # rp-pps core only on the host; its HAL backends need a target + the downstream chip feature.
       - run: cargo clippy -p rp-pps -- -D warnings
       - run: cargo clippy -p ntp-refclock --all-targets -- -D warnings
+      # pico-10base-t's framing core is HAL-free; its backend needs a target (see the embedded job).
+      - run: cargo clippy -p pico-10base-t --all-targets -- -D warnings
       - run: cargo test -p gnssdo
       - run: cargo test -p gnssdo --all-features
       - run: cargo test -p rp-pps
@@ -39,6 +42,7 @@ jobs:
       # (Not --all-features: the HAL backends need a target.)
       - run: cargo test -p rp-pps --features gnssdo
       - run: cargo test -p ntp-refclock
+      - run: cargo test -p pico-10base-t
 
   embedded:
     name: embedded (thumbv6m-none-eabi)
@@ -78,8 +82,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo publish --dry-run -p gnssdo
-      # ntp-refclock has no path dependencies, so its dry-run stands alone.
+      # ntp-refclock and pico-10base-t have no path dependencies, so their dry-runs stand alone.
       - run: cargo publish --dry-run -p ntp-refclock
+      - run: cargo publish --dry-run -p pico-10base-t
       # rp-pps は gnssdo が crates.io に公開されるまで dry-run が原理的に通らない
       # ([patch.crates-io] は publish で無視される。root Cargo.toml のコメント参照)。
       # 公開後に自然に green になるよう continue-on-error で走らせておく。

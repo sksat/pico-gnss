@@ -77,9 +77,16 @@ pub struct UdpFrameSpec<'a> {
 
 /// The Ethernet FCS: CRC-32 (reflected, polynomial `0xEDB88320`), as used by IEEE 802.3.
 ///
-/// Bitwise, with no lookup table. A table would be ~4x faster and cost 1 KB of flash; at one frame
-/// per second that trade buys nothing, and the on-target benchmark (`bench_frame`) is there to say
-/// so with a number rather than an opinion.
+/// Bitwise, with no lookup table, and measurement says that is the right call (see
+/// `tests/bench_host.rs`):
+///
+/// - Building a whole frame costs **~0.26% of the time that frame occupies the wire**, flat across
+///   64 B to MTU. The CRC is ~94% of that, so even quadrupling it leaves framing around 1%.
+/// - A 256-entry table would cost 1 KB of flash to buy back a fraction of that 1%.
+/// - Curiously, the comparison cannot even be made on an optimising host build: at `-O0` the table
+///   is 4.3x faster, but at `-O3` the two are indistinguishable, because LLVM recognises the
+///   bitwise CRC idiom and rewrites it. Whether that recognition fires for `thumbv6m-none-eabi` is
+///   unknown — and does not matter, given the margin above.
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
