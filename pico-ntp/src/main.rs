@@ -104,7 +104,7 @@ const SRC_PORT: u16 = 123;
 /// — same timestamps, same checksums, same line coding — so "did it arrive, and how far off was it"
 /// is answered identically. Only a real NTP client needs 123, and that is the one thing a high port
 /// cannot test.
-const DST_PORT: u16 = 10123; // TEMPORARY: unprivileged measurement build
+const DST_PORT: u16 = 123;
 
 // --- Server policy ----------------------------------------------------------------------------
 
@@ -146,8 +146,24 @@ const FRAME_DUMPS: u32 = 3;
 /// Which UTC second an NMEA sentence refers to, relative to the PPS edge it is paired with.
 ///
 /// Receiver-dependent, and the one setting that can put the clock a whole second out while every
-/// phase measurement still looks perfect. Measured against an external reference rather than
-/// assumed — see `logs/20260818-ntp-bringup/`.
+/// phase measurement still looks perfect.
+///
+/// **Measured, not assumed.** The GlobalTop MT3333 application note's 1PPS section specifies the
+/// electrical levels, the ±10 ns jitter, the pulse width and cable-delay compensation — but says
+/// nothing about which UTC second the edge marks. So it was determined by comparing the disciplined
+/// clock against an NTP-synchronised host over the debug probe (no network path involved, in case
+/// the network was the thing adding a second), in both directions:
+///
+/// | association | host − firmware |
+/// |---|---|
+/// | `SameSecond` | +1.11 … +1.20 s |
+/// | `NmeaIsPreviousSecond` | +0.11 … +0.20 s |
+///
+/// The residual in the second row is the probe's RTT polling latency, not clock error. See
+/// `logs/20260818-ntp-bringup/`.
+///
+/// This value is for the Taiyo Yuden GYSFFMANC as sold by Akizuki; another MT3333 module with
+/// different firmware could differ, which is exactly why it is a constant here and not a default.
 const PPS_NMEA: rp_pps::PpsNmeaAssociation = rp_pps::PpsNmeaAssociation::NmeaIsPreviousSecond;
 
 /// The disciplined clock. The two rp-pps runners write it; the NTP task reads it.
