@@ -16,6 +16,11 @@ name = "ntp_refclock"
 # No runtime dependencies: pure integer logic, mirroring `gnssdo`. Ethernet/IPv4/UDP framing and the
 # PHY deliberately live in the sibling `pico-10base-t` crate, so NTP stays L2/L3/L4-agnostic.
 
-# Dev-only: property tests for the timestamp conversions (round-trip, monotonicity, era wrap).
 [dev-dependencies]
+# Property tests for the timestamp conversions (round-trip, monotonicity, era wrap).
 proptest = "1"
+# An independent RFC 5905 client, used to end-to-end the server policy: `tests/client_e2e.rs`
+# serves real replies over a loopback socket and checks that a third-party implementation reads the
+# time we meant to send. Dev-only, so the crate's zero-runtime-dependency property is untouched.
+# Async is off — this needs a blocking client, not tokio.
+rsntp = { version = "4.1", default-features = false, features = ["chrono"] }
