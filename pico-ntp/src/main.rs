@@ -162,48 +162,36 @@ const GNSS_FAST_BAUD: u32 = 115_200;
 /// change rate in step.
 const RAISE_BAUD: bool = true;
 
-/// Which UTC second an NMEA sentence refers to, relative to the PPS edge it is paired with.
+/// How the disciplined clock is configured, pinned rather than inherited.
 ///
-/// Receiver-dependent, and the one setting that can put the clock a whole second out while every
-/// phase measurement still looks perfect.
+/// Both values now match `rp-pps`'s own defaults, so `PpsGpsdo::new()` would do the same thing.
+/// They are spelled out anyway: this is a time server, and the setting that decides *which UTC
+/// second* a pulse is labelled with should not change under it because a library default moved.
 ///
-/// **Measured, not assumed.** The GlobalTop MT3333 application note's 1PPS section specifies the
-/// electrical levels, the ±10 ns jitter, the pulse width and cable-delay compensation — but says
-/// nothing about which UTC second the edge marks. So it was determined by comparing the disciplined
-/// clock against an NTP-synchronised host over the debug probe (no network path involved, in case
-/// the network was the thing adding a second), in both directions:
+/// # These were verified, not assumed
 ///
-/// | association | host − firmware |
-/// |---|---|
-/// | `SameSecond` | +1.11 … +1.20 s |
-/// | `NmeaIsPreviousSecond` | +0.11 … +0.20 s |
-///
-/// The residual in the second row is the probe's RTT polling latency, not clock error. See
-/// `logs/20260818-ntp-bringup/`.
-///
-/// **This is a mitigation, not a fix, and the underlying defect is worse than the offset.**
-///
-/// The MT3333 NMEA specification defines only **ZDA** against the pulse ("outputs the time
-/// associated with the current 1PPS pulse … tells the time of the pulse that just occurred").
-/// `rp-pps` pairs on **RMC**, which carries no such guarantee and sits near the end of the NMEA
-/// burst. At 9600 baud that burst runs ~640 ms and starts a few hundred ms after the edge, so RMC
-/// arrives *approximately on top of the next edge*. Measured over 188 sentences:
+/// ZDA is the sentence the receiver defines against its pulse ("outputs the time associated with
+/// the current 1PPS pulse … tells the time of the pulse that just occurred" — MT3333 NMEA
+/// specification §2.2.7), and `SameSecond` is what that sentence therefore means. But the
+/// specification-correct pair only *holds* if the sentence arrives comfortably before the following
+/// edge, which at 9600 baud it does not:
 ///
 /// ```text
-/// margin from RMC to the next PPS edge: mean 490 ms, sd 460 ms, min 2 ms
+/// margin from the time sentence to the next PPS edge, measured on this hardware
+///   9600 baud    RMC  mean 490 ms, sd 460 ms, min   2 ms   (bimodal: either side of the edge)
+///                ZDA  mean 866 ms, sd 218 ms, min   1 ms
+///   115200 baud  RMC  mean 749 ms, sd  26 ms, min 718 ms
 /// ```
 ///
-/// The distribution is bimodal — tens of milliseconds before the edge, or tens of milliseconds
-/// after it — which means the pairing crosses the boundary at random. Whichever association is
-/// chosen, the second can still slip by one at runtime; more satellites means more GSV sentences
-/// means a later RMC. Setting this constant only picks which side of the coin toss is currently
-/// right.
+/// So the firmware raises the receiver's baud rate at boot (see [`RAISE_BAUD`]); with that margin
+/// in place these two constants are correct on their own, with no ±1 s correction anywhere.
+/// Without it, either association is a coin toss that a longer NMEA burst can flip at runtime.
 ///
-/// The real fix is to give the pairing margin instead of guessing at it: trim the sentence set
-/// (`PMTK314`) or raise the baud rate so the burst finishes long before the next edge, and/or pair
-/// on the first sentence of the burst rather than one near its end.
+/// Verified against an NTP-synchronised host over the debug probe, so no network path could be
+/// mistaken for clock error: `host − firmware = +0.11 … +0.20 s`, which is the probe's RTT polling
+/// latency and not an offset. See `logs/20260818-ntp-bringup/`.
 const PPS_NMEA: rp_pps::PpsNmeaAssociation = rp_pps::PpsNmeaAssociation::SameSecond;
-/// Pair on **ZDA**, the only sentence the receiver defines against its 1PPS output.
+/// Pair on ZDA — see [`PPS_NMEA`].
 const TIME_SOURCE: rp_pps::NmeaTimeSource = rp_pps::NmeaTimeSource::Zda;
 
 /// The disciplined clock. The two rp-pps runners write it; the NTP task reads it.
