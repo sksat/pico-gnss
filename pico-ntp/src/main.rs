@@ -59,7 +59,8 @@ use embassy_rp::uart::{
 };
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_time::{Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
+use embedded_io_async::Read as _;
 use static_cell::StaticCell;
 
 use ntp_refclock::packet::PACKET_LEN;
@@ -159,7 +160,7 @@ const GNSS_FAST_BAUD: u32 = 115_200;
 /// which is what makes the second-pairing a coin toss. Trimming the sentence set with `PMTK314` is
 /// the other route to the same margin and may prove easier, since it does not require both ends to
 /// change rate in step.
-const RAISE_BAUD: bool = false;
+const RAISE_BAUD: bool = true;
 
 /// Which UTC second an NMEA sentence refers to, relative to the PPS edge it is paired with.
 ///
@@ -201,7 +202,7 @@ const RAISE_BAUD: bool = false;
 /// The real fix is to give the pairing margin instead of guessing at it: trim the sentence set
 /// (`PMTK314`) or raise the baud rate so the burst finishes long before the next edge, and/or pair
 /// on the first sentence of the burst rather than one near its end.
-const PPS_NMEA: rp_pps::PpsNmeaAssociation = rp_pps::PpsNmeaAssociation::NmeaIsPreviousSecond;
+const PPS_NMEA: rp_pps::PpsNmeaAssociation = rp_pps::PpsNmeaAssociation::SameSecond;
 /// Pair on **ZDA**, the only sentence the receiver defines against its 1PPS output.
 const TIME_SOURCE: rp_pps::NmeaTimeSource = rp_pps::NmeaTimeSource::Zda;
 
@@ -371,6 +372,104 @@ async fn send_pmtk<W: embedded_io_async::Write>(tx: &mut W, payload: &str) {
     }
 }
 
+/// Read until a complete NMEA sentence arrives, or the deadline passes.
+///
+/// Used as the liveness probe on both sides of a baud change: the point is not the contents but
+/// that framing works at all, which is exactly what a wrong rate destroys.
+async fn await_nmea(uart: &mut BufferedUart, timeout: Duration) -> bool {
+    let mut assembler = rp_pps::NmeaLineAssembler::new();
+    let mut buf = [0u8; 64];
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        let Ok(read) = with_timeout(remaining, uart.read(&mut buf)).await else {
+            return false;
+        };
+        // Framing and break errors are what a wrong baud rate looks like; keep waiting rather than
+        // treating them as a verdict, since a few are normal right after a rate change.
+        let Ok(n) = read else { continue };
+        for &b in &buf[..n] {
+            if let Some(sentence) = assembler.push(b)
+                && sentence.starts_with(b"$G")
+            {
+                return true;
+            }
+        }
+    }
+}
+
+/// Find the receiver, then get it onto [`GNSS_FAST_BAUD`] — verifying at every step.
+///
+/// Returns the rate the link ended up on.
+///
+/// # Why it probes instead of assuming
+///
+/// Two things make "open at 9600 and send PMTK251" wrong:
+///
+/// 1. **The rate survives a firmware reflash.** `PMTK251` reverts only on a full cold start or
+///    standby (MT3333 NMEA specification §2.3.14), so after re-flashing the RP2040 the module is
+///    still at whatever it was last set to. Assuming the power-on rate means finding silence and
+///    concluding the receiver is dead — which is exactly what happened before this probed.
+/// 2. **The change cannot be acknowledged.** `PMTK251` has no ACK and could not have one: the reply
+///    would have to be sent at a rate one end has not adopted yet. Nothing in the specification says
+///    how long the switch takes, either.
+///
+/// So the sleep below is not load-bearing. It only has to be *usually* long enough; if it is not,
+/// the probe afterwards finds the module at whichever rate it actually settled on and follows it.
+/// That is a much better property than a carefully tuned constant, because the constant would be
+/// tuned against one module on one day.
+async fn establish_gnss_link(uart: &mut BufferedUart) -> u32 {
+    let Some(found) = probe_gnss_baud(uart).await else {
+        warn!("no NMEA at either rate — check the wiring, or power-cycle the receiver");
+        return GNSS_BOOT_BAUD;
+    };
+    if found == GNSS_FAST_BAUD {
+        info!("GNSS already at {}", GNSS_FAST_BAUD);
+        return found;
+    }
+
+    // At the slow rate, where the sentence burst (~640 ms) collides with the next PPS edge. Ask for
+    // the fast one, which shrinks the burst to ~53 ms and turns the second-pairing from a coin toss
+    // into a margin.
+    send_pmtk(uart, "PMTK251,115200").await;
+    // Enough for the command to clock out at 9600 (~21 ms) and for the module to finish the sentence
+    // it is part-way through. Generous rather than tuned — see above, and note this is boot-time
+    // only, against a clock that needs seconds to lock regardless.
+    Timer::after_millis(500).await;
+
+    match probe_gnss_baud(uart).await {
+        Some(rate) if rate == GNSS_FAST_BAUD => {
+            info!("GNSS baud raised to {}", GNSS_FAST_BAUD);
+            rate
+        }
+        Some(rate) => {
+            warn!("PMTK251 did not take; continuing at {}", rate);
+            rate
+        }
+        None => {
+            warn!(
+                "lost the receiver after PMTK251; leaving the port at {}",
+                GNSS_BOOT_BAUD
+            );
+            uart.set_baudrate(GNSS_BOOT_BAUD);
+            GNSS_BOOT_BAUD
+        }
+    }
+}
+
+/// Try each supported rate until NMEA frames, leaving the port on the one that worked.
+async fn probe_gnss_baud(uart: &mut BufferedUart) -> Option<u32> {
+    for baud in [GNSS_BOOT_BAUD, GNSS_FAST_BAUD] {
+        uart.set_baudrate(baud);
+        if await_nmea(uart, Duration::from_secs(3)).await {
+            return Some(baud);
+        }
+    }
+    None
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -428,11 +527,7 @@ async fn main(spawner: Spawner) {
     //
     // Not persistent: the module reverts to 9600 on power loss, so this runs on every boot.
     if RAISE_BAUD {
-        send_pmtk(&mut uart, "PMTK251,115200").await;
-        // Let the command drain at the old rate before the far end changes underneath us.
-        Timer::after_millis(250).await;
-        uart.set_baudrate(GNSS_FAST_BAUD);
-        info!("GNSS baud raised to {}", GNSS_FAST_BAUD);
+        establish_gnss_link(&mut uart).await;
     }
 
     let (_uart_tx, uart_rx) = uart.split();
