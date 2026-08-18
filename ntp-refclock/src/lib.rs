@@ -6,6 +6,7 @@
 //! timestamps and a UTC epoch, which is the same layer boundary the rest of this workspace uses.
 //!
 //! - [`timestamp`] — NTP's two fixed-point time formats and their Unix-ns conversions.
+//! - [`packet`] — the 48-byte header and its wire encoding.
 //!
 //! # Where the other pieces live
 //!
@@ -20,6 +21,8 @@
 
 #![no_std]
 
+pub mod packet;
 pub mod timestamp;
 
+pub use packet::{LeapIndicator, Mode, NtpPacket, PACKET_LEN};
 pub use timestamp::{NTP_UNIX_OFFSET_SECS, NtpShort, NtpTimestamp};
