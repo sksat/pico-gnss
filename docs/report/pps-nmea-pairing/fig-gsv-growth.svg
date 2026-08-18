@@ -20,7 +20,7 @@
   <rect x="371" y="80" width="245" height="44" fill="#c1442e"/>
   <rect x="616" y="80" width="82" height="44" fill="url(#h)" stroke="#c1442e" stroke-dasharray="4 3"/>
 
-  <text x="255" y="107" font-size="12" fill="#ffffff" text-anchor="middle">固定の 8 本</text>
+  <text x="255" y="107" font-size="12" fill="#ffffff" text-anchor="middle">固定の 8 センテンス</text>
   <text x="493" y="107" font-size="12" fill="#ffffff" text-anchor="middle">GSV 6 本 (437 ms)</text>
   <text x="657" y="107" font-size="11" fill="#c1442e" text-anchor="middle">+2 本</text>
 
