@@ -154,7 +154,11 @@ def fig_timeline(slow, fast, path: Path):
 
 
 def fig_margin(slow_m, fast_m, path: Path):
-    """次エッジまでの残りの分布。9600 は二峰、115200 は一峰。"""
+    """次エッジまでの残りの分布。9600 は二峰、115200 は一峰。
+
+    どちらの系列も RMC である。本文では ZDA も扱うので、凡例でセンテンス種別まで明示して
+    「センテンスによらない性質」と誤読されないようにする。
+    """
     fig, ax = plt.subplots(figsize=(9, 3.6))
     bins = [i / 50 for i in range(51)]
     ax.hist(
@@ -162,14 +166,14 @@ def fig_margin(slow_m, fast_m, path: Path):
         bins=[b * 1000 for b in bins],
         color=SLOW_C,
         alpha=0.75,
-        label=f"9600 baud (n={len(slow_m)})",
+        label=f"RMC @ 9600 baud (n={len(slow_m)})",
     )
     ax.hist(
         [m * 1000 for _, m in fast_m],
         bins=[b * 1000 for b in bins],
         color=FAST_C,
         alpha=0.75,
-        label=f"115200 baud (n={len(fast_m)})",
+        label=f"RMC @ 115200 baud (n={len(fast_m)})",
     )
     ax.axvline(0, color="#333", lw=2)
     ax.annotate(
