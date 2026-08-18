@@ -99,10 +99,19 @@ def main() -> int:
             offset_ns = xmt - recv_ns
             offsets.append(offset_ns / 1e9)
             if not args.quiet:
+                # Both absolute times, not just their difference: a difference alone cannot say
+                # whether the server's clock is wrong or its scheduling is, and the two need
+                # opposite fixes.
+                def iso(ns: int) -> str:
+                    return time.strftime("%H:%M:%S", time.gmtime(ns // 1_000_000_000)) + (
+                        f".{ns % 1_000_000_000:09d}"
+                    )
+
                 print(
                     f"{addr[0]:<15} mode={MODE_NAMES.get(mode, mode):<9} stratum={stratum} "
                     f"li={leap} prec=2^{precision} refid={refid.decode('ascii', 'replace').rstrip(chr(0))!r:<7} "
-                    f"rootdisp={root_disp / 65536 * 1e6:.0f}us  offset={offset_ns / 1000:+.1f}us"
+                    f"rootdisp={root_disp / 65536 * 1e6:.0f}us  xmt={iso(xmt)} recv={iso(recv_ns)} "
+                    f"offset={offset_ns / 1000:+.1f}us"
                 )
     except KeyboardInterrupt:
         pass

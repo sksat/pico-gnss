@@ -94,7 +94,17 @@ const SRC_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 200);
 /// is the other legitimate choice once this works.
 const DST_IP: Ipv4Addr = Ipv4Addr::BROADCAST;
 const DST_MAC: MacAddr = MacAddr::BROADCAST;
-const NTP_PORT: u16 = 123;
+/// Source port. Always 123: a client checks it, and it is what makes this an NTP server rather
+/// than a host that happens to emit 48-byte datagrams.
+const SRC_PORT: u16 = 123;
+/// Destination port. 123 in production.
+///
+/// Set it above 1024 to measure from an **unprivileged** listener: binding 123 needs root, which is
+/// a real obstacle on a machine where the developer cannot elevate. Nothing about the frame changes
+/// — same timestamps, same checksums, same line coding — so "did it arrive, and how far off was it"
+/// is answered identically. Only a real NTP client needs 123, and that is the one thing a high port
+/// cannot test.
+const DST_PORT: u16 = 10123; // TEMPORARY: unprivileged measurement build
 
 // --- Server policy ----------------------------------------------------------------------------
 
@@ -133,9 +143,16 @@ const SYMBOL_WORDS: usize = encoded_words(FRAME_LEN);
 /// timestamps, real framing, real checksums — with only the line coding and the wire left over.
 const FRAME_DUMPS: u32 = 3;
 
+/// Which UTC second an NMEA sentence refers to, relative to the PPS edge it is paired with.
+///
+/// Receiver-dependent, and the one setting that can put the clock a whole second out while every
+/// phase measurement still looks perfect. Measured against an external reference rather than
+/// assumed — see `logs/20260818-ntp-bringup/`.
+const PPS_NMEA: rp_pps::PpsNmeaAssociation = rp_pps::PpsNmeaAssociation::NmeaIsPreviousSecond;
+
 /// The disciplined clock. The two rp-pps runners write it; the NTP task reads it.
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<PpsGpsdo>> =
-    BlockingMutex::new(RefCell::new(PpsGpsdo::new()));
+    BlockingMutex::new(RefCell::new(PpsGpsdo::with_association(PPS_NMEA)));
 
 /// `Instant` as nanoseconds (µs resolution) — the query timebase for the disciplined clock.
 fn now_ns() -> u64 {
@@ -182,7 +199,11 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
     let mut symbols = [0u32; SYMBOL_WORDS];
     let mut ip_id: u16 = 0;
     let mut sent: u32 = 0;
-    let nlp_ms = (NLP_INTERVAL_US / 1000) as u64;
+    let nlp_us = NLP_INTERVAL_US as u64;
+    // The last second we actually served. Guards against emitting the same timestamp twice, which
+    // is otherwise reachable: after transmitting we can still be a few hundred microseconds *before*
+    // the boundary we aimed at, and would then aim at it again.
+    let mut last_target_ns: i64 = i64::MIN;
 
     loop {
         let (now, state) = clock_state();
@@ -190,23 +211,30 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
         // Without a UTC epoch there is no second boundary to aim at. Keep the link up and wait.
         let Some(now) = now else {
             tx.link_pulse();
-            Timer::after_millis(nlp_ms).await;
+            Timer::after_micros(nlp_us).await;
             continue;
         };
 
-        // Time to the next whole UTC second, in disciplined nanoseconds.
-        let until_next = 1_000_000_000 - now.rem_euclid(1_000_000_000);
-        if until_next > (nlp_ms * 1_000_000) as i64 {
+        // The next whole UTC second we have not already served.
+        let mut target_unix_ns = (now.div_euclid(1_000_000_000) + 1) * 1_000_000_000;
+        if target_unix_ns <= last_target_ns {
+            target_unix_ns = last_target_ns + 1_000_000_000;
+        }
+        let wait_ns = target_unix_ns - now - TX_LEAD_NS;
+
+        // Sleep towards the boundary, but **never past it**: the sleep is capped at the link-pulse
+        // interval rather than being a fixed tick. Polling on a fixed 16 ms period with a 16 ms
+        // threshold means any jitter either steps over the boundary (dropping that second) or lands
+        // short of it twice (sending it twice) — both were observed on hardware before this.
+        if wait_ns > (nlp_us * 1000) as i64 {
             tx.link_pulse();
-            Timer::after_millis(nlp_ms).await;
+            Timer::after_micros(nlp_us).await;
             continue;
         }
-
-        // Aim the *frame's first bit* at the second boundary, so the transmit timestamp we write is
-        // the time the packet is actually on the wire rather than when we started thinking about it.
-        let target_unix_ns = now + until_next;
-        let sleep_ns = (until_next - TX_LEAD_NS).max(0);
-        Timer::after_micros((sleep_ns / 1000) as u64).await;
+        // Aim the *frame's first bit* at the boundary, so the transmit timestamp we write is when
+        // the packet is on the wire rather than when we started thinking about it.
+        Timer::after_micros((wait_ns.max(0) / 1000) as u64).await;
+        last_target_ns = target_unix_ns;
 
         // Re-read: the policy gate must reflect the state at transmission, not a second ago.
         let (_, state_now) = clock_state();
@@ -222,7 +250,7 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
                 // cannot interrogate us. Say why on RTT so the reason is visible.
                 warn!("NTP silent: {}", defmt::Debug2Format(&reason));
                 tx.link_pulse();
-                Timer::after_millis(nlp_ms).await;
+                Timer::after_micros(nlp_us).await;
             }
             ServeDecision::Serve(packet) => {
                 ip_id = ip_id.wrapping_add(1);
@@ -232,8 +260,8 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
                     dst_mac: DST_MAC,
                     src_ip: SRC_IP,
                     dst_ip: DST_IP,
-                    src_port: NTP_PORT,
-                    dst_port: NTP_PORT,
+                    src_port: SRC_PORT,
+                    dst_port: DST_PORT,
                     ip_id,
                     // Broadcast is link-local; one hop is all it may take.
                     ttl: 1,
