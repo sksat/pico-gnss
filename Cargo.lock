@@ -1193,6 +1193,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "pico-ntp"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-rp",
+ "embassy-sync 0.7.2",
+ "embassy-time",
+ "gnssdo",
+ "ntp-refclock",
+ "panic-probe",
+ "pico-10base-t",
+ "portable-atomic",
+ "rp-pps",
+ "static_cell",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

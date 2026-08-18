@@ -1,0 +1,21 @@
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+runner = "probe-rs run --chip RP2040"
+rustflags = [
+  "-C", "linker=flip-link",
+  "-C", "link-arg=-Tlink.x",
+  # This is needed if your flash or ram addresses are not aligned to 0x10000 in memory.x
+  # See https://github.com/rust-embedded/cortex-m-quickstart/pull/95
+  "-C", "link-arg=--nmagic",
+
+  "-C", "link-arg=-Tdefmt.x",
+]
+
+[build]
+target = "thumbv6m-none-eabi"    # Cortex-M0 and Cortex-M0+
+
+[env]
+# defmt はビルド時に DEFMT_LOG でログレベルを決める。未設定だと info!/warn! 等が
+# コンパイル時に無効化され RTT に何も出ない (println! だけは別枠で常に出る)。
+DEFMT_LOG = "info"
+# RTT up バッファ既定 1024B は NMEA + PMTK 設定の混雑で溢れて行が trim される。広げる。
+DEFMT_RTT_BUFFER_SIZE = "8192"

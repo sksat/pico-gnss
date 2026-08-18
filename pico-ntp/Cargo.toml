@@ -1,0 +1,47 @@
+[package]
+name = "pico-ntp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RP2040 Stratum-1 NTP broadcast server firmware: a GNSS-disciplined clock serving time over 10BASE-T Ethernet driven straight from two GPIO pins."
+publish = false
+
+[[bin]]
+name = "pico-ntp"
+path = "src/main.rs"
+
+[dependencies]
+# The three layers this firmware wires together.
+gnssdo = { version = "0.1.0", path = "../gnssdo" }
+rp-pps = { version = "0.1.0", path = "../rp-pps", features = ["embassy-rp", "gnssdo"] }
+ntp-refclock = { version = "0.1.0", path = "../ntp-refclock" }
+pico-10base-t = { version = "0.1.0", path = "../pico-10base-t", features = ["embassy-rp"] }
+
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.3"
+defmt = "1.0"
+defmt-rtt = "1.0"
+embassy-executor = { version = "0.10.0", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "executor-interrupt",
+    "defmt",
+] }
+embassy-rp = { version = "0.10.0", features = [
+    "defmt",
+    "unstable-pac",
+    "time-driver",
+    "critical-section-impl",
+    "rp2040",
+] }
+embassy-time = { version = "0.5.1", features = [
+    "defmt",
+    "defmt-timestamp-uptime",
+] }
+embassy-sync = { version = "0.7.2", features = ["defmt"] }
+static_cell = "2.1.1"
+# Cortex-M0+ has no atomic compare-exchange; static_cell (via portable-atomic) needs this shim.
+portable-atomic = { version = "1.13.1", features = ["critical-section"] }
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
