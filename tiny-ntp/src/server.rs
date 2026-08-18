@@ -102,6 +102,11 @@ pub enum SilentReason {
     /// Following this upstream would put us at [`MAX_STRATUM`] or deeper, which on the wire means
     /// unsynchronised. Serving it would be claiming to be a source while announcing we are not one.
     TooDeep,
+    /// What arrived was not a client asking the time (RFC 5905 mode 3). Only [`respond`] reports
+    /// this; nothing about our own clock is wrong.
+    NotARequest,
+    /// A client asked in a version this crate does not speak.
+    UnsupportedVersion,
 }
 
 /// Whether to transmit, and what.
@@ -159,6 +164,16 @@ fn gate(cfg: &ServerConfig, state: &ClockState) -> Result<i64, SilentReason> {
         return Err(SilentReason::TooDeep);
     }
     Ok(last_update)
+}
+
+/// Whether the clock is in a state we may serve from, without building a packet to find out.
+///
+/// For callers that prepare a frame ahead of the instant it is due to leave: encoding takes time,
+/// and doing it after the transmit timestamp has passed makes that timestamp a lie. Build early,
+/// then ask this immediately before handing the buffer over — the answer can change in between, and
+/// what matters is the answer at transmission.
+pub fn may_serve(cfg: &ServerConfig, state: &ClockState) -> Result<(), SilentReason> {
+    gate(cfg, state).map(|_| ())
 }
 
 /// Our stratum: 1 for a reference clock, one more than the upstream otherwise.
@@ -237,7 +252,8 @@ pub fn broadcast(cfg: &ServerConfig, state: &ClockState, transmit_unix_ns: i64) 
 /// together with the client's own two timestamps they are what lets the client separate offset from
 /// round-trip delay — the thing a one-way [`broadcast`] can never give it.
 ///
-/// Gated identically to [`broadcast`]: an undisciplined clock answers nothing.
+/// Gated identically to [`broadcast`]: an undisciplined clock answers nothing. Additionally, only a
+/// mode-3 request in a version we speak gets an answer — see [`SilentReason::NotARequest`].
 pub fn respond(
     cfg: &ServerConfig,
     state: &ClockState,
@@ -245,6 +261,17 @@ pub fn respond(
     receive_unix_ns: i64,
     transmit_unix_ns: i64,
 ) -> ServeDecision {
+    // Before anything about our own clock: is this even a question? Answering a mode 4 or 5 makes
+    // us a reflector — two such servers pointed at each other would answer each other forever, and
+    // a spoofed source address turns every one of them into an amplifier.
+    if request.mode != Mode::Client {
+        return ServeDecision::Silent(SilentReason::NotARequest);
+    }
+    // We echo the client's version, so answering one we do not speak would put a number on the wire
+    // whose meaning we have not implemented.
+    if request.version == 0 || request.version > NTP_VERSION {
+        return ServeDecision::Silent(SilentReason::UnsupportedVersion);
+    }
     let last_update = match gate(cfg, state) {
         Ok(t) => t,
         Err(reason) => return ServeDecision::Silent(reason),
@@ -682,6 +709,101 @@ mod tests {
                 reply.leap, indicator,
                 "both service modes say the same thing"
             );
+        }
+    }
+
+    #[test]
+    fn only_a_client_request_gets_an_answer() {
+        // Answering a mode 4 or 5 makes this a reflector: two such servers pointed at each other
+        // would answer each other forever, and a spoofed source address turns one into an
+        // amplifier aimed at whoever it names.
+        for mode in [
+            Mode::Reserved,
+            Mode::SymmetricActive,
+            Mode::SymmetricPassive,
+            Mode::Server,
+            Mode::Broadcast,
+            Mode::ControlMessage,
+            Mode::Private,
+        ] {
+            let mut req = client_request();
+            req.mode = mode;
+            assert_eq!(
+                respond(&cfg(), &disciplined(), &req, REF_UNIX_NS, REF_UNIX_NS),
+                ServeDecision::Silent(SilentReason::NotARequest),
+                "mode {mode:?} is not a question"
+            );
+        }
+    }
+
+    #[test]
+    fn a_version_we_do_not_speak_gets_no_answer() {
+        // The reply echoes the client's version, so answering an unknown one would put a number on
+        // the wire whose meaning is not implemented here.
+        for version in [0, NTP_VERSION + 1, 7] {
+            let mut req = client_request();
+            req.version = version;
+            assert_eq!(
+                respond(&cfg(), &disciplined(), &req, REF_UNIX_NS, REF_UNIX_NS),
+                ServeDecision::Silent(SilentReason::UnsupportedVersion)
+            );
+        }
+        // Older versions we do speak are still answered.
+        for version in [1, 2, 3, NTP_VERSION] {
+            let mut req = client_request();
+            req.version = version;
+            let p = served(respond(
+                &cfg(),
+                &disciplined(),
+                &req,
+                REF_UNIX_NS,
+                REF_UNIX_NS,
+            ));
+            assert_eq!(p.version, version);
+        }
+    }
+
+    #[test]
+    fn what_is_wrong_with_the_request_is_decided_before_what_is_wrong_with_us() {
+        // A caller uses these to tell "we cannot serve" from "that was not a request". Reporting an
+        // undisciplined clock for a mode-5 packet would send them looking at the wrong subsystem.
+        let mut req = client_request();
+        req.mode = Mode::Broadcast;
+        let undisciplined = ClockState {
+            last_update_unix_ns: None,
+            ..disciplined()
+        };
+        assert_eq!(
+            respond(&cfg(), &undisciplined, &req, REF_UNIX_NS, REF_UNIX_NS),
+            ServeDecision::Silent(SilentReason::NotARequest)
+        );
+    }
+
+    #[test]
+    fn may_serve_agrees_with_what_the_service_modes_decide() {
+        // It exists so a caller can build a frame early and check eligibility late. If it could
+        // disagree with the gate the modes use, that caller would send packets the policy refused.
+        let cases = [
+            disciplined(),
+            ClockState {
+                last_update_unix_ns: None,
+                ..disciplined()
+            },
+            ClockState {
+                frequency_locked: false,
+                ..disciplined()
+            },
+            ClockState {
+                holdover_ns: cfg().max_holdover_ns + 1,
+                ..disciplined()
+            },
+        ];
+        for state in cases {
+            let by_broadcast = match broadcast(&cfg(), &state, REF_UNIX_NS) {
+                ServeDecision::Serve(_) => Ok(()),
+                ServeDecision::Silent(r) => Err(r),
+            };
+            assert_eq!(may_serve(&cfg(), &state), by_broadcast);
         }
     }
 }

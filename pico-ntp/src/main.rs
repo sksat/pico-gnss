@@ -70,7 +70,9 @@ use pico_10base_t::phy::{NLP_INTERVAL_US, encode_frame, encoded_words};
 use rp_pps::PpsGpsdo;
 use rp_pps::embassy::{TimedPpsCapture, run_capture, run_nmea};
 use tiny_ntp::packet::PACKET_LEN;
-use tiny_ntp::server::{ClockState, LeapWarning, ServeDecision, ServerConfig, Source, broadcast};
+use tiny_ntp::server::{
+    ClockState, LeapWarning, ServeDecision, ServerConfig, Source, broadcast, may_serve,
+};
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
@@ -366,7 +368,21 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
                 // exists to cancel — and it is what has to be measured before that constant can be
                 // anything but zero. Reading it costs a lock and lands inside the number it
                 // reports, so the figure errs high, which is the safe direction for a correction.
-                let (utc_at_handover, _) = clock_state();
+                let (utc_at_handover, state_at_handover) = clock_state();
+
+                // The packet above was built from the clock as it stood before the sleep, so its
+                // *eligibility* is that old too. Lock can drop and holdover can cross its limit in
+                // the meantime, and the policy is about the state at transmission — otherwise
+                // moving the build off the critical path would have bought accuracy by paying with
+                // correctness. Cheaper than `broadcast()`: this asks the gate without rebuilding a
+                // packet we would only discard.
+                if let Err(reason) = may_serve(&CFG, &state_at_handover) {
+                    warn!("NTP silent at handover: {}", defmt::Debug2Format(&reason));
+                    tx.link_pulse();
+                    Timer::after_micros(nlp_us).await;
+                    continue;
+                }
+
                 let before = now_ns();
                 tx.send(&symbols[..words]).await;
                 let after = now_ns();
