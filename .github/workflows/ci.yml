@@ -71,6 +71,8 @@ jobs:
         working-directory: pico-gnss
       # rp-pps's rp2040-hal backend (RP2040-specific, no chip feature → checkable standalone).
       - run: cargo clippy -p rp-pps --features rp2040-hal --target thumbv6m-none-eabi -- -D warnings
+      # pico-10base-t's embassy-rp backend needs both a target and a chip feature.
+      - run: cargo clippy -p pico-10base-t --features embassy-rp,embassy-rp/rp2040 --target thumbv6m-none-eabi -- -D warnings
 
   publish-dry-run:
     name: publish --dry-run

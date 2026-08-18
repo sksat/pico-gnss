@@ -55,6 +55,50 @@ pub const NLP_INTERVAL_US: u32 = 16_000;
 /// Symbol words emitted per frame byte: 8 bits × 2 half-bits × 2 bits = 32 bits.
 pub const WORDS_PER_BYTE: usize = 1;
 
+/// PIO clock for the serialiser: one instruction per 50 ns half-bit.
+pub const PIO_CLOCK_HZ: u32 = 20_000_000;
+
+/// System clock → PIO clock divider, as the raw fixed-point value the hardware takes (8 fractional
+/// bits).
+///
+/// Integer arithmetic scaled by 256, because the core this runs on has no FPU. At the usual 125 MHz
+/// the result is exactly 6.25, so the half-bit period is exactly 50 ns.
+///
+/// The bit rate inherits the crystal's error — a few hundred ppb on this hardware — which is three
+/// orders of magnitude inside 10BASE-T's ±100 ppm tolerance, so the GPSDO's steering never needs to
+/// reach the line rate.
+pub const fn pio_clock_divider_bits(clk_hz: u32) -> u32 {
+    (((clk_hz as u64) << 8) / PIO_CLOCK_HZ as u64) as u32
+}
+
+/// The 10BASE-T serialiser, as a HAL-agnostic [`pio::Program`].
+///
+/// Three instructions, and the addresses carry the meaning: the symbol pulled by `out pc, 2` is the
+/// address of the next state, so instruction 0 drives idle, 1 drives low and 2 drives high. That is
+/// why `.origin 0` is not optional — relocating the program would silently redefine every symbol.
+///
+/// Ported from `ser_10base_t.pio` in
+/// [kingyoPiyo/Pico-10BASE-T](https://github.com/kingyoPiyo/Pico-10BASE-T).
+///
+/// # Backend setup contract
+///
+/// - Side-set: 2 pins, TX− first then TX+ (i.e. the low side-set bit drives TX−).
+/// - Clock: [`PIO_CLOCK_HZ`].
+/// - OSR: shift **right**, autopull at 32 bits — symbols are consumed LSB-first.
+/// - Join both FIFOs into TX (8 words deep) so a DMA burst has somewhere to land.
+pub fn ser_10base_t_program() -> pio::Program<32> {
+    pio::pio_asm!(
+        ".origin 0",
+        ".side_set 2",
+        ".wrap_target",
+        "    out pc, 2  side 0b00", // address 0: idle
+        "    out pc, 2  side 0b01", // address 1: differential low
+        "    out pc, 2  side 0b10", // address 2: differential high
+        ".wrap",
+    )
+    .program
+}
+
 /// Manchester-encode one byte into eight half-bit pairs, packed two bits per symbol, LSB first.
 ///
 /// Computed rather than looked up. Upstream ships a 256-entry `tbl_manchester`, and the tests here
@@ -203,6 +247,62 @@ mod tests {
     }
 
     // --- Whole-frame encoding ---
+
+    // --- The PIO program ---
+    //
+    // The symbol values are *addresses* in this program, so its shape is part of the encoding's
+    // contract rather than an implementation detail. These guard it.
+
+    #[test]
+    fn divider_at_125mhz_is_exactly_six_and_a_quarter() {
+        // 125 MHz / 20 MHz = 6.25, i.e. 6.25 * 256 = 1600 raw. Getting this wrong yields a
+        // waveform that looks perfect on a scope and decodes nowhere.
+        assert_eq!(pio_clock_divider_bits(125_000_000), 1600);
+        assert_eq!(pio_clock_divider_bits(125_000_000) as f64 / 256.0, 6.25);
+    }
+
+    #[test]
+    fn divider_tracks_other_system_clocks() {
+        // RP2350 commonly runs at 150 MHz: 150/20 = 7.5 -> 1920 raw.
+        assert_eq!(pio_clock_divider_bits(150_000_000), 1920);
+        // A clock that is already the PIO rate divides by one.
+        assert_eq!(pio_clock_divider_bits(PIO_CLOCK_HZ), 256);
+    }
+
+    #[test]
+    fn the_serialiser_is_three_instructions_at_origin_zero() {
+        let p = ser_10base_t_program();
+        assert_eq!(
+            p.code.len(),
+            3,
+            "one instruction per line state; a fourth would make symbol 0b11 reachable"
+        );
+        assert_eq!(
+            p.origin,
+            Some(0),
+            "symbols are absolute addresses — relocating redefines every one of them"
+        );
+        assert_eq!(p.side_set.bits(), 2, "TX- and TX+");
+    }
+
+    #[test]
+    fn the_serialiser_wraps_over_its_whole_body() {
+        // Every instruction must be reachable as a jump target, so the wrap has to span all three.
+        let p = ser_10base_t_program();
+        assert_eq!(p.wrap.source, 2);
+        assert_eq!(p.wrap.target, 0);
+    }
+
+    #[test]
+    fn each_symbol_value_indexes_a_real_instruction() {
+        let p = ser_10base_t_program();
+        for sym in [SYMBOL_IDLE, SYMBOL_LOW, SYMBOL_HIGH] {
+            assert!(
+                (sym as usize) < p.code.len(),
+                "symbol {sym} must address an instruction"
+            );
+        }
+    }
 
     #[test]
     fn encoded_length_is_preamble_plus_frame_plus_tp_idl() {

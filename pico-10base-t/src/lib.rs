@@ -17,6 +17,8 @@
 
 #![no_std]
 
+#[cfg(feature = "embassy-rp")]
+pub mod embassy;
 pub mod frame;
 pub mod phy;
 

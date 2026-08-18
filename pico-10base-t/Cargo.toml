@@ -21,10 +21,14 @@ default-target = "thumbv6m-none-eabi"
 default = []
 # Thin backend over embassy-rp. The downstream binary selects the chip (e.g. embassy-rp/rp2040);
 # this crate stays chip-feature-agnostic, the same way rp-pps does.
-embassy-rp = ["dep:embassy-rp", "dep:pio"]
+embassy-rp = ["dep:embassy-rp", "dep:fixed"]
 
 [dependencies]
 # The PIO program is built HAL-agnostically via `pio::pio_asm!` (not a HAL's re-export), so any
-# backend loads the same `pio::Program`. Only needed with a backend selected.
-pio = { version = "0.3", optional = true }
+# backend loads the same `pio::Program` — and the host tests can assert its shape without a HAL.
+# Not optional for that reason: the program is part of the portable core, not of a backend.
+pio = "0.3"
 embassy-rp = { version = "0.10", optional = true, default-features = false }
+# The PIO clock divider is a fixed-point value; version pinned to embassy-rp 0.10's so the types
+# unify rather than colliding as two distinct `FixedU32`s.
+fixed = { version = "1.31", optional = true, default-features = false }
