@@ -37,6 +37,10 @@ NMEA_RE = re.compile(r"NMEA (\$([A-Z]{2})([A-Z]{3})\S*)")
 # 見やすさのため、図の色は 2 つの条件で固定する。
 SLOW_C, FAST_C = "#c1442e", "#2e7d5b"
 
+# 図には実機が出している電文名で書く。ログの突き合わせは 3 文字の種別で行うが、
+# 表示まで 3 文字にすると GP 始まりだと読まれる (この個体の RMC は GNRMC である)。
+FULL = {"RMC": "GNRMC", "ZDA": "GPZDA", "GGA": "GPGGA", "GST": "GPGST"}
+
 
 def load(path: Path):
     """(PPS エッジ時刻, [(センテンス時刻, 種別, バイト長)]) を返す。"""
@@ -155,7 +159,7 @@ def fig_timeline(panels, title, path: Path):
             ha = "right" if off > 700 else "left"
             dx = -14 if ha == "right" else 14
             ax.annotate(
-                f"{kind} at {off:.0f} ms",
+                f"{FULL.get(kind, kind)} at {off:.0f} ms",
                 xy=(off, 0.62),
                 xytext=(off + dx, y),
                 ha=ha,
@@ -302,8 +306,8 @@ def main() -> int:
     )
     fig_margin(
         [
-            ("RMC\n@ 9600", slow_rmc, SLOW_C),
-            ("ZDA\n@ 9600", slow_zda, SLOW_C),
+            ("GNRMC\n@ 9600", slow_rmc, SLOW_C),
+            ("GPZDA\n@ 9600", slow_zda, SLOW_C),
         ],
         OUT / "fig-margin.png",
     )
