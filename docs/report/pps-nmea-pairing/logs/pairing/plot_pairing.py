@@ -102,20 +102,19 @@ def occupancy(edges, sentences, baud):
     return n * 10 / span / baud, n / span
 
 
-def fig_timeline(slow, fast, notes, path: Path):
+def fig_timeline(panels, title, path: Path):
     """代表的な 1 秒に、実測のセンテンス到着をそのまま並べる。
+
+    条件ごとに 1 枚ずつ描く。1 枚に 9600 と 115200 を並べると、9600 の話をしている段で
+    115200 の結果まで目に入ってしまい、図が本文より先に答えを出す。
 
     注釈は全部 axes の内側に置く。外に出すと x 軸ラベルや目盛と重なるし、右端の
     センテンスでは図からはみ出す。位置に応じて揃えを変えて、線やラベル同士の衝突も避ける。
     """
-    fig, axes = plt.subplots(2, 1, figsize=(10, 4.6), sharex=True)
-    for ax, (label, items, colour, note) in zip(
-        axes,
-        [
-            ("9600 baud", slow, SLOW_C, notes[0]),
-            ("115200 baud", fast, FAST_C, notes[1]),
-        ],
-    ):
+    fig, axes = plt.subplots(
+        len(panels), 1, figsize=(10, 2.9 * len(panels)), sharex=True, squeeze=False
+    )
+    for ax, (label, items, colour, note) in zip(axes[:, 0], panels):
         for x, text, ha, dx in (
             (0.0, "PPS edge", "left", 0.012),
             (1.0, "next PPS edge", "right", -0.012),
@@ -160,12 +159,9 @@ def fig_timeline(slow, fast, notes, path: Path):
         for side in ("top", "right", "left"):
             ax.spines[side].set_visible(False)
 
-    axes[-1].set_xlim(-0.03, 1.06)
-    axes[-1].set_xlabel("seconds after a PPS edge")
-    fig.suptitle(
-        "One second of NMEA, as logged: every sentence arrival between two PPS edges",
-        fontsize=12,
-    )
+    axes[-1, 0].set_xlim(-0.03, 1.06)
+    axes[-1, 0].set_xlabel("seconds after a PPS edge")
+    fig.suptitle(title, fontsize=12)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     print(f"wrote {path}")
@@ -254,10 +250,28 @@ def main() -> int:
                 print(f"{name}   {kind} at {hit[0] * 1000:.0f} ms, {(1 - hit[0]) * 1000:.0f} ms to next edge")
 
     fig_timeline(
-        one_second(slow_e, slow_s),
-        one_second(fast_e, fast_s),
-        [f"{slow_u * 100:.0f}% of the link is NMEA", f"{fast_u * 100:.0f}% of the link is NMEA"],
-        OUT / "fig-burst-timing.png",
+        [
+            (
+                "9600 baud",
+                one_second(slow_e, slow_s),
+                SLOW_C,
+                f"{slow_u * 100:.0f}% of the link is NMEA",
+            )
+        ],
+        "One second of NMEA at 9600 baud, as logged",
+        OUT / "fig-burst-9600.png",
+    )
+    fig_timeline(
+        [
+            (
+                "115200 baud",
+                one_second(fast_e, fast_s),
+                FAST_C,
+                f"{fast_u * 100:.0f}% of the link is NMEA",
+            )
+        ],
+        "The same second at 115200 baud",
+        OUT / "fig-burst-115200.png",
     )
     fig_margin(slow_rmc, fast_rmc, OUT / "fig-margin.png")
     return 0

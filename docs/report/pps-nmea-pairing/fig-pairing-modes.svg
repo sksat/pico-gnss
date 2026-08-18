@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 460" width="760" height="460" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="遅延ではスロットが誤り待ち行列が正しく、脱落では逆になる">
+  <rect width="760" height="460" fill="#ffffff"/>
+  <defs>
+    <marker id="mb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2f6fb5"/>
+    </marker>
+    <marker id="ma" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b5762f"/>
+    </marker>
+  </defs>
+
+  <!-- ============ 遅延 ============ -->
+  <text x="60" y="44" font-size="13" fill="#333">センテンスが遅れて、次のエッジを跨いだ</text>
+  <line x1="120" y1="94" x2="680" y2="94" stroke="#ccc" stroke-width="1"/>
+  <g stroke="#333" stroke-width="2">
+    <line x1="160" y1="70" x2="160" y2="94"/>
+    <line x1="320" y1="70" x2="320" y2="94"/>
+    <line x1="480" y1="70" x2="480" y2="94"/>
+    <line x1="640" y1="70" x2="640" y2="94"/>
+  </g>
+  <g font-size="11" fill="#333" text-anchor="middle">
+    <text x="160" y="64">e1</text><text x="320" y="64">e2</text>
+    <text x="480" y="64">e3</text><text x="640" y="64">e4</text>
+  </g>
+  <g fill="#eee" stroke="#bbb">
+    <rect x="213" y="116" width="54" height="20" rx="3"/>
+    <rect x="513" y="116" width="54" height="20" rx="3"/>
+  </g>
+  <g font-size="11" fill="#555" text-anchor="middle">
+    <text x="240" y="130">s1</text><text x="540" y="130">s2</text>
+  </g>
+  <text x="576" y="130" font-size="11" fill="#888">遅れて到着</text>
+  <path d="M534,116 L486,100" fill="none" stroke="#2f6fb5" stroke-width="1.6" marker-end="url(#mb)"/>
+  <path d="M513,128 C430,162 362,152 321,101" fill="none" stroke="#b5762f" stroke-width="1.6" marker-end="url(#ma)"/>
+  <text x="120" y="166" font-size="12.5" fill="#2f6fb5">スロット: s2 を e3 に対応付ける → 規律 UTC が 1 秒遅れる</text>
+  <text x="120" y="188" font-size="12.5" fill="#b5762f">待ち行列: s2 を e2 に対応付ける → 正しい</text>
+
+  <!-- ============ 脱落 ============ -->
+  <text x="60" y="264" font-size="13" fill="#333">センテンスが 1 本落ちた</text>
+  <line x1="120" y1="314" x2="680" y2="314" stroke="#ccc" stroke-width="1"/>
+  <g stroke="#333" stroke-width="2">
+    <line x1="160" y1="290" x2="160" y2="314"/>
+    <line x1="320" y1="290" x2="320" y2="314"/>
+    <line x1="480" y1="290" x2="480" y2="314"/>
+    <line x1="640" y1="290" x2="640" y2="314"/>
+  </g>
+  <g font-size="11" fill="#333" text-anchor="middle">
+    <text x="160" y="284">e1</text><text x="320" y="284">e2</text>
+    <text x="480" y="284">e3</text><text x="640" y="284">e4</text>
+  </g>
+  <rect x="213" y="336" width="54" height="20" rx="3" fill="#eee" stroke="#bbb"/>
+  <rect x="373" y="336" width="54" height="20" rx="3" fill="none" stroke="#bbb" stroke-dasharray="3 3"/>
+  <rect x="533" y="336" width="54" height="20" rx="3" fill="#eee" stroke="#bbb"/>
+  <g font-size="11" text-anchor="middle">
+    <text x="240" y="350" fill="#555">s1</text>
+    <text x="400" y="350" fill="#aaa">欠落</text>
+    <text x="560" y="350" fill="#555">s3</text>
+  </g>
+  <path d="M554,336 L486,320" fill="none" stroke="#2f6fb5" stroke-width="1.6" marker-end="url(#mb)"/>
+  <path d="M533,348 C455,380 385,368 321,321" fill="none" stroke="#b5762f" stroke-width="1.6" marker-end="url(#ma)"/>
+  <text x="120" y="400" font-size="12.5" fill="#2f6fb5">スロット: s3 を e3 に対応付ける → ひとりでに正しい対応に戻る</text>
+  <text x="120" y="422" font-size="12.5" fill="#b5762f">待ち行列: s3 を e2 に対応付ける → 以後ずっと 1 つ古いエッジを取る</text>
+</svg>
