@@ -1547,7 +1547,10 @@ async fn main(spawner: Spawner) {
     let rx_buf = RX_BUF.init([0; 256]);
     let mut config = UartConfig::default();
     config.baudrate = mt3333::GNSS_BAUD;
-    let uart = BufferedUart::new(p.UART0, p.PIN_0, p.PIN_1, Irqs, tx_buf, rx_buf, config);
+    let mut uart = BufferedUart::new(p.UART0, p.PIN_0, p.PIN_1, Irqs, tx_buf, rx_buf, config);
+    // 受信機のボーレートを引き上げてから分割する (set_baudrate は分割前の BufferedUart にしかない)。
+    // 目的は帯域ではなく PPS↔NMEA 対応付けの余裕。詳細は mt3333::GNSS_FAST_BAUD の doc。
+    mt3333::establish_link(&mut uart).await;
     let (tx, mut rx) = uart.split();
 
     // モジュール設定は別タスクで送る (main は RX を読み続ける)。
