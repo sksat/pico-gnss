@@ -83,6 +83,36 @@ pub fn parse_rmc_time_date(sentence: &str) -> Option<RmcTimeDate> {
     Some((time, date))
 }
 
+/// Extract `((hour,min,sec),(day,month,year))` from a **ZDA** sentence.
+///
+/// `$GPZDA,hhmmss.sss,dd,mm,yyyy,zh,zm*CS` — time, then day, month and a **four-digit** year, so
+/// unlike RMC there is no two-digit year to guess a century for.
+///
+/// # Why this sentence in particular
+///
+/// ZDA is the one NMEA sentence defined *against the timing pulse*. The MT3333 platform NMEA
+/// specification lists it as the "PPS timing message (synchronized to PPS)" and says it "outputs the
+/// time associated with the current 1PPS pulse … and tells the time of the pulse that just
+/// occurred". RMC carries a time too, but nothing in any specification ties it to the pulse — it is
+/// a navigation sentence that happens to contain a clock.
+///
+/// Pairing on a sentence with no defined relationship to the edge is how a receiver ends up
+/// labelling the pulse with the wrong second.
+pub fn parse_zda_time_date(sentence: &str) -> Option<RmcTimeDate> {
+    if sentence.get(3..6) != Some("ZDA") {
+        return None;
+    }
+    let mut f = sentence.split(',');
+    let time = f.nth(1).and_then(parse_hhmmss)?;
+    let day: u8 = f.next()?.parse().ok()?;
+    let month: u8 = f.next()?.parse().ok()?;
+    let year: u16 = f.next()?.parse().ok()?;
+    if !(1..=31).contains(&day) || !(1..=12).contains(&month) || year < 1980 {
+        return None;
+    }
+    Some((time, (day, month, year)))
+}
+
 /// Extract `((hour,min,sec),(day,month,year))` from RMC (nmea crate backend). See the default
 /// version's docs. `nmea::parse_str` **validates the checksum** before extracting RMC
 /// (mismatch → `None`).
@@ -233,6 +263,41 @@ mod tests {
         assert_eq!(parse_hhmmss("12345"), None); // too short
         assert_eq!(parse_hhmmss("99xxss"), None);
         assert_eq!(parse_hhmmss("250000"), None); // hour > 23
+    }
+
+    #[test]
+    fn parse_zda_extracts_time_and_a_four_digit_year() {
+        // A real sentence from the receiver this was developed against.
+        let s = "$GPZDA,024247.000,18,08,2026,,*56";
+        let r = parse_zda_time_date(s).unwrap();
+        assert_eq!(r.0, (2, 42, 47));
+        // No century to guess at, unlike RMC's two-digit year.
+        assert_eq!(r.1, (18, 8, 2026));
+    }
+
+    #[test]
+    fn parse_zda_ignores_other_sentences() {
+        // Both appear in the same burst, so a parser that accepted either would make the choice of
+        // time source meaningless — whichever arrived first would win.
+        let rmc = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
+        assert!(parse_zda_time_date(rmc).is_none());
+        assert!(
+            parse_zda_time_date("$GPGGA,024247.000,3605.7502,N,1,11,1.11,30.9,M,,,*5A").is_none()
+        );
+    }
+
+    #[test]
+    fn parse_zda_rejects_impossible_dates() {
+        assert!(parse_zda_time_date("$GPZDA,024247.000,32,08,2026,,*00").is_none());
+        assert!(parse_zda_time_date("$GPZDA,024247.000,18,13,2026,,*00").is_none());
+        // A year before GPS existed means the field is not what we think it is.
+        assert!(parse_zda_time_date("$GPZDA,024247.000,18,08,1970,,*00").is_none());
+    }
+
+    #[test]
+    fn parse_zda_rejects_a_truncated_sentence() {
+        assert!(parse_zda_time_date("$GPZDA,024247.000,18").is_none());
+        assert!(parse_zda_time_date("$GPZDA").is_none());
     }
 
     #[test]

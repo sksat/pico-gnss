@@ -11,8 +11,25 @@
 //! `on_pps_edge` from a PPS task and [`feed_nmea`](PpsGpsdo::feed_nmea) from the UART task, behind a
 //! mutex. Logging, receiver config and pin/SM assignment stay the caller's.
 
-use crate::{TimedEdge, parse_rmc_time_date};
+use crate::{TimedEdge, parse_rmc_time_date, parse_zda_time_date};
 use gnssdo::{Gnssdo, GnssdoStep};
+
+/// Which NMEA sentence supplies the UTC second that gets paired with a PPS edge.
+///
+/// This is not a matter of taste. **ZDA is the only sentence specified against the timing pulse**:
+/// the MT3333 platform NMEA specification lists it as the "PPS timing message (synchronized to
+/// PPS)" and states that it "outputs the time associated with the current 1PPS pulse … and tells
+/// the time of the pulse that just occurred". RMC also carries a time, but no specification ties it
+/// to the pulse — it is a navigation sentence that happens to contain a clock, and it sits near the
+/// end of the NMEA burst where, at 9600 baud, it can arrive *after the next edge*.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum NmeaTimeSource {
+    /// Recommended Minimum. The historical default here, kept so existing users are unaffected.
+    #[default]
+    Rmc,
+    /// Time & Date — the sentence the receiver defines relative to its 1PPS output.
+    Zda,
+}
 
 /// Diagnostics from the sync that [`PpsGpsdo::feed_nmea`] establishes (computed on the pre-update
 /// clock, then the epoch is applied). All ns; the caller decides what/whether to log.
@@ -46,16 +63,42 @@ pub struct SyncReport {
 pub struct PpsGpsdo {
     clock: Gnssdo,
     sync: crate::PpsTimeSync,
+    source: NmeaTimeSource,
 }
 
 impl PpsGpsdo {
     /// Create with the default discipline and [`SameSecond`](crate::PpsNmeaAssociation::SameSecond)
     /// PPS↔NMEA association.
     pub const fn new() -> Self {
+        Self::with_association(crate::PpsNmeaAssociation::SameSecond)
+    }
+
+    /// Create with an explicit time source and PPS↔NMEA association.
+    ///
+    /// See [`NmeaTimeSource`] — on a receiver that emits ZDA, preferring it is the more defensible
+    /// choice, because ZDA is the only sentence specified against the timing pulse.
+    pub const fn with_config(
+        source: NmeaTimeSource,
+        association: crate::PpsNmeaAssociation,
+    ) -> Self {
         Self {
             clock: Gnssdo::new(),
-            sync: crate::PpsTimeSync::new(),
+            sync: crate::PpsTimeSync::with_association(association),
+            source,
         }
+    }
+
+    /// Create with an explicit PPS↔NMEA association.
+    ///
+    /// Worth reaching for: [`PpsNmeaAssociation`](crate::PpsNmeaAssociation) is documented as the
+    /// biggest footgun in this library, because getting it wrong shifts the whole UTC epoch by a
+    /// second while every *phase* measurement still looks perfect. Until this existed, the turn-key
+    /// bundle was the one path that could not change it.
+    ///
+    /// The symptom is invisible without an external time reference — a disciplined 1PPS output can
+    /// sit on the GPS edge to nanoseconds and still be labelled with the wrong second.
+    pub const fn with_association(association: crate::PpsNmeaAssociation) -> Self {
+        Self::with_config(NmeaTimeSource::Rmc, association)
     }
 
     /// Feed a timed PPS edge, timestamped on the query timebase (e.g. embassy `Instant`) as
@@ -71,7 +114,13 @@ impl PpsGpsdo {
     /// the UTC epoch and returns a [`SyncReport`]; otherwise (non-RMC, no fresh edge, parse failure)
     /// returns `None`.
     pub fn feed_nmea(&mut self, sentence: &str) -> Option<SyncReport> {
-        let ((h, mi, s), (day, month, year)) = parse_rmc_time_date(sentence)?;
+        // Only the configured sentence is parsed, never "whichever arrives first". Both RMC and ZDA
+        // appear in the same burst, and `on_time` consumes the pending edge — so accepting both
+        // would silently let the earlier one win and make the choice meaningless.
+        let ((h, mi, s), (day, month, year)) = match self.source {
+            NmeaTimeSource::Rmc => parse_rmc_time_date(sentence)?,
+            NmeaTimeSource::Zda => parse_zda_time_date(sentence)?,
+        };
         self.sync.set_date(year, month, day);
         let epoch = self.sync.on_time(h, mi, s)?;
         // Residuals are computed on the pre-update clock (the self-diagnostic of the correction).

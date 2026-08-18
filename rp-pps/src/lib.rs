@@ -49,14 +49,14 @@ mod timesync;
 pub use assembler::{MAX_SENTENCE_LEN, NmeaLineAssembler, nmea_checksum, nmea_checksum_valid};
 pub use timesync::{
     PpsNmeaAssociation, PpsTimeSync, RmcTimeDate, SyncEpoch, civil_to_unix, days_from_civil,
-    parse_ddmmyy, parse_hhmmss, parse_rmc_time_date,
+    parse_ddmmyy, parse_hhmmss, parse_rmc_time_date, parse_zda_time_date,
 };
 
 /// Turn-key GPSDO state bundle (PPS edge + NMEA → disciplined UTC). Enable with the `gnssdo` feature.
 #[cfg(feature = "gnssdo")]
 mod gpsdo;
 #[cfg(feature = "gnssdo")]
-pub use gpsdo::{PpsGpsdo, SyncReport};
+pub use gpsdo::{NmeaTimeSource, PpsGpsdo, SyncReport};
 
 /// One capture tick = 2 PIO clock cycles: [`pps_capture_program`] advances its free-running
 /// counter once per 2 cycles (`jmp x--` in a 2-cycle loop), so at 125 MHz one tick is 16 ns.
