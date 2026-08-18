@@ -16,8 +16,10 @@ use crate::timestamp::{NtpShort, NtpTimestamp};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reject {
     /// Not a server's answer (mode 4). A broadcast has no origin timestamp to match against, so it
-    /// cannot be measured this way at all.
+    /// cannot be measured this way at all — use [`accept_broadcast`].
     NotAReply,
+    /// Not a broadcast (mode 5), passed to [`accept_broadcast`].
+    NotABroadcast,
     /// Answered in a different version than we asked in.
     VersionMismatch,
     /// The echoed origin timestamp is not the one we sent, so this reply belongs to some other
@@ -119,23 +121,52 @@ pub fn measure(
     })
 }
 
-/// Take the time from a one-way [`Mode::Broadcast`] packet. **Not implemented.**
+/// Take the time from a one-way [`Mode::Broadcast`] packet (RFC 5905 §9.1).
 ///
-/// The counterpart to [`crate::server::broadcast`], and the only way to use a transmit-only server
-/// like this workspace's. It cannot reuse [`measure`]: with no request there is no origin to match
-/// and no fourth timestamp, so the round trip is unmeasurable and the client has to get a delay
-/// from somewhere else. RFC 5905 §9.1 calibrates it with an occasional unicast exchange — which is
-/// exactly what a transmit-only server cannot answer.
+/// A broadcast carries only its own departure, so the arithmetic that separates offset from path
+/// delay in [`measure`] has nothing to work with: `T3 - T4` is the offset *minus* the one-way
+/// delay, and no amount of listening will tell them apart. `delay_ns` is the round-trip delay the
+/// caller believes in, half of which is added back.
 ///
-/// So this needs a decision before it needs code: take the delay on trust from configuration, or
-/// accept an offset that is only ever as good as the path delay. Stubbed rather than guessed.
-#[allow(unused_variables)]
+/// Where that number comes from is the caller's problem, and RFC 5905 §9.1 answers it by running a
+/// short volley of ordinary [`request`]/[`measure`] exchanges first and reusing the delay they
+/// measured. A server that cannot receive — as this workspace's transmit-only PHY cannot — leaves
+/// its clients to configure the delay instead, and to wear the error if it is wrong. Passing `0` is
+/// legitimate: it says the path is short compared to the accuracy wanted.
+///
+/// Stateless, so it cannot see replays. A broadcast is trivially forged and trivially repeated, and
+/// RFC 5905 §9.1 has the client remember the last transmit timestamp it accepted and discard
+/// anything not newer. That state belongs to the caller, along with the decision of whom to believe.
 pub fn accept_broadcast(
     broadcast: &NtpPacket,
     destination_unix_ns: i64,
-    assumed_delay_ns: i64,
+    delay_ns: i64,
 ) -> Result<Measurement, Reject> {
-    todo!("broadcast client: the delay model is the open question, see the doc comment")
+    if broadcast.mode != Mode::Broadcast {
+        return Err(Reject::NotABroadcast);
+    }
+    if broadcast.transmit_timestamp == NtpTimestamp::ZERO {
+        return Err(Reject::Bogus);
+    }
+    if broadcast.leap == LeapIndicator::Unsynchronized
+        || broadcast.stratum == 0
+        || broadcast.stratum >= 16
+    {
+        return Err(Reject::Unsynchronized);
+    }
+
+    let t3 = broadcast
+        .transmit_timestamp
+        .to_unix_ns_near(destination_unix_ns);
+    // i128 for the same reason as `measure`: the departure time is attacker-supplied.
+    let offset = (t3 as i128 - destination_unix_ns as i128) + (delay_ns as i128) / 2;
+
+    Ok(Measurement {
+        offset_ns: offset.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+        delay_ns,
+        stratum: broadcast.stratum,
+        root_dispersion_ns: broadcast.root_dispersion.to_nanos(),
+    })
 }
 
 #[cfg(test)]
@@ -262,6 +293,55 @@ mod tests {
         };
         reply.version = 4;
         assert_eq!(measure(&req, &reply, T), Err(Reject::VersionMismatch));
+    }
+
+    #[test]
+    fn a_broadcast_gives_the_offset_once_the_delay_is_supplied() {
+        let (offset_ns, one_way_ns) = (250_000_000, 5_000_000);
+        // The server stamps departure on its own clock, which leads ours.
+        let t3 = T + offset_ns;
+        let t4 = T + one_way_ns;
+        let ServeDecision::Serve(bcast) = server::broadcast(&cfg(), &locked(t3), t3) else {
+            panic!("a locked clock must announce");
+        };
+        let m = accept_broadcast(&bcast, t4, 2 * one_way_ns).unwrap();
+        assert_eq!(m.offset_ns, offset_ns);
+        assert_eq!(m.delay_ns, 2 * one_way_ns);
+        assert_eq!(m.stratum, 1);
+    }
+
+    #[test]
+    fn a_broadcast_client_that_assumes_no_delay_is_wrong_by_the_one_way_time() {
+        // What a caller with nothing to calibrate against is choosing. Worth being explicit that
+        // the error is the one-way time and not something smaller.
+        let one_way_ns = 5_000_000;
+        let ServeDecision::Serve(bcast) = server::broadcast(&cfg(), &locked(T), T) else {
+            panic!("a locked clock must announce");
+        };
+        let m = accept_broadcast(&bcast, T + one_way_ns, 0).unwrap();
+        assert_eq!(m.offset_ns, -one_way_ns);
+    }
+
+    #[test]
+    fn a_unicast_reply_is_not_a_broadcast() {
+        let req = request(T, 4);
+        let ServeDecision::Serve(reply) = server::respond(&cfg(), &locked(T), &req, T, T) else {
+            panic!("a locked clock must answer");
+        };
+        assert_eq!(
+            accept_broadcast(&reply, T, 0),
+            Err(Reject::NotABroadcast),
+            "mode 4 carries an origin to match; routing it here would skip that check"
+        );
+    }
+
+    #[test]
+    fn an_unsynchronised_broadcast_is_refused() {
+        let ServeDecision::Serve(mut bcast) = server::broadcast(&cfg(), &locked(T), T) else {
+            panic!("a locked clock must announce");
+        };
+        bcast.leap = LeapIndicator::Unsynchronized;
+        assert_eq!(accept_broadcast(&bcast, T, 0), Err(Reject::Unsynchronized));
     }
 
     #[test]

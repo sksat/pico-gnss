@@ -1,7 +1,7 @@
 # tiny-ntp
 
 `no_std`, integer-only, **zero-dependency** NTP ([RFC 5905](https://www.rfc-editor.org/info/rfc5905))
-for embedded targets. A Stratum-1 reference-clock server, and the unicast client that can check it.
+for embedded targets. A Stratum-1 reference-clock server, and a client for both unicast and broadcast.
 
 This crate turns a **disciplined UTC instant (Unix nanoseconds)** into the bytes of an NTP packet,
 and back. It knows nothing about Ethernet, IPv4, UDP or any HAL — only integer nanosecond timestamps
