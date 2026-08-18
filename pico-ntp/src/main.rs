@@ -201,7 +201,7 @@ const RAISE_BAUD: bool = false;
 /// The real fix is to give the pairing margin instead of guessing at it: trim the sentence set
 /// (`PMTK314`) or raise the baud rate so the burst finishes long before the next edge, and/or pair
 /// on the first sentence of the burst rather than one near its end.
-const PPS_NMEA: rp_pps::PpsNmeaAssociation = rp_pps::PpsNmeaAssociation::SameSecond;
+const PPS_NMEA: rp_pps::PpsNmeaAssociation = rp_pps::PpsNmeaAssociation::NmeaIsPreviousSecond;
 /// Pair on **ZDA**, the only sentence the receiver defines against its 1PPS output.
 const TIME_SOURCE: rp_pps::NmeaTimeSource = rp_pps::NmeaTimeSource::Zda;
 
