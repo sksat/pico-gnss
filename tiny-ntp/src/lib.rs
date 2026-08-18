@@ -7,13 +7,15 @@
 //! into it are integer nanosecond timestamps and a UTC epoch, which is the same layer boundary the
 //! rest of this workspace uses.
 //!
-//! **Scope today is the server side**, and only as a Stratum-1 reference clock. [`timestamp`] and
-//! [`packet`] are what any NTP role needs, but there is no client and the stratum is not
-//! configurable. The name is deliberately broader than that — a client belongs beside [`server`]
-//! rather than in another crate — but nothing here implements one yet.
+//! **Scope today is one Stratum-1 server and the unicast client that can check it.** [`timestamp`]
+//! and [`packet`] are what any NTP role needs; [`server`] answers only as a primary server, since
+//! the stratum is not configurable and a secondary would have to accumulate an upstream path into
+//! root delay. [`client::accept_broadcast`] is a stub — see its doc for the question that has to be
+//! answered before it can be written.
 //!
 //! - [`timestamp`] — NTP's two fixed-point time formats and their Unix-ns conversions.
 //! - [`packet`] — the 48-byte header and its wire encoding.
+//! - [`client`] — building a request and turning a reply into an offset and a delay.
 //! - [`server`] — Stratum-1 policy: when we may serve at all, and what to claim. Both service
 //!   modes are here — [`server::respond`] for a unicast client exchange and [`server::broadcast`]
 //!   for one-way announcement — since they differ only in which timestamps are meaningful.
@@ -31,6 +33,7 @@
 
 #![no_std]
 
+pub mod client;
 pub mod packet;
 pub mod server;
 pub mod timestamp;
