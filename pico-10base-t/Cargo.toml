@@ -1,0 +1,30 @@
+[package]
+name = "pico-10base-t"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "10BASE-T Ethernet transmit from a Raspberry Pi Pico with three resistors and no PHY chip: PIO Manchester serialiser, link pulses, and Ethernet/IPv4/UDP framing. A Rust port of kingyoPiyo/Pico-10BASE-T. HAL-agnostic core (host-testable) with a thin embassy-rp backend."
+keywords = ["ethernet", "10base-t", "pio", "rp2040", "no_std"]
+categories = ["embedded", "no-std", "hardware-support", "network-programming"]
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+
+[lib]
+name = "pico_10base_t"
+
+[package.metadata.docs.rs]
+features = ["embassy-rp", "embassy-rp/rp2040"]
+default-target = "thumbv6m-none-eabi"
+
+[features]
+default = []
+# Thin backend over embassy-rp. The downstream binary selects the chip (e.g. embassy-rp/rp2040);
+# this crate stays chip-feature-agnostic, the same way rp-pps does.
+embassy-rp = ["dep:embassy-rp", "dep:pio"]
+
+[dependencies]
+# The PIO program is built HAL-agnostically via `pio::pio_asm!` (not a HAL's re-export), so any
+# backend loads the same `pio::Program`. Only needed with a backend selected.
+pio = { version = "0.3", optional = true }
+embassy-rp = { version = "0.10", optional = true, default-features = false }
