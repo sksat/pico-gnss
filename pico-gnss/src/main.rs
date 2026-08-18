@@ -56,7 +56,7 @@ use rp_pps::embassy::{SteeredPpsOutput, TimedPpsCapture};
 use rp_pps::{NaivePeriodDither, NmeaLineAssembler, PpsGpsdo, PpsSteer, TimedEdge, fold_phase_ns};
 
 /// 受信機固有レイヤ (MT3333/GYSFFMANC の PMTK 設定・ボーレート)。別受信機ならここだけ差し替え。
-mod mt3333;
+use pico_gnss::mt3333;
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;

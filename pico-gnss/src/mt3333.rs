@@ -133,6 +133,9 @@ async fn send_pmtk<W: Write>(tx: &mut W, payload: &str) {
 /// 一日測って調整した定数」を作らずに済む。
 pub async fn establish_link(uart: &mut BufferedUart) -> u32 {
     let Some(found) = probe_baud(uart).await else {
+        // probe は最後に試したレート (fast) を残したまま抜けている。既定へ戻しておかないと、
+        // 受信機が後から既定レートで起動しても受信ループが追従できず、二度と復帰しない。
+        uart.set_baudrate(GNSS_BAUD);
         warn!("GNSS: no NMEA at either baud — check wiring, or power-cycle the receiver");
         return GNSS_BAUD;
     };
@@ -164,6 +167,23 @@ pub async fn establish_link(uart: &mut BufferedUart) -> u32 {
             GNSS_BAUD
         }
     }
+}
+
+/// 受信機が今どのレートで喋っているかを探し、port をそこに合わせる。**設定は変えない**。
+///
+/// [`establish_link`] と違って受信機に何も送らないので、設定を持たない側 (例のバイナリなど) が
+/// 使う。`PMTK251` の設定は firmware の再フラッシュを跨いで残るため、9600 決め打ちで開くと、
+/// 一度でも引き上げた受信機からは何も受け取れなくなる。
+pub async fn follow_baud(uart: &mut BufferedUart) -> Option<u32> {
+    let found = probe_baud(uart).await;
+    match found {
+        Some(rate) => info!("GNSS: talking at {=u32}", rate),
+        None => {
+            uart.set_baudrate(GNSS_BAUD);
+            warn!("GNSS: no NMEA at either baud — check wiring, or power-cycle the receiver");
+        }
+    }
+    found
 }
 
 /// 各レートを順に試し、NMEA が framing できたところで止める。port はそのレートのまま残す。
