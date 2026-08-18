@@ -24,7 +24,12 @@ use gnssdo::{Gnssdo, GnssdoStep};
 /// end of the NMEA burst where, at 9600 baud, it can arrive *after the next edge*.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum NmeaTimeSource {
-    /// Recommended Minimum — a *navigation* sentence that happens to carry a clock.
+    /// **R**ecommended **M**inimum Navigation Information — and the name is the argument.
+    ///
+    /// Still expanded that way in NMEA 0183 v4.11: the minimum set of data a *navigation* source
+    /// should provide — position, course, speed, and the time those apply to. It sits beside RMA
+    /// (Loran-C) and RMB (navigation to a waypoint) from the same era. It carries a clock because
+    /// navigation needs one, not because it was designed to state the time.
     ///
     /// Select this only for a receiver that does not emit ZDA. Its time is not defined against the
     /// timing pulse, so pairing it with an edge works by convention rather than by specification.
