@@ -35,9 +35,9 @@
     <rect x="530" y="158" width="76" height="24" rx="3"/>
   </g>
   <g font-size="11.5" fill="#c1442e" text-anchor="middle">
-    <text x="188" y="175">ZDA 12:00:00</text>
-    <text x="378" y="175">ZDA 12:00:01</text>
-    <text x="568" y="175">ZDA 12:00:02</text>
+    <text x="188" y="175">12:00:00</text>
+    <text x="378" y="175">12:00:01</text>
+    <text x="568" y="175">12:00:02</text>
   </g>
 
   <!-- 対応付け -->

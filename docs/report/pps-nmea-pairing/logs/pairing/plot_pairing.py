@@ -167,43 +167,63 @@ def fig_timeline(panels, title, path: Path):
     print(f"wrote {path}")
 
 
-def fig_margin(slow_m, fast_m, path: Path):
-    """次エッジまでの残りの分布。9600 は二峰、115200 は一峰。
+# 境界のすぐ近くとみなす幅。ここに落ちたセンテンスは、バーストのわずかな揺れで
+# 境界の反対側へ移りうる。
+NEAR_MS = 100
 
-    どちらの系列も RMC である。本文では ZDA も扱うので、凡例でセンテンス種別まで明示して
-    「センテンスによらない性質」と誤読されないようにする。
+
+def fig_margin(series, path: Path):
+    """時刻センテンスが届いてから次の PPS エッジまでの残り時間の分布。
+
+    条件ごとに段を分ける。1 枚に重ねると、山がどちらの系列のものか読み取れないうえ、
+    「センテンスの種別によらない性質」と誤読されやすい。
+
+    0 ms と 1000 ms は同じ境界を両側から見た値である。残りが 0 に近いセンテンスは
+    エッジを跨ぐ寸前におり、1000 に近いセンテンスは跨いだ直後にいる。どちらも
+    「境界の際」なので、両端に同じ幅の帯を敷いて、そこに入った割合を出す。
     """
-    fig, ax = plt.subplots(figsize=(9, 3.6))
-    bins = [i / 50 for i in range(51)]
-    ax.hist(
-        [m * 1000 for _, m in slow_m],
-        bins=[b * 1000 for b in bins],
-        color=SLOW_C,
-        alpha=0.75,
-        label=f"RMC @ 9600 baud (n={len(slow_m)})",
+    fig, axes = plt.subplots(
+        len(series), 1, figsize=(9, 1.9 * len(series)), sharex=True, squeeze=False
     )
-    ax.hist(
-        [m * 1000 for _, m in fast_m],
-        bins=[b * 1000 for b in bins],
-        color=FAST_C,
-        alpha=0.75,
-        label=f"RMC @ 115200 baud (n={len(fast_m)})",
-    )
-    ax.axvline(0, color="#333", lw=2)
-    ax.annotate(
-        "the next PPS edge\n(crossing it shifts the epoch by one second)",
-        (0, ax.get_ylim()[1] * 0.95),
-        textcoords="offset points",
-        xytext=(8, -6),
+    for ax, (label, margins, colour) in zip(axes[:, 0], series):
+        v = [m * 1000 for _, m in margins]
+        near = sum(1 for x in v if x < NEAR_MS or x > 1000 - NEAR_MS)
+        ax.axvspan(0, NEAR_MS, color="#999", alpha=0.18, lw=0)
+        ax.axvspan(1000 - NEAR_MS, 1000, color="#999", alpha=0.18, lw=0)
+        ax.hist(v, bins=[i * 20 for i in range(51)], color=colour)
+        ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=10)
+        ax.text(
+            130,
+            ax.get_ylim()[1] * 0.84,
+            f"{near / len(v) * 100:.0f}% within {NEAR_MS} ms of an edge"
+            f"   (n={len(v)}, min {min(v):.0f} ms)",
+            ha="left",
+            fontsize=9.5,
+            color=colour,
+        )
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+        ax.set_yticks([])
+
+    # 説明は最終段の空いている左側に置く。上段に置くと、その段の数値と重なる。
+    axes[-1, 0].text(
+        130,
+        axes[-1, 0].get_ylim()[1] * 0.52,
+        "landing in a shaded band means the pairing is decided\n"
+        "by which side of the edge the sentence happens to fall on",
+        ha="left",
         va="top",
         fontsize=9,
         color="#333",
     )
-    ax.set_xlabel("margin from the time sentence to the next PPS edge (ms)")
-    ax.set_ylabel("sentences")
-    ax.legend(loc="upper right")
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
+    axes[-1, 0].set_xlim(0, 1000)
+    axes[-1, 0].set_xlabel(
+        "margin from the time sentence to the next PPS edge (ms)\n"
+        "0 = about to cross an edge,  1000 = just crossed one"
+    )
+    fig.suptitle(
+        "How close to a PPS edge does the time sentence arrive?", fontsize=12
+    )
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     print(f"wrote {path}")
@@ -273,7 +293,13 @@ def main() -> int:
         "The same second at 115200 baud",
         OUT / "fig-burst-115200.png",
     )
-    fig_margin(slow_rmc, fast_rmc, OUT / "fig-margin.png")
+    fig_margin(
+        [
+            ("RMC\n@ 9600", slow_rmc, SLOW_C),
+            ("ZDA\n@ 9600", slow_zda, SLOW_C),
+        ],
+        OUT / "fig-margin.png",
+    )
     return 0
 
 
