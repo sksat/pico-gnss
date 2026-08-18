@@ -278,12 +278,19 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
             Timer::after_micros(nlp_us).await;
             continue;
         }
-        // Aim the *frame's first bit* at the boundary, so the transmit timestamp we write is when
-        // the packet is on the wire rather than when we started thinking about it.
-        Timer::after_micros((wait_ns.max(0) / 1000) as u64).await;
         last_target_ns = target_unix_ns;
 
-        // Re-read: the policy gate must reflect the state at transmission, not a second ago.
+        // Build *before* sleeping. The transmit timestamp we are about to write says the frame's
+        // first bit is at `target_unix_ns`, so everything between waking and handing the buffer to
+        // the PIO is a systematic lag added to every packet we serve. Encoding 48 NTP bytes into a
+        // ~90-byte frame and then into Manchester symbols is far more than the ~1 µs of timestamp
+        // resolution `CFG.precision` advertises, so it cannot sit on that path.
+        //
+        // What this costs is freshness: the packet's contents are those of a moment up to one
+        // link-pulse interval before it leaves. That is affordable and the gate below is not —
+        // holdover grows dispersion by `holdover_drift_ppb` over that interval, single-digit
+        // nanoseconds against a floor of a millisecond, whereas *whether we may speak at all* has
+        // to be answered at transmission.
         let (_, state_now) = clock_state();
         let state = if state_now.last_update_unix_ns.is_some() {
             state_now
@@ -323,6 +330,22 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
                     continue;
                 };
 
+                // Only now sleep to the boundary, and re-read the clock to do it: the build above
+                // consumed part of the interval, and `wait_ns` was measured before it. Sleeping the
+                // stale figure would overshoot by exactly the build time — the error this ordering
+                // exists to remove.
+                let (before_wait, _) = clock_state();
+                if let Some(before_wait) = before_wait {
+                    let remaining_ns = target_unix_ns - before_wait - TX_LEAD_NS;
+                    Timer::after_micros((remaining_ns.max(0) / 1000) as u64).await;
+                }
+
+                // Disciplined UTC as close to the handover as we can read it. `sched_ns` below is
+                // this minus the instant we advertised, i.e. the residual lag that `TX_LEAD_NS`
+                // exists to cancel — and it is what has to be measured before that constant can be
+                // anything but zero. Reading it costs a lock and lands inside the number it
+                // reports, so the figure errs high, which is the safe direction for a correction.
+                let (utc_at_handover, _) = clock_state();
                 let before = now_ns();
                 tx.send(&symbols[..words]).await;
                 let after = now_ns();
@@ -339,9 +362,10 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
                 // what we believed we were sending, and to see the scheduling error separately from
                 // the path delay.
                 info!(
-                    "NTPTX n={} target_unix_ns={} tx_lead_ns={} dma_us={} bytes={} words={} disp_ns={} holdover_ns={}",
+                    "NTPTX n={} target_unix_ns={} sched_ns={} tx_lead_ns={} dma_us={} bytes={} words={} disp_ns={} holdover_ns={}",
                     sent,
                     target_unix_ns,
+                    utc_at_handover.map(|u| u - target_unix_ns).unwrap_or(0),
                     TX_LEAD_NS,
                     (after - before) / 1000,
                     len,
