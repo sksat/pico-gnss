@@ -96,8 +96,12 @@ def occupancy(sentences, span, baud):
 
 
 def fig_timeline(slow, fast, path: Path):
-    """代表的な 1 秒に、実測のセンテンス到着をそのまま並べる。"""
-    fig, axes = plt.subplots(2, 1, figsize=(10, 5.0), sharex=True)
+    """代表的な 1 秒に、実測のセンテンス到着をそのまま並べる。
+
+    注釈は全部 axes の内側に置く。外に出すと x 軸ラベルや目盛と重なるし、右端の
+    センテンスでは図からはみ出す。位置に応じて揃えを変えて、線やラベル同士の衝突も避ける。
+    """
+    fig, axes = plt.subplots(2, 1, figsize=(10, 4.6), sharex=True)
     for ax, (label, items, colour, note) in zip(
         axes,
         [
@@ -105,50 +109,57 @@ def fig_timeline(slow, fast, path: Path):
             ("115200 baud", fast, FAST_C, "7% of the link is NMEA"),
         ],
     ):
-        for x in (0.0, 1.0):
+        for x, text, ha, dx in (
+            (0.0, "PPS edge", "left", 0.012),
+            (1.0, "next PPS edge", "right", -0.012),
+        ):
             ax.axvline(x, color="#333", lw=2)
-        ax.text(0.0, 1.30, "PPS edge", ha="center", fontsize=9, color="#333")
-        ax.text(1.0, 1.30, "next PPS edge", ha="center", fontsize=9, color="#333")
+            # 線の上に文字を乗せない。線から少しずらして、外向きでなく内向きに逃がす。
+            ax.text(x + dx, 1.42, text, ha=ha, va="top", fontsize=9, color="#333")
 
         for off, kind in items:
             hot = kind in ("RMC", "ZDA")
             ax.plot(
                 [off, off],
-                [0.35, 0.75] if hot else [0.45, 0.65],
-                color=colour if hot else "#999",
+                [0.18, 0.62] if hot else [0.26, 0.54],
+                color=colour if hot else "#aaa",
                 lw=2.4 if hot else 1.2,
             )
-        # 時刻センテンスだけ、次エッジまでの残りを添える
-        for kind, dy in (("RMC", -26), ("ZDA", -44)):
+
+        # 時刻センテンスの注釈は上へ、二本を縦にずらして重ならないようにする。
+        for kind, y in (("RMC", 1.06), ("ZDA", 0.80)):
             hit = [o for o, k in items if k == kind]
             if not hit:
                 continue
             off = hit[0]
+            # 右端に近ければ右揃えにして、図の外へ出さない。
+            ha = "right" if off > 0.62 else "left"
+            dx = -0.015 if ha == "right" else 0.015
             ax.annotate(
                 f"{kind}: {(1.0 - off) * 1000:.0f} ms to the next edge",
-                (off, 0.35),
-                textcoords="offset points",
-                xytext=(4, dy),
-                ha="left",
-                fontsize=8,
+                xy=(off, 0.62),
+                xytext=(off + dx, y),
+                ha=ha,
+                va="center",
+                fontsize=8.5,
                 color=colour,
-                arrowprops=dict(arrowstyle="-", color=colour, lw=0.8),
+                arrowprops=dict(arrowstyle="-", color=colour, lw=0.8, alpha=0.6),
             )
-        ax.text(0.5, 1.02, note, ha="center", fontsize=9, color=colour)
+
+        ax.text(0.5, 0.06, note, ha="center", va="bottom", fontsize=9, color=colour)
         ax.set_ylim(0, 1.5)
         ax.set_yticks([])
         ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=10)
         for side in ("top", "right", "left"):
             ax.spines[side].set_visible(False)
 
-    axes[-1].set_xlim(-0.04, 1.12)
+    axes[-1].set_xlim(-0.03, 1.06)
     axes[-1].set_xlabel("seconds after a PPS edge")
     fig.suptitle(
         "One second of NMEA, as logged: every sentence arrival between two PPS edges",
         fontsize=12,
-        y=0.99,
     )
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    fig.tight_layout()
     fig.savefig(path, dpi=150)
     print(f"wrote {path}")
 
