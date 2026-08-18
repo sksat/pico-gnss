@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 250" width="760" height="250" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="バーストの内訳。GSV が衛星 4 個ごとに 1 本増え、あと 2 本で 1 秒を使い切る">
+  <rect width="760" height="250" fill="#ffffff"/>
+  <defs>
+    <pattern id="h" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <line x1="0" y1="0" x2="0" y2="7" stroke="#c1442e" stroke-width="2.5" opacity="0.45"/>
+    </pattern>
+  </defs>
+
+  <g stroke="#333" stroke-width="2">
+    <line x1="140" y1="62" x2="140" y2="150"/>
+    <line x1="700" y1="62" x2="700" y2="150"/>
+  </g>
+  <g font-size="12" fill="#333">
+    <text x="144" y="54">PPS エッジ</text>
+    <text x="696" y="54" text-anchor="end">次の PPS エッジ</text>
+  </g>
+
+  <rect x="140" y="80" width="560" height="44" fill="#f4f4f4" stroke="#ccc"/>
+  <rect x="140" y="80" width="231" height="44" fill="#d68b7c"/>
+  <rect x="371" y="80" width="245" height="44" fill="#c1442e"/>
+  <rect x="616" y="80" width="82" height="44" fill="url(#h)" stroke="#c1442e" stroke-dasharray="4 3"/>
+
+  <text x="255" y="107" font-size="12" fill="#ffffff" text-anchor="middle">固定の 8 本</text>
+  <text x="493" y="107" font-size="12" fill="#ffffff" text-anchor="middle">GSV 6 本 (437 ms)</text>
+  <text x="657" y="107" font-size="11" fill="#c1442e" text-anchor="middle">+2 本</text>
+
+  <text x="140" y="146" font-size="11.5" fill="#777">いまの余白は 150 ms しかない</text>
+
+  <text x="140" y="188" font-size="12.5" fill="#333">GSV は見えている衛星を並べるセンテンスで、1 本に 4 個まで載る (仕様 §2.2.4)。</text>
+  <text x="140" y="210" font-size="12.5" fill="#333">いまは 22 から 23 個が見えていて 6 本。衛星が 4 個増えるごとに 1 本、73 ms ぶん伸びる。</text>
+  <text x="140" y="232" font-size="12.5" fill="#c1442e">あと 8 個増えれば 2 本増えて、9600 bps では 1 秒を使い切る。</text>
+</svg>

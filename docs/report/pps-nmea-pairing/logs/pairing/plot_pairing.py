@@ -187,16 +187,21 @@ def fig_margin(series, path: Path):
     )
     for ax, (label, margins, colour) in zip(axes[:, 0], series):
         v = [m * 1000 for _, m in margins]
-        near = sum(1 for x in v if x < NEAR_MS or x > 1000 - NEAR_MS)
-        ax.axvspan(0, NEAR_MS, color="#999", alpha=0.18, lw=0)
-        ax.axvspan(1000 - NEAR_MS, 1000, color="#999", alpha=0.18, lw=0)
+        # 両端は同じ境界だが、跨ぐ前か後かで対応付けの外れ方が変わる。合計だけ出すと
+        # 「半々で転ぶ」(RMC) と「いつも同じ向きに外す」(ZDA) が同じ数字に潰れるので、
+        # 帯を色で分けて別々に数える。
+        before = sum(1 for x in v if x < NEAR_MS)
+        after = sum(1 for x in v if x > 1000 - NEAR_MS)
+        ax.axvspan(0, NEAR_MS, color="#b5762f", alpha=0.16, lw=0)
+        ax.axvspan(1000 - NEAR_MS, 1000, color="#2f6fb5", alpha=0.16, lw=0)
         ax.hist(v, bins=[i * 20 for i in range(51)], color=colour)
         ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=10)
         ax.text(
             130,
             ax.get_ylim()[1] * 0.84,
-            f"{near / len(v) * 100:.0f}% within {NEAR_MS} ms of an edge"
-            f"   (n={len(v)}, min {min(v):.0f} ms)",
+            f"about to cross: {before / len(v) * 100:.0f}%"
+            f"    just crossed: {after / len(v) * 100:.0f}%"
+            f"    (n={len(v)}, min {min(v):.0f} ms)",
             ha="left",
             fontsize=9.5,
             color=colour,
@@ -209,8 +214,8 @@ def fig_margin(series, path: Path):
     axes[-1, 0].text(
         130,
         axes[-1, 0].get_ylim()[1] * 0.52,
-        "landing in a shaded band means the pairing is decided\n"
-        "by which side of the edge the sentence happens to fall on",
+        "shaded = within 100 ms of an edge.  amber is about to cross it,\n"
+        "blue has already crossed and is measured to the following edge.",
         ha="left",
         va="top",
         fontsize=9,
