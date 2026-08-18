@@ -143,6 +143,24 @@ const SYMBOL_WORDS: usize = encoded_words(FRAME_LEN);
 /// timestamps, real framing, real checksums — with only the line coding and the wire left over.
 const FRAME_DUMPS: u32 = 3;
 
+/// The receiver's power-on baud rate.
+const GNSS_BOOT_BAUD: u32 = 9600;
+/// What it would be raised to, to get the NMEA burst out of the way of the next PPS edge.
+const GNSS_FAST_BAUD: u32 = 115_200;
+
+/// **Off, because it did not work.** Sending `PMTK251,115200` and switching the UART leaves the
+/// link producing nothing but framing and break errors, i.e. the module kept transmitting at 9600
+/// and did not accept the command. Not yet established whether it needs longer after power-up
+/// before it will take configuration, whether this module's firmware supports PMTK251 at all, or
+/// whether the switch has to be sequenced differently.
+///
+/// Kept rather than deleted because the *reason* to want it is sound and unchanged: at 9600 baud
+/// the NMEA burst lands on top of the next PPS edge (margin: mean 490 ms, sd 460 ms, **min 2 ms**),
+/// which is what makes the second-pairing a coin toss. Trimming the sentence set with `PMTK314` is
+/// the other route to the same margin and may prove easier, since it does not require both ends to
+/// change rate in step.
+const RAISE_BAUD: bool = false;
+
 /// Which UTC second an NMEA sentence refers to, relative to the PPS edge it is paired with.
 ///
 /// Receiver-dependent, and the one setting that can put the clock a whole second out while every
@@ -344,6 +362,15 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
     }
 }
 
+/// Send `$<payload>*<checksum>\r\n` to the receiver.
+async fn send_pmtk<W: embedded_io_async::Write>(tx: &mut W, payload: &str) {
+    let cs = rp_pps::nmea_checksum(payload.as_bytes());
+    let mut line: heapless::String<64> = heapless::String::new();
+    if core::fmt::Write::write_fmt(&mut line, format_args!("${payload}*{cs:02X}\r\n")).is_ok() {
+        let _ = tx.write_all(line.as_bytes()).await;
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -372,20 +399,42 @@ async fn main(spawner: Spawner) {
         clk_sys_freq(),
     );
 
-    // UART0: the receiver's NMEA. TX is unused — this firmware does not reconfigure the module.
-    static TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
+    // UART0: the receiver's NMEA.
+    static TX_BUF: StaticCell<[u8; 32]> = StaticCell::new();
     static RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
     let mut config = UartConfig::default();
-    config.baudrate = 9600;
-    let uart = BufferedUart::new(
+    config.baudrate = GNSS_BOOT_BAUD;
+    let mut uart = BufferedUart::new(
         p.UART0,
         p.PIN_0,
         p.PIN_1,
         Irqs,
-        TX_BUF.init([0; 16]),
+        TX_BUF.init([0; 32]),
         RX_BUF.init([0; 256]),
         config,
     );
+
+    // Raise the receiver's baud rate before doing anything else.
+    //
+    // This is a *correctness* measure, not a throughput one. `rp-pps` pairs a PPS edge with the UTC
+    // second from an NMEA sentence, and at 9600 baud the sentence burst runs ~640 ms and starts a
+    // few hundred ms after the edge — so the timing sentence lands essentially on top of the *next*
+    // pulse (measured margin: mean 490 ms, sd 460 ms, min 2 ms, bimodal either side of the edge).
+    // Whichever association is configured, a longer burst — more satellites, more GSV — can flip
+    // the pairing and move the clock by a whole second at runtime.
+    //
+    // Twelve times the baud makes the burst ~53 ms, which puts the sentence hundreds of
+    // milliseconds clear of the next edge and turns a coin toss into a margin.
+    //
+    // Not persistent: the module reverts to 9600 on power loss, so this runs on every boot.
+    if RAISE_BAUD {
+        send_pmtk(&mut uart, "PMTK251,115200").await;
+        // Let the command drain at the old rate before the far end changes underneath us.
+        Timer::after_millis(250).await;
+        uart.set_baudrate(GNSS_FAST_BAUD);
+        info!("GNSS baud raised to {}", GNSS_FAST_BAUD);
+    }
+
     let (_uart_tx, uart_rx) = uart.split();
 
     spawner.spawn(pps_task(capture).unwrap());
