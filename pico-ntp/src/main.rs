@@ -63,13 +63,13 @@ use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::Read as _;
 use static_cell::StaticCell;
 
-use tiny_ntp::packet::PACKET_LEN;
-use tiny_ntp::server::{ClockState, ServeDecision, ServerConfig, broadcast};
 use pico_10base_t::embassy::Tx10BaseT;
 use pico_10base_t::frame::{Ipv4Addr, MacAddr, UdpFrameSpec, build_udp_frame, frame_len};
 use pico_10base_t::phy::{NLP_INTERVAL_US, encode_frame, encoded_words};
 use rp_pps::PpsGpsdo;
 use rp_pps::embassy::{TimedPpsCapture, run_capture, run_nmea};
+use tiny_ntp::packet::PACKET_LEN;
+use tiny_ntp::server::{ClockState, LeapWarning, ServeDecision, ServerConfig, Source, broadcast};
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
@@ -123,7 +123,7 @@ const CFG: ServerConfig = ServerConfig {
     precision: -20,
     // Broadcast interval, log2 seconds: one per second.
     poll: 0,
-    reference_id: *b"GPS\0",
+    source: Source::ReferenceClock { id: *b"GPS\0" },
     // Our own uncertainty when freshly disciplined. Conservative for the same reason as `precision`.
     base_dispersion_ns: 1_000_000,
     // Bound on fractional frequency error during holdover. The crystal measures ~0.6 ppm off and
@@ -228,6 +228,9 @@ fn clock_state() -> (Option<i64>, ClockState) {
                 last_update_unix_ns: now.map(|n| n - holdover_ns as i64),
                 holdover_ns,
                 frequency_locked: g.frequency_locked(),
+                // The MT3333 does not surface the almanac's leap-second announcement, so we have
+                // nothing to pass on. Clients see NoWarning, which is what we actually know.
+                leap: LeapWarning::None,
             },
         )
     })

@@ -23,7 +23,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tiny_ntp::packet::{Mode, NtpPacket};
-use tiny_ntp::server::{ClockState, ServeDecision, ServerConfig, respond};
+use tiny_ntp::server::{ClockState, LeapWarning, ServeDecision, ServerConfig, Source, respond};
 
 fn unix_ns_now() -> i64 {
     SystemTime::now()
@@ -36,7 +36,7 @@ fn config() -> ServerConfig {
     ServerConfig {
         precision: -20,
         poll: 4,
-        reference_id: *b"GPS\0",
+        source: Source::ReferenceClock { id: *b"GPS\0" },
         base_dispersion_ns: 1_000_000,
         holdover_drift_ppb: 1_000,
         max_holdover_ns: 3_600 * 1_000_000_000,
@@ -66,6 +66,7 @@ fn serve_once(offset_ns: i64) -> u16 {
             last_update_unix_ns: Some(receive_unix_ns - 500_000_000),
             holdover_ns: 500_000_000,
             frequency_locked: true,
+            leap: LeapWarning::None,
         };
 
         let transmit_unix_ns = unix_ns_now() + offset_ns;

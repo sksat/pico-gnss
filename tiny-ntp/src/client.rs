@@ -172,7 +172,7 @@ pub fn accept_broadcast(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::{self, ClockState, ServeDecision, ServerConfig};
+    use crate::server::{self, ClockState, LeapWarning, ServeDecision, ServerConfig, Source};
 
     const T: i64 = 1_787_020_967 * 1_000_000_000;
 
@@ -180,7 +180,7 @@ mod tests {
         ServerConfig {
             precision: -20,
             poll: 4,
-            reference_id: *b"GPS\0",
+            source: Source::ReferenceClock { id: *b"GPS\0" },
             base_dispersion_ns: 1_000_000,
             holdover_drift_ppb: 100,
             max_holdover_ns: 3_600 * 1_000_000_000,
@@ -192,7 +192,37 @@ mod tests {
             last_update_unix_ns: Some(now),
             holdover_ns: 0,
             frequency_locked: true,
+            leap: LeapWarning::None,
         }
+    }
+
+    #[test]
+    fn a_secondary_server_is_a_usable_source() {
+        // The sanity checks reject stratum 0 and 16, so they must not reject what lies between:
+        // most of the servers a client will ever talk to are secondaries.
+        let secondary = ServerConfig {
+            source: Source::Upstream {
+                address: [10, 0, 0, 1],
+                stratum: 1,
+                root_delay: NtpShort::from_nanos(20_000_000),
+                root_dispersion: NtpShort::from_nanos(30_000_000),
+                delay_ns: 6_000_000,
+            },
+            ..cfg()
+        };
+        let req = request(T, 4);
+        let ServeDecision::Serve(reply) = server::respond(&secondary, &locked(T), &req, T, T)
+        else {
+            panic!("a locked clock must answer");
+        };
+        let m = measure(&req, &reply, T).expect("stratum 2 is synchronised");
+        assert_eq!(m.stratum, 2);
+        // The dispersion a client sees is the whole path's, not just the server's own.
+        assert!(
+            m.root_dispersion_ns >= 30_000_000,
+            "the upstream's dispersion has to survive the trip: {}",
+            m.root_dispersion_ns
+        );
     }
 
     /// Run one exchange where the server's clock leads ours by `offset_ns` and each direction of

@@ -7,16 +7,18 @@
 //! into it are integer nanosecond timestamps and a UTC epoch, which is the same layer boundary the
 //! rest of this workspace uses.
 //!
-//! **Scope today is a Stratum-1 server and a client for it.** [`timestamp`]
-//! and [`packet`] are what any NTP role needs; [`server`] answers only as a primary server, since
-//! the stratum is not configurable and a secondary would have to accumulate an upstream path into
-//! root delay. [`client`] covers both service modes: a unicast exchange, and
-//! the one-way broadcast that a transmit-only server leaves as the only option.
+//! [`server`] answers as either a primary server holding a reference clock or a secondary following
+//! another server, and [`client`] covers both service modes — a unicast exchange, and the one-way
+//! broadcast that a transmit-only server leaves as the only option.
+//!
+//! What it does not do is choose. RFC 5905 §10-11 — polling several servers, filtering their
+//! samples and picking whom to believe — is an algorithm with state and a scheduler, and it belongs
+//! above this layer rather than inside it.
 //!
 //! - [`timestamp`] — NTP's two fixed-point time formats and their Unix-ns conversions.
 //! - [`packet`] — the 48-byte header and its wire encoding.
 //! - [`client`] — building a request, and turning a reply or a broadcast into an offset.
-//! - [`server`] — Stratum-1 policy: when we may serve at all, and what to claim. Both service
+//! - [`server`] — server policy: when we may serve at all, and what to claim. Both service
 //!   modes are here — [`server::respond`] for a unicast client exchange and [`server::broadcast`]
 //!   for one-way announcement — since they differ only in which timestamps are meaningful.
 //!

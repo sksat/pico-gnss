@@ -37,7 +37,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tiny_ntp::packet::{Mode, NtpPacket};
-use tiny_ntp::server::{ClockState, ServeDecision, ServerConfig, respond};
+use tiny_ntp::server::{ClockState, LeapWarning, ServeDecision, ServerConfig, Source, respond};
 
 /// Where the firmware broadcasts while `DST_PORT` is set to the measurement port.
 const HARDWARE_PORT: u16 = 10123;
@@ -95,7 +95,9 @@ fn relay_hardware_time(hw: HardwareTime) -> u16 {
     let cfg = ServerConfig {
         precision: -20,
         poll: 4,
-        reference_id: hw.reference_id,
+        source: Source::ReferenceClock {
+            id: hw.reference_id,
+        },
         base_dispersion_ns: hw.root_dispersion_ns,
         holdover_drift_ppb: 1_000,
         max_holdover_ns: 3_600 * 1_000_000_000,
@@ -115,6 +117,7 @@ fn relay_hardware_time(hw: HardwareTime) -> u16 {
             last_update_unix_ns: Some(receive_unix_ns - 500_000_000),
             holdover_ns: 500_000_000,
             frequency_locked: true,
+            leap: LeapWarning::None,
         };
         match respond(&cfg, &state, &request, receive_unix_ns, now(&hw)) {
             ServeDecision::Serve(reply) => {

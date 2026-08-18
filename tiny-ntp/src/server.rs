@@ -1,8 +1,10 @@
-//! Stratum-1 server policy: deciding *whether* we may serve the time, and what to claim about it.
+//! Server policy: deciding *whether* we may serve the time, and what to claim about it.
 //!
-//! The wire format ([`crate::packet`]) is neutral about stratum. This module is where being a
-//! **reference clock** shows up: refusing to transmit while undisciplined, growing root dispersion
-//! through a holdover, and pinning stratum 1 with a source identifier.
+//! The wire format ([`crate::packet`]) is neutral about where a server's time came from. This
+//! module is where that shows up: refusing to transmit while undisciplined, growing root dispersion
+//! through a holdover, and filling in the stratum, the reference identifier and the accumulated
+//! path back to the root — all of which differ between a server holding a [reference
+//! clock](Source::ReferenceClock) and one [following another server](Source::Upstream).
 //!
 //! It takes the clock's state as plain integers, so it is testable on the host without a GNSS
 //! receiver anywhere nearby.
@@ -10,7 +12,51 @@
 use crate::packet::{LeapIndicator, Mode, NtpPacket};
 use crate::timestamp::{NtpShort, NtpTimestamp};
 
-/// Static description of this reference clock.
+/// The deepest stratum that still means "synchronised" (RFC 5905 §7.3: MAXSTRAT).
+pub const MAX_STRATUM: u8 = 16;
+
+/// Where this server's time comes from, which is what decides its stratum and what it advertises
+/// as the path back to the root.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    /// Hardware attached to this machine: a primary server, stratum 1.
+    ReferenceClock {
+        /// Four-character ASCII source code (RFC 5905 §7.3), e.g. `GPS\0`.
+        id: [u8; 4],
+    },
+    /// Another NTP server, making this a secondary server one stratum below it.
+    Upstream {
+        /// The upstream's IPv4 address, which is what the reference identifier carries for IPv4
+        /// (RFC 5905 §7.3). A secondary names its source by address, not by a text code.
+        address: [u8; 4],
+        /// The upstream's own stratum. Ours is one more.
+        stratum: u8,
+        /// The upstream's root delay, which is its distance to the root and not to us.
+        root_delay: NtpShort,
+        /// The upstream's root dispersion, likewise.
+        root_dispersion: NtpShort,
+        /// Round-trip delay to the upstream, as [`crate::client::measure`] reports it. Added to the
+        /// upstream's root delay, since our clients are that much further from the root than we are.
+        delay_ns: i64,
+    },
+}
+
+/// A leap second the time source has announced for the end of the current UTC day.
+///
+/// Deliberately not [`LeapIndicator`], which also has a value meaning *unsynchronised*. Whether we
+/// are synchronised is decided by [`ClockState`] and the gate below, not by whoever fills this in;
+/// letting a caller set it here would be a second, contradictory way to answer the same question.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LeapWarning {
+    #[default]
+    None,
+    /// The last minute of the day will have 61 seconds.
+    Insert,
+    /// The last minute of the day will have 59 seconds.
+    Delete,
+}
+
+/// Static description of this server.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ServerConfig {
     /// log2 seconds of the resolution at which we can actually *timestamp* a transmission.
@@ -20,8 +66,8 @@ pub struct ServerConfig {
     pub precision: i8,
     /// log2 seconds between broadcasts.
     pub poll: i8,
-    /// Four-character source code (RFC 5905 §7.3), e.g. `GPS\0`.
-    pub reference_id: [u8; 4],
+    /// What we are synchronised to, which sets our stratum and reference identifier.
+    pub source: Source,
     /// Our own uncertainty when freshly disciplined (ns) — the floor of root dispersion.
     pub base_dispersion_ns: u64,
     /// Bound on fractional frequency error (ppb) used to grow dispersion during holdover.
@@ -40,6 +86,8 @@ pub struct ClockState {
     pub holdover_ns: u64,
     /// Whether the frequency estimate has locked. Without it, holdover extrapolation is meaningless.
     pub frequency_locked: bool,
+    /// A leap second the source has announced, passed on to clients so they can apply it too.
+    pub leap: LeapWarning,
 }
 
 /// Why we are staying silent.
@@ -51,6 +99,9 @@ pub enum SilentReason {
     FrequencyUnlocked,
     /// Holdover has run longer than the configured limit.
     HoldoverExceeded,
+    /// Following this upstream would put us at [`MAX_STRATUM`] or deeper, which on the wire means
+    /// unsynchronised. Serving it would be claiming to be a source while announcing we are not one.
+    TooDeep,
 }
 
 /// Whether to transmit, and what.
@@ -104,22 +155,62 @@ fn gate(cfg: &ServerConfig, state: &ClockState) -> Result<i64, SilentReason> {
     if state.holdover_ns > cfg.max_holdover_ns {
         return Err(SilentReason::HoldoverExceeded);
     }
+    if stratum(&cfg.source) >= MAX_STRATUM {
+        return Err(SilentReason::TooDeep);
+    }
     Ok(last_update)
 }
 
-/// The fields that describe *this clock* rather than the exchange, shared by both service modes.
+/// Our stratum: 1 for a reference clock, one more than the upstream otherwise.
+///
+/// Saturating, so a chain already at the bottom stays there rather than wrapping to 0 — which is a
+/// kiss-o'-death and would be read as something else entirely.
+fn stratum(source: &Source) -> u8 {
+    match source {
+        Source::ReferenceClock { .. } => 1,
+        Source::Upstream { stratum, .. } => stratum.saturating_add(1),
+    }
+}
+
+/// The fields that describe *this server* rather than the exchange, shared by both service modes.
 fn base_packet(cfg: &ServerConfig, state: &ClockState, last_update: i64) -> NtpPacket {
+    let own_dispersion = root_dispersion_ns(cfg, state.holdover_ns);
+    // What a client is told about the whole path to the root, not just to us. For a reference
+    // clock both are ours alone; for a secondary, the upstream's figures are already in the packet
+    // it sent us and our own hop goes on top.
+    let (reference_id, root_delay, root_dispersion) = match cfg.source {
+        // Stratum 1 *is* the root: there is no upstream path to have delay to.
+        Source::ReferenceClock { id } => (id, NtpShort::ZERO, NtpShort::from_nanos(own_dispersion)),
+        Source::Upstream {
+            address,
+            root_delay,
+            root_dispersion,
+            delay_ns,
+            ..
+        } => (
+            address,
+            NtpShort::from_nanos(
+                root_delay
+                    .to_nanos()
+                    .saturating_add(delay_ns.unsigned_abs()),
+            ),
+            NtpShort::from_nanos(root_dispersion.to_nanos().saturating_add(own_dispersion)),
+        ),
+    };
     NtpPacket {
-        leap: LeapIndicator::NoWarning,
+        leap: match state.leap {
+            LeapWarning::None => LeapIndicator::NoWarning,
+            LeapWarning::Insert => LeapIndicator::LastMinute61,
+            LeapWarning::Delete => LeapIndicator::LastMinute59,
+        },
         version: NTP_VERSION,
         mode: Mode::Broadcast,
-        stratum: 1,
+        stratum: stratum(&cfg.source),
         poll: cfg.poll,
         precision: cfg.precision,
-        // Stratum 1 *is* the root: there is no upstream path to have delay to.
-        root_delay: NtpShort::ZERO,
-        root_dispersion: NtpShort::from_nanos(root_dispersion_ns(cfg, state.holdover_ns)),
-        reference_id: cfg.reference_id,
+        root_delay,
+        root_dispersion,
+        reference_id,
         reference_timestamp: NtpTimestamp::from_unix_ns(last_update),
         origin_timestamp: NtpTimestamp::ZERO,
         receive_timestamp: NtpTimestamp::ZERO,
@@ -184,7 +275,7 @@ mod tests {
         ServerConfig {
             precision: -20,
             poll: 4,
-            reference_id: *b"GPS\0",
+            source: Source::ReferenceClock { id: *b"GPS\0" },
             base_dispersion_ns: 1_000_000,
             holdover_drift_ppb: 100,
             max_holdover_ns: 3_600 * 1_000_000_000,
@@ -196,6 +287,7 @@ mod tests {
             last_update_unix_ns: Some(REF_UNIX_NS),
             holdover_ns: 0,
             frequency_locked: true,
+            leap: LeapWarning::None,
         }
     }
 
@@ -464,5 +556,132 @@ mod tests {
             p.root_dispersion,
             NtpShort::from_nanos(root_dispersion_ns(&cfg(), st.holdover_ns))
         );
+    }
+
+    /// A secondary server following `upstream_stratum`, one round trip away, whose own distance to
+    /// the root is `up_delay_ns` / `up_dispersion_ns`.
+    fn secondary(
+        upstream_stratum: u8,
+        hop_ns: i64,
+        up_delay_ns: u64,
+        up_dispersion_ns: u64,
+    ) -> ServerConfig {
+        ServerConfig {
+            source: Source::Upstream {
+                address: [10, 0, 0, 1],
+                stratum: upstream_stratum,
+                root_delay: NtpShort::from_nanos(up_delay_ns),
+                root_dispersion: NtpShort::from_nanos(up_dispersion_ns),
+                delay_ns: hop_ns,
+            },
+            ..cfg()
+        }
+    }
+
+    #[test]
+    fn a_secondary_sits_one_stratum_below_what_it_follows() {
+        let p = served(broadcast(
+            &secondary(2, 0, 0, 0),
+            &disciplined(),
+            REF_UNIX_NS,
+        ));
+        assert_eq!(p.stratum, 3);
+    }
+
+    #[test]
+    fn a_secondary_names_its_source_by_address_not_by_a_text_code() {
+        // RFC 5905 §7.3: below stratum 1 the reference identifier is the upstream's IPv4 address.
+        // Sending `GPS\0` from a secondary would claim hardware it does not have.
+        let p = served(broadcast(
+            &secondary(2, 0, 0, 0),
+            &disciplined(),
+            REF_UNIX_NS,
+        ));
+        assert_eq!(p.reference_id, [10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn root_delay_accumulates_the_hop_to_the_upstream() {
+        // The field is the distance to the *root*, so our clients are one hop further out than we
+        // are. Passing the upstream's figure through unchanged would understate every client's
+        // uncertainty by exactly our own path.
+        let up = 20_000_000;
+        let hop = 6_000_000;
+        let p = served(broadcast(
+            &secondary(2, hop, up, 0),
+            &disciplined(),
+            REF_UNIX_NS,
+        ));
+        assert_eq!(p.root_delay, NtpShort::from_nanos(up + hop as u64));
+    }
+
+    #[test]
+    fn root_dispersion_accumulates_on_top_of_the_upstreams() {
+        let up = 30_000_000;
+        let p = served(broadcast(
+            &secondary(2, 0, 0, up),
+            &disciplined(),
+            REF_UNIX_NS,
+        ));
+        assert_eq!(
+            p.root_dispersion,
+            NtpShort::from_nanos(up + root_dispersion_ns(&secondary(2, 0, 0, up), 0))
+        );
+    }
+
+    #[test]
+    fn following_an_upstream_at_the_bottom_of_the_chain_goes_silent() {
+        // Stratum 15 would make us 16, which on the wire *is* "unsynchronised". Serving it would
+        // mean announcing we have no time while presenting ourselves as a source of it.
+        assert_eq!(
+            broadcast(&secondary(15, 0, 0, 0), &disciplined(), REF_UNIX_NS),
+            ServeDecision::Silent(SilentReason::TooDeep)
+        );
+        // One stratum higher is still a usable server.
+        let p = served(broadcast(
+            &secondary(14, 0, 0, 0),
+            &disciplined(),
+            REF_UNIX_NS,
+        ));
+        assert_eq!(p.stratum, 15);
+    }
+
+    #[test]
+    fn a_saturating_stratum_never_wraps_into_a_kiss_of_death() {
+        // 255 + 1 would be 0, and stratum 0 means kiss-o'-death — a packet clients treat as an
+        // instruction rather than as a time source.
+        assert_eq!(
+            broadcast(&secondary(255, 0, 0, 0), &disciplined(), REF_UNIX_NS),
+            ServeDecision::Silent(SilentReason::TooDeep)
+        );
+    }
+
+    #[test]
+    fn an_announced_leap_second_reaches_the_packet() {
+        // The point of carrying it: clients that never see the GNSS receiver still get to apply the
+        // same leap at the same moment we do.
+        for (warning, indicator) in [
+            (LeapWarning::None, LeapIndicator::NoWarning),
+            (LeapWarning::Insert, LeapIndicator::LastMinute61),
+            (LeapWarning::Delete, LeapIndicator::LastMinute59),
+        ] {
+            let st = ClockState {
+                leap: warning,
+                ..disciplined()
+            };
+            let p = served(broadcast(&cfg(), &st, REF_UNIX_NS));
+            assert_eq!(p.leap, indicator);
+            let reply = served(respond(
+                &cfg(),
+                &st,
+                &client_request(),
+                REF_UNIX_NS,
+                REF_UNIX_NS,
+            ));
+            assert_eq!(
+                reply.leap, indicator,
+                "both service modes say the same thing"
+            );
+        }
     }
 }
