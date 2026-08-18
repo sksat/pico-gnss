@@ -69,27 +69,6 @@ def margins(edges, sentences, kind):
     return out
 
 
-def one_second(edges, sentences, want=("RMC", "ZDA")):
-    """代表的な 1 秒 (エッジからエッジ) を選び、その区間のセンテンス到着を実測のまま返す。
-
-    模式図ではなくログそのものを描くために使う。選ぶのは「その区間に載ったセンテンス数が
-    中央値の区間」で、たまたま短い/長い秒を代表にしないようにする。
-    """
-    per_edge: dict[int, list[tuple[float, str]]] = {}
-    for t, k, _n in sentences:
-        prev = [i for i, e in enumerate(edges) if e <= t]
-        if prev and prev[-1] + 1 < len(edges):
-            per_edge.setdefault(prev[-1], []).append((t - edges[prev[-1]], k))
-    if not per_edge:
-        return []
-    counts = sorted(len(v) for v in per_edge.values())
-    target = counts[len(counts) // 2]
-    for _i, items in sorted(per_edge.items()):
-        if len(items) == target:
-            return sorted(items)
-    return sorted(next(iter(per_edge.values())))
-
-
 def occupancy(edges, sentences, baud):
     """NMEA が UART を毎秒どれだけ占有しているか。(占有率, 1 秒あたりの文字数) を返す。
 
@@ -102,8 +81,45 @@ def occupancy(edges, sentences, baud):
     return n * 10 / span / baud, n / span
 
 
+def one_cycle(edges, sentences):
+    """代表的な 1 サイクルの到着を、その直前の PPS エッジからの経過 (ms) で返す。
+
+    切れ目は GGA に取る。サイクルの先頭が GGA であることは、同じ UTC 秒を載せた
+    センテンスを突き合わせて確かめてある (measure_pairing.py)。
+
+    エッジからエッジの「窓」で切ってはいけない。9600 bps ではサイクルが 1 秒より長いので、
+    窓には前後のサイクルのセンテンスが混ざる。混ざったまま並べると、前サイクルの ZDA が
+    窓の冒頭に写り、ZDA が RMC より先に届いているように見える。実際の送出順は逆である。
+
+    返す経過は 1000 ms を超えうる。超えている部分が、そのサイクルが次のエッジを跨いだ量に
+    あたる。
+    """
+    chunks, cur = [], None
+    for t, kind, _n in sentences:
+        if kind == "GGA":
+            if cur:
+                chunks.append(cur)
+            cur = []
+        if cur is not None:
+            cur.append((t, kind))
+    if cur:
+        chunks.append(cur)
+    if not chunks:
+        return []
+    # たまたま短い/長いサイクルを代表にしないよう、本数が中央値のものを選ぶ。
+    target = sorted(len(c) for c in chunks)[len(chunks) // 2]
+    for c in chunks:
+        if len(c) != target:
+            continue
+        prev = [e for e in edges if e <= c[0][0]]
+        if not prev:
+            continue
+        return [((t - prev[-1]) * 1000, k) for t, k in c]
+    return []
+
+
 def fig_timeline(panels, title, path: Path):
-    """代表的な 1 秒に、実測のセンテンス到着をそのまま並べる。
+    """代表的な 1 サイクルの到着を、直前の PPS エッジからの経過で並べる。
 
     条件ごとに 1 枚ずつ描く。1 枚に 9600 と 115200 を並べると、9600 の話をしている段で
     115200 の結果まで目に入ってしまい、図が本文より先に答えを出す。
@@ -114,13 +130,12 @@ def fig_timeline(panels, title, path: Path):
     fig, axes = plt.subplots(
         len(panels), 1, figsize=(10, 2.9 * len(panels)), sharex=True, squeeze=False
     )
-    for ax, (label, items, colour, note) in zip(axes[:, 0], panels):
+    for ax, (label, items, colour) in zip(axes[:, 0], panels):
         for x, text, ha, dx in (
-            (0.0, "PPS edge", "left", 0.012),
-            (1.0, "next PPS edge", "right", -0.012),
+            (0.0, "PPS edge", "left", 10),
+            (1000.0, "next PPS edge", "right", -10),
         ):
             ax.axvline(x, color="#333", lw=2)
-            # 線の上に文字を乗せない。線から少しずらして、外向きでなく内向きに逃がす。
             ax.text(x + dx, 1.42, text, ha=ha, va="top", fontsize=9, color="#333")
 
         for off, kind in items:
@@ -132,17 +147,15 @@ def fig_timeline(panels, title, path: Path):
                 lw=2.4 if hot else 1.2,
             )
 
-        # 時刻センテンスの注釈は上へ、二本を縦にずらして重ならないようにする。
         for kind, y in (("RMC", 1.06), ("ZDA", 0.80)):
             hit = [o for o, k in items if k == kind]
             if not hit:
                 continue
             off = hit[0]
-            # 右端に近ければ右揃えにして、図の外へ出さない。
-            ha = "right" if off > 0.62 else "left"
-            dx = -0.015 if ha == "right" else 0.015
+            ha = "right" if off > 700 else "left"
+            dx = -14 if ha == "right" else 14
             ax.annotate(
-                f"{kind}: {(1.0 - off) * 1000:.0f} ms to the next edge",
+                f"{kind} at {off:.0f} ms",
                 xy=(off, 0.62),
                 xytext=(off + dx, y),
                 ha=ha,
@@ -152,15 +165,14 @@ def fig_timeline(panels, title, path: Path):
                 arrowprops=dict(arrowstyle="-", color=colour, lw=0.8, alpha=0.6),
             )
 
-        ax.text(0.5, 0.06, note, ha="center", va="bottom", fontsize=9, color=colour)
         ax.set_ylim(0, 1.5)
         ax.set_yticks([])
         ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=10)
         for side in ("top", "right", "left"):
             ax.spines[side].set_visible(False)
 
-    axes[-1, 0].set_xlim(-0.03, 1.06)
-    axes[-1, 0].set_xlabel("seconds after a PPS edge")
+    axes[-1, 0].set_xlim(-40, 1260)
+    axes[-1, 0].set_xlabel("ms since the PPS edge before this cycle started")
     fig.suptitle(title, fontsize=12)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -262,40 +274,30 @@ def main() -> int:
     print(f"115200 {fast_c:.0f} chars/s -> {fast_u * 100:.0f}% of the link")
 
     for name, e, s in (("9600  ", slow_e, slow_s), ("115200", fast_e, fast_s)):
-        it = one_second(e, s)
+        it = one_cycle(e, s)
         gaps = [b[0] - a[0] for a, b in zip(it, it[1:])]
         print(
-            f"{name} burst {it[0][0] * 1000:.0f}..{it[-1][0] * 1000:.0f} ms "
-            f"(span {(it[-1][0] - it[0][0]) * 1000:.0f} ms, n={len(it)}, "
-            f"max gap {max(gaps) * 1000:.0f} ms)"
+            f"{name} cycle {it[0][0]:.0f}..{it[-1][0]:.0f} ms after the preceding edge "
+            f"(span {it[-1][0] - it[0][0]:.0f} ms, n={len(it)}, "
+            f"max gap {max(gaps):.0f} ms)"
         )
         for kind in ("RMC", "ZDA"):
             hit = [o for o, k in it if k == kind]
             if hit:
-                print(f"{name}   {kind} at {hit[0] * 1000:.0f} ms, {(1 - hit[0]) * 1000:.0f} ms to next edge")
+                print(f"{name}   {kind} at {hit[0]:.0f} ms ({hit[0] - 1000:+.0f} ms relative to the next edge)")
 
     fig_timeline(
         [
-            (
-                "9600 baud",
-                one_second(slow_e, slow_s),
-                SLOW_C,
-                f"{slow_u * 100:.0f}% of the link is NMEA",
-            )
+            ("9600 baud", one_cycle(slow_e, slow_s), SLOW_C)
         ],
-        "One second of NMEA at 9600 baud, as logged",
+        "One cycle of NMEA at 9600 baud, as logged",
         OUT / "fig-burst-9600.png",
     )
     fig_timeline(
         [
-            (
-                "115200 baud",
-                one_second(fast_e, fast_s),
-                FAST_C,
-                f"{fast_u * 100:.0f}% of the link is NMEA",
-            )
+            ("115200 baud", one_cycle(fast_e, fast_s), FAST_C)
         ],
-        "The same second at 115200 baud",
+        "The same cycle at 115200 baud",
         OUT / "fig-burst-115200.png",
     )
     fig_margin(

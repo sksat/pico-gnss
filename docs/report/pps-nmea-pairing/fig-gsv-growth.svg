@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 350" width="760" height="350" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="時刻センテンスは GSV より後ろにあり、衛星が増えて GSV が増えると境界へ押し出される">
-  <rect width="760" height="350" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 420" width="760" height="420" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="見えている衛星は 1 センテンスに 4 個ずつ分かれて GSV になり、その後ろにいる時刻センテンスが境界へ押し出される">
+  <rect width="760" height="420" fill="#ffffff"/>
   <defs>
     <pattern id="h" width="7" height="7" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
       <line x1="0" y1="0" x2="0" y2="7" stroke="#c1442e" stroke-width="2.5" opacity="0.4"/>
@@ -9,40 +9,62 @@
     </marker>
   </defs>
 
+  <!-- 衛星が GSV に分かれる -->
+  <text x="140" y="32" font-size="12.5" fill="#333">見えている衛星 23 個は、1 センテンスに 4 個ずつ載って GSV になる (仕様 §2.2.4)。</text>
+  <g fill="#c1442e" fill-opacity="0.1" stroke="#c1442e">
+    <rect x="140" y="48" width="76" height="44" rx="4"/>
+    <rect x="224" y="48" width="76" height="44" rx="4"/>
+    <rect x="308" y="48" width="76" height="44" rx="4"/>
+    <rect x="392" y="48" width="76" height="44" rx="4"/>
+    <rect x="476" y="48" width="76" height="44" rx="4"/>
+    <rect x="560" y="48" width="76" height="44" rx="4"/>
+  </g>
+  <g fill="#c1442e">
+    <circle cx="154" cy="66" r="5"/><circle cx="170" cy="66" r="5"/><circle cx="186" cy="66" r="5"/><circle cx="202" cy="66" r="5"/>
+    <circle cx="238" cy="66" r="5"/><circle cx="254" cy="66" r="5"/><circle cx="270" cy="66" r="5"/><circle cx="286" cy="66" r="5"/>
+    <circle cx="322" cy="66" r="5"/><circle cx="338" cy="66" r="5"/><circle cx="354" cy="66" r="5"/><circle cx="370" cy="66" r="5"/>
+    <circle cx="406" cy="66" r="5"/><circle cx="422" cy="66" r="5"/><circle cx="438" cy="66" r="5"/><circle cx="454" cy="66" r="5"/>
+    <circle cx="490" cy="66" r="5"/><circle cx="506" cy="66" r="5"/><circle cx="522" cy="66" r="5"/><circle cx="538" cy="66" r="5"/>
+    <circle cx="574" cy="66" r="5"/><circle cx="590" cy="66" r="5"/><circle cx="606" cy="66" r="5"/>
+  </g>
+  <g font-size="9.5" fill="#c1442e" text-anchor="middle">
+    <text x="178" y="86">GSV 1</text><text x="262" y="86">GSV 2</text><text x="346" y="86">GSV 3</text>
+    <text x="430" y="86">GSV 4</text><text x="514" y="86">GSV 5</text><text x="598" y="86">GSV 6</text>
+  </g>
+  <text x="652" y="72" font-size="11.5" fill="#333">計 6 センテンス</text>
+
+  <!-- バーストの中での位置 -->
   <g stroke="#333" stroke-width="2">
-    <line x1="140" y1="62" x2="140" y2="230"/>
-    <line x1="700" y1="62" x2="700" y2="230"/>
+    <line x1="140" y1="146" x2="140" y2="316"/>
+    <line x1="700" y1="146" x2="700" y2="316"/>
   </g>
   <g font-size="12" fill="#333">
-    <text x="144" y="54">PPS エッジ</text>
-    <text x="696" y="54" text-anchor="end">次の PPS エッジ</text>
+    <text x="144" y="138">PPS エッジ</text>
+    <text x="696" y="138" text-anchor="end">次の PPS エッジ</text>
   </g>
 
-  <!-- いま -->
-  <text x="128" y="106" font-size="12.5" fill="#333" text-anchor="end">いま</text>
-  <rect x="140" y="84" width="560" height="40" fill="#f4f4f4" stroke="#ccc"/>
-  <rect x="140" y="84" width="162" height="40" fill="#d68b7c"/>
-  <rect x="302" y="84" width="245" height="40" fill="#c1442e"/>
-  <rect x="547" y="84" width="69" height="40" fill="#7e2a1c"/>
-  <text x="221" y="109" font-size="11" fill="#ffffff" text-anchor="middle">先頭の 4 センテンス</text>
-  <text x="424" y="109" font-size="11.5" fill="#ffffff" text-anchor="middle">GSV 6 センテンス</text>
-  <text x="658" y="109" font-size="11" fill="#777" text-anchor="middle">空き 150 ms</text>
-  <text x="581" y="78" font-size="10.5" fill="#7e2a1c" text-anchor="middle">RMC と ZDA を含む 4 センテンス</text>
+  <text x="128" y="190" font-size="12.5" fill="#333" text-anchor="end">いま</text>
+  <rect x="140" y="168" width="560" height="40" fill="#f4f4f4" stroke="#ccc"/>
+  <rect x="140" y="168" width="162" height="40" fill="#d68b7c"/>
+  <rect x="302" y="168" width="245" height="40" fill="#c1442e"/>
+  <rect x="547" y="168" width="69" height="40" fill="#7e2a1c"/>
+  <text x="221" y="193" font-size="11" fill="#ffffff" text-anchor="middle">GGA, GLL, GSA×2</text>
+  <text x="424" y="193" font-size="11.5" fill="#ffffff" text-anchor="middle">GSV 6 センテンス</text>
+  <text x="658" y="193" font-size="11" fill="#777" text-anchor="middle">空き 150 ms</text>
+  <text x="581" y="162" font-size="10.5" fill="#7e2a1c" text-anchor="middle">RMC, VTG, ZDA, GST</text>
 
-  <!-- 衛星が 8 個増えたとき -->
-  <text x="128" y="186" font-size="12.5" fill="#333" text-anchor="end">衛星 +8</text>
-  <rect x="140" y="164" width="560" height="40" fill="#f4f4f4" stroke="#ccc"/>
-  <rect x="140" y="164" width="162" height="40" fill="#d68b7c"/>
-  <rect x="302" y="164" width="245" height="40" fill="#c1442e"/>
-  <rect x="547" y="164" width="82" height="40" fill="url(#h)" stroke="#c1442e" stroke-dasharray="4 3"/>
-  <rect x="629" y="164" width="69" height="40" fill="#7e2a1c"/>
-  <text x="424" y="189" font-size="11.5" fill="#ffffff" text-anchor="middle">GSV 8 センテンス</text>
-  <text x="588" y="158" font-size="10.5" fill="#c1442e" text-anchor="middle">+2</text>
+  <text x="128" y="272" font-size="12.5" fill="#333" text-anchor="end">衛星 +8</text>
+  <rect x="140" y="250" width="560" height="40" fill="#f4f4f4" stroke="#ccc"/>
+  <rect x="140" y="250" width="162" height="40" fill="#d68b7c"/>
+  <rect x="302" y="250" width="245" height="40" fill="#c1442e"/>
+  <rect x="547" y="250" width="82" height="40" fill="url(#h)" stroke="#c1442e" stroke-dasharray="4 3"/>
+  <rect x="629" y="250" width="69" height="40" fill="#7e2a1c"/>
+  <text x="424" y="275" font-size="11.5" fill="#ffffff" text-anchor="middle">GSV 8 センテンス</text>
+  <text x="588" y="244" font-size="10.5" fill="#c1442e" text-anchor="middle">+2</text>
 
-  <line x1="586" y1="220" x2="666" y2="220" stroke="#7e2a1c" stroke-width="1.5" marker-end="url(#p)"/>
-  <text x="626" y="238" font-size="11" fill="#7e2a1c" text-anchor="middle">境界まで押し出される</text>
+  <line x1="586" y1="306" x2="666" y2="306" stroke="#7e2a1c" stroke-width="1.5" marker-end="url(#p)"/>
+  <text x="626" y="324" font-size="11" fill="#7e2a1c" text-anchor="middle">境界まで押し出される</text>
 
-  <text x="140" y="284" font-size="12.5" fill="#333">GSV は見えている衛星の情報を載せるセンテンスで、1 センテンスに 4 衛星ぶんまで入る。</text>
-  <text x="140" y="306" font-size="12.5" fill="#333">衛星が多ければ、複数のセンテンスに分割して送られる (仕様 §2.2.4)。</text>
-  <text x="140" y="328" font-size="12.5" fill="#c1442e">時刻センテンスは GSV の後ろにいるので、GSV が 1 センテンス増えるたびに 73 ms ぶん後ろへ動く。</text>
+  <text x="140" y="366" font-size="12.5" fill="#333">衛星が 4 個増えるたびに GSV が 1 センテンス、73 ms ぶん増える。</text>
+  <text x="140" y="390" font-size="12.5" fill="#c1442e">時刻センテンスはその後ろにいるので、そのぶん境界へ動く。</text>
 </svg>
