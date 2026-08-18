@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" width="760" height="380" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="余裕は時刻センテンスの到着から次の PPS エッジまでの残り時間。境界を跨ぐ直前は 0 ms 側、跨いだ直後は 1000 ms 側に現れる">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" width="760" height="380" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="測るのは時刻センテンスの到着から次の PPS エッジまでの残り時間。境界を跨ぐ直前は 0 ms 側、跨いだ直後は 1000 ms 側に現れる">
   <rect width="760" height="380" fill="#ffffff"/>
   <defs>
     <marker id="s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
@@ -10,7 +10,7 @@
   </defs>
 
   <!-- 行 1: 余裕が大きい -->
-  <text x="145" y="34" font-size="12.5" fill="#333">余裕が大きいとき</text>
+  <text x="145" y="34" font-size="12.5" fill="#333">まだ十分に残っているとき</text>
   <g font-size="11" fill="#333" text-anchor="middle">
     <text x="160" y="52">PPS エッジ</text>
     <text x="420" y="52">次の PPS エッジ</text>
@@ -25,7 +25,7 @@
   <rect x="227" y="82" width="46" height="18" rx="3" fill="#eee" stroke="#bbb"/>
   <text x="250" y="95" font-size="10.5" fill="#555" text-anchor="middle">時刻文</text>
   <line x1="250" y1="112" x2="420" y2="112" stroke="#c1442e" stroke-width="1.4" marker-start="url(#e)" marker-end="url(#s)"/>
-  <text x="335" y="128" font-size="11.5" fill="#c1442e" text-anchor="middle">余裕</text>
+  <text x="335" y="128" font-size="11.5" fill="#c1442e" text-anchor="middle">次のエッジまでの残り</text>
 
   <!-- 行 2: 境界の際 (跨ぐ前) -->
   <text x="145" y="176" font-size="12.5" fill="#333">境界の際にあるとき</text>
@@ -38,7 +38,7 @@
   <rect x="371" y="214" width="46" height="18" rx="3" fill="#eee" stroke="#bbb"/>
   <text x="394" y="227" font-size="10.5" fill="#555" text-anchor="middle">時刻文</text>
   <line x1="396" y1="244" x2="420" y2="244" stroke="#c1442e" stroke-width="1.4" marker-start="url(#e)" marker-end="url(#s)"/>
-  <text x="470" y="248" font-size="11.5" fill="#c1442e">余裕 ≒ 0 ms</text>
+  <text x="470" y="248" font-size="11.5" fill="#c1442e">残り ≒ 0 ms</text>
 
   <!-- 行 3: 跨いだ直後 -->
   <text x="145" y="298" font-size="12.5" fill="#333">少し遅れて、跨いだあと</text>
@@ -51,5 +51,5 @@
   <rect x="429" y="336" width="46" height="18" rx="3" fill="#eee" stroke="#bbb"/>
   <text x="452" y="349" font-size="10.5" fill="#555" text-anchor="middle">時刻文</text>
   <line x1="452" y1="366" x2="680" y2="366" stroke="#c1442e" stroke-width="1.4" marker-start="url(#e)" marker-end="url(#s)"/>
-  <text x="566" y="362" font-size="11.5" fill="#c1442e" text-anchor="middle">余裕 ≒ 1000 ms</text>
+  <text x="566" y="362" font-size="11.5" fill="#c1442e" text-anchor="middle">残り ≒ 1000 ms</text>
 </svg>
