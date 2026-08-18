@@ -974,9 +974,9 @@ async fn gen_capture_task(
         let (pred_mppb, steer_mppb, level_mppb, temp_k, slope_mppb, phase) = CLOCK.lock(|g| {
             let g = g.borrow();
             (
-                g.predicted_freq_mppb(), // raw (holdover/診断用、clamp なし)
-                g.steering_freq_mppb(),  // clamp 後 (出力周期の操舵に使う)
-                g.freq_mppb(),           // α-β level (温度FF lead を含まない)
+                g.predicted_freq_mppb(),  // raw (holdover/診断用、clamp なし)
+                g.steering_freq_mppb(),   // clamp 後 (出力周期の操舵に使う)
+                g.freq_mppb(),            // α-β level (温度FF lead を含まない)
                 g.temp_k_mppb_per_unit(), // 学習した温度係数 (0=未学習)
                 g.freq_slope_mppb(),
                 g.now_from_query_ns(now_local_ns()).map(snap_to_second_ns),
@@ -1100,7 +1100,7 @@ async fn gen_capture_task(
                 PRECISION_STAGE as u32,
                 recal_eff(PRECISION_STAGE),
                 0u32, // dith_ticks: PIO 経路は dither 不使用 (両経路スキーマ一致のため 0)
-                steer_ff_mppb // steer_ff: clamp 後の操舵 FF 偏差 (steering − level)
+                steer_ff_mppb  // steer_ff: clamp 後の操舵 FF 偏差 (steering − level)
             );
             // 実験(KEXP): 実効 K ドリフト切り分け用の生カウンタ行。PPSGEN と同 count で 1:1 join できる。
             // 純観測 (c3/c3n は制御に非関与)。PPSGEN のフォーマット/引数は 1 byte も変えていない (別 info! を後置)。
@@ -1167,8 +1167,15 @@ async fn gen_capture_task(
             edges_since_shadow += 1;
             if edges_since_shadow >= SHADOW_EDGES {
                 edges_since_shadow = 0;
-                let k_meas =
-                    recal_k(&mut sm, &mut output, &cfg_gp2, &cfg_gp4, k_target, last_period).await;
+                let k_meas = recal_k(
+                    &mut sm,
+                    &mut output,
+                    &cfg_gp2,
+                    &cfg_gp4,
+                    k_target,
+                    last_period,
+                )
+                .await;
                 info!(
                     "KSHADOW count={} k_meas={} k0={} dk={}",
                     count,
@@ -1365,8 +1372,13 @@ async fn main(spawner: Spawner) {
         } else {
             rp_pps::pps_capture_program()
         };
-        let mut capture =
-            TimedPpsCapture::new_with_program(&mut common, sm0, p.PIN_2, clk_sys_freq(), &capture_prog);
+        let mut capture = TimedPpsCapture::new_with_program(
+            &mut common,
+            sm0,
+            p.PIN_2,
+            clk_sys_freq(),
+            &capture_prog,
+        );
 
         // stage②: SM2 (ループバック位相計測。rp-pps 外の実験機能) は capture と GP2 を共有して生カウンタ差
         // K=C0−C2 を較正する。embassy の set_jmp_pin は &Pin を要求し GP2 は一度しか make できないので、

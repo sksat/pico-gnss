@@ -60,11 +60,7 @@ impl OpMode {
 
 /// dynmode コード (4=stationary, それ以外=mobile) → PMTK886 コマンド。A/B 実験で使う。
 const fn pmtk886_for(code: u32) -> &'static str {
-    if code == 4 {
-        "PMTK886,4"
-    } else {
-        "PMTK886,0"
-    }
+    if code == 4 { "PMTK886,4" } else { "PMTK886,0" }
 }
 
 /// 起動時にモジュールへ送る PMTK 設定 (チェックサムは送信時に計算)。
@@ -117,7 +113,10 @@ pub async fn config_task(mut tx: BufferedUartTx) {
         // 各セグメントの平均時刻位置を揃えて slow drift を一次で相殺する)。各セグメント DYNMODEL_AB_SECS。
         // 解析側は dynmode で層別し、切替直後の過渡を捨て、隣接ペア差 (mobile−stationary) で比較する。
         const SCHEDULE: [u32; 4] = [4, 0, 0, 4];
-        info!("DYNMODEL A/B: ABBA 886,4/886,0 every {=u64}s", DYNMODEL_AB_SECS);
+        info!(
+            "DYNMODEL A/B: ABBA 886,4/886,0 every {=u64}s",
+            DYNMODEL_AB_SECS
+        );
         let mut i = 0usize;
         loop {
             let code = SCHEDULE[i % SCHEDULE.len()];
