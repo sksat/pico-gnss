@@ -24,10 +24,13 @@ use gnssdo::{Gnssdo, GnssdoStep};
 /// end of the NMEA burst where, at 9600 baud, it can arrive *after the next edge*.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum NmeaTimeSource {
-    /// Recommended Minimum. The historical default here, kept so existing users are unaffected.
-    #[default]
+    /// Recommended Minimum — a *navigation* sentence that happens to carry a clock.
+    ///
+    /// Select this only for a receiver that does not emit ZDA. Its time is not defined against the
+    /// timing pulse, so pairing it with an edge works by convention rather than by specification.
     Rmc,
-    /// Time & Date — the sentence the receiver defines relative to its 1PPS output.
+    /// Time & Date — the sentence defined against the 1PPS output. **The default.**
+    #[default]
     Zda,
 }
 
@@ -67,8 +70,12 @@ pub struct PpsGpsdo {
 }
 
 impl PpsGpsdo {
-    /// Create with the default discipline and [`SameSecond`](crate::PpsNmeaAssociation::SameSecond)
-    /// PPS↔NMEA association.
+    /// Create with the default discipline, [`ZDA`](NmeaTimeSource::Zda) as the time source, and the
+    /// [`SameSecond`](crate::PpsNmeaAssociation::SameSecond) association.
+    ///
+    /// Those two defaults belong together: ZDA is specified to report "the time of the pulse that
+    /// just occurred", which *is* `SameSecond`. Use [`with_config`](Self::with_config) for a
+    /// receiver that does not emit ZDA.
     pub const fn new() -> Self {
         Self::with_association(crate::PpsNmeaAssociation::SameSecond)
     }
@@ -98,7 +105,7 @@ impl PpsGpsdo {
     /// The symptom is invisible without an external time reference — a disciplined 1PPS output can
     /// sit on the GPS edge to nanoseconds and still be labelled with the wrong second.
     pub const fn with_association(association: crate::PpsNmeaAssociation) -> Self {
-        Self::with_config(NmeaTimeSource::Rmc, association)
+        Self::with_config(NmeaTimeSource::Zda, association)
     }
 
     /// Feed a timed PPS edge, timestamped on the query timebase (e.g. embassy `Instant`) as
@@ -251,6 +258,11 @@ mod tests {
     // Valid `*6F` checksum so the test also passes under the `external-nmea` (validating) parser.
     const RMC: &str = "$GPRMC,170658.000,A,3541.0,N,13945.0,E,0.0,0.0,070626,,,A*6F";
 
+    /// A clock configured for RMC, for the tests that are about RMC specifically.
+    fn rmc_gpsdo() -> PpsGpsdo {
+        PpsGpsdo::with_config(NmeaTimeSource::Rmc, crate::PpsNmeaAssociation::SameSecond)
+    }
+
     fn edge(ns: u64) -> TimedEdge {
         TimedEdge {
             raw: 0,
@@ -261,7 +273,7 @@ mod tests {
 
     #[test]
     fn feed_nmea_needs_a_fresh_edge() {
-        let mut g = PpsGpsdo::new();
+        let mut g = rmc_gpsdo();
         // No edge yet → no epoch, no disciplined time.
         assert!(g.feed_nmea(RMC).is_none());
         assert!(g.now_from_query_ns(1_000_000_000).is_none());
@@ -269,7 +281,7 @@ mod tests {
 
     #[test]
     fn edge_then_rmc_establishes_utc() {
-        let mut g = PpsGpsdo::new();
+        let mut g = rmc_gpsdo();
         g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);
         let report = g
             .feed_nmea(RMC)
@@ -333,8 +345,22 @@ mod tests {
     }
 
     #[test]
+    fn the_default_time_source_is_zda() {
+        // The point of the change that made it so: a caller who does not think about this at all
+        // should get the sentence that is defined against the pulse, not the one that merely
+        // happens to carry a clock.
+        let mut g = PpsGpsdo::new();
+        g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);
+        assert!(
+            g.feed_nmea(RMC).is_none(),
+            "RMC must not establish an epoch by default"
+        );
+        assert!(g.feed_nmea(ZDA).is_some(), "ZDA must");
+    }
+
+    #[test]
     fn rmc_source_passes_over_zda_symmetrically() {
-        let mut g = PpsGpsdo::new(); // RMC is the default
+        let mut g = rmc_gpsdo();
         g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);
         assert!(
             g.feed_nmea(ZDA).is_none(),
