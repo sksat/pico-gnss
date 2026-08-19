@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 350" width="760" height="350" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="アクティブ High の 1PPS は立ち上がりが、アクティブ Low の 1PPS は立ち下がりがパルスの始まりで、秒境界を指すのはどちらもその始まりである">
+  <rect width="760" height="350" fill="#ffffff"/>
+  <defs>
+    <marker id="p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#888"/>
+    </marker>
+  </defs>
+
+  <!-- 秒境界と、その 100 ms 後に来るパルスの終わり -->
+  <line x1="280" y1="40" x2="280" y2="262" stroke="#333" stroke-width="0.9" stroke-dasharray="4 4"/>
+  <line x1="410" y1="40" x2="410" y2="262" stroke="#c1442e" stroke-width="0.9" stroke-dasharray="4 4"/>
+  <text x="280" y="32" font-size="12.5" fill="#333" text-anchor="middle">UTC 秒境界</text>
+  <text x="410" y="32" font-size="12.5" fill="#c1442e" text-anchor="middle">パルスの終わり</text>
+
+  <!-- アクティブ High: idle low、秒境界で立ち上がる -->
+  <text x="190" y="94" font-size="12.5" fill="#333" text-anchor="end">アクティブ High</text>
+  <text x="190" y="111" font-size="10.5" fill="#888" text-anchor="end">(モジュール側)</text>
+  <path fill="none" stroke="#333" stroke-width="2.2" d="M200,110 L280,110 L280,70 L410,70 L410,110 L700,110"/>
+  <circle cx="280" cy="90" r="3.6" fill="#2e7d5b"/>
+  <text x="288" y="62" font-size="11" fill="#2e7d5b">立ち上がりがパルスの始まり</text>
+
+  <!-- アクティブ Low: idle high、秒境界で立ち下がる -->
+  <text x="190" y="224" font-size="12.5" fill="#333" text-anchor="end">アクティブ Low</text>
+  <text x="190" y="241" font-size="10.5" fill="#888" text-anchor="end">(基板の出力。この GPS-R)</text>
+  <path fill="none" stroke="#333" stroke-width="2.2" d="M200,210 L280,210 L280,250 L410,250 L410,210 L700,210"/>
+  <circle cx="280" cy="230" r="3.6" fill="#2e7d5b"/>
+  <circle cx="410" cy="230" r="3.6" fill="#c1442e"/>
+  <text x="418" y="246" font-size="11" fill="#c1442e">firmware はここを捕捉していた</text>
+  <text x="288" y="202" font-size="11" fill="#2e7d5b">立ち下がりがパルスの始まり</text>
+
+  <!-- 反転の経路 -->
+  <line x1="600" y1="124" x2="600" y2="196" stroke="#888" stroke-width="1.4" marker-end="url(#p)"/>
+  <text x="612" y="154" font-size="11.5" fill="#333">基板の 74HC04 を</text>
+  <text x="612" y="170" font-size="11.5" fill="#333">1 段通ると反転する</text>
+
+  <!-- パルス幅 -->
+  <g stroke="#c1442e" stroke-width="1">
+    <line x1="280" y1="268" x2="410" y2="268"/>
+    <line x1="280" y1="264" x2="280" y2="272"/>
+    <line x1="410" y1="264" x2="410" y2="272"/>
+  </g>
+  <text x="345" y="286" font-size="11" fill="#c1442e" text-anchor="middle">100 ms</text>
+
+  <text x="380" y="316" font-size="12.5" fill="#333" text-anchor="middle">秒境界を指すのは、どちらもパルスの始まりである。反転すると、その始まりが立ち上がりから立ち下がりへ移る。</text>
+  <text x="380" y="338" font-size="12.5" fill="#c1442e" text-anchor="middle">パルスの終わりを秒境界と見なすことになり、時刻は 100 ms 遅れる。</text>
+</svg>
