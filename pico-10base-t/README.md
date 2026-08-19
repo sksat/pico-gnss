@@ -33,7 +33,7 @@ Following the upstream wiring:
 |---|---|
 | TX− | GP16 |
 | TX+ | GP17 |
-| Resistors | 2 × 47 Ω (one in series with each TX pin), 1 × 470 Ω (across the pair) |
+| Resistors | 2 × 33 Ω (one in series with each TX pin), 1 × 1 kΩ (across the pair) |
 | Connector | RJ45 — pins 1 and 2 (the receiver's RX pair) |
 
 Upstream recommends a pulse transformer for isolation, and so do we: without one there is no
