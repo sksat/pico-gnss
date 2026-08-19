@@ -11,7 +11,7 @@
 //! - `NMEA $GxXXX,...*hh`
 //! - `PPS count=<n> interval_us=<us> interval_ns=<ns> state=<...> missed=<m>`
 //! - `SYNC pps_local_us=<t> unix_s=<s> drift_us=<d>`
-//! - `TIME unix_ns=<n> ppb=<p> holdover_ms=<h> locked=<0|1>`  (GPSDO の UTC)
+//! - `TIME unix_ns=<n> ppb=<p> holdover_ms=<h> locked=<0|1>`  (現在時刻)
 //!
 //! ## PPS タイムスタンプは PIO ハードキャプチャ (~16ns 分解能)
 //! ソフト (embassy Input + Instant) はジッタが µs オーダの床 (M0+ の critical-section 全 IRQ マスク。
@@ -20,8 +20,8 @@
 //!
 //! ## GPSDO (GPS 同期発振器)
 //! PIO の精密な PPS 間隔から RP2040 水晶の周波数オフセット (ppb) を [`DisciplinedClock`] が
-//! EMA 推定し、UTC エポックと合わせて GPSDO の UTC を提供する。**PPS が切れている間 (holdover)
-//! も推定周波数で外挿**して時刻を保つ。`time_task` が 1Hz で GPSDO の UTC を `TIME` 行に出す。
+//! EMA 推定し、UTC エポックと合わせて現在時刻を提供する。**PPS が切れている間 (holdover)
+//! も推定周波数で外挿**して時刻を保つ。`time_task` が 1Hz で現在時刻を `TIME` 行に出す。
 
 use core::cell::RefCell;
 
@@ -67,16 +67,16 @@ bind_interrupts!(struct Irqs {
     DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>;
 });
 
-/// GPSDO 状態 (rp-pps の一体型 state bundle = gnssdo 同期 + PPS↔NMEA 対応付け)。pps_task が
-/// `on_pps_edge` で周波数同期 + エッジ記録、main が `feed_nmea` で UTC エポック確定、time_task が読む。
-/// 分類/Locked のみ同期/復帰 quarantine、NMEA ペアリングと fresh-once、残差診断は PpsGpsdo が内包する。
+/// GPSDO 状態 (rp-pps の一体型 state bundle = gnssdo の時計 + PPS↔NMEA 対応付け)。pps_task が
+/// `on_pps_edge` で周波数推定の更新 + エッジ記録、main が `feed_nmea` で UTC エポック確定、time_task が読む。
+/// 分類/Locked のみ推定更新/復帰 quarantine、NMEA ペアリングと fresh-once、残差診断は PpsGpsdo が内包する。
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<PpsGpsdo>> =
     BlockingMutex::new(RefCell::new(PpsGpsdo::new()));
 
 /// **精度向上アークの単一ノブ (唯一の真実源)**。0..=5 を選ぶと派生ゲート (use_pio/apply_freq/
 /// phase_servo/recal_on/temp_ff) が段を構成する。**5 = production (出荷既定)** で、現出荷ファームと
 /// bit 一致することを下の const assert が機械保証する (計測 workflow が段ごとに一時変更する)。
-/// - S0: naive 自走 (同期なし)。S1: soft による周波数同期 (+dither)。S2: 全 PIO I/O + loopback, 開ループFF。
+/// - S0: naive 自走 (補正なし)。S1: soft による周波数補正 (+dither)。S2: 全 PIO I/O + loopback, 開ループFF。
 /// - S3: PLL 閉ループ (Smith 内包)。S4: recal。S5: 温度FF = production。
 const PRECISION_STAGE: u8 = 5;
 // 上限ガード: stage>5 だと全ゲートが production 相当 (>=N) に倒れる一方、下の override-sentinel 強制は
@@ -383,11 +383,11 @@ static RECEPTION_JITTER: AtomicU32 = AtomicU32::new(0);
 
 /// RP2040 内蔵温度センサの ADC 値を **N 回積算平均した fractional 値** (12bit ADC code を ×TEMP_RAW_SCALE
 /// した固定小数)。temp_task が **DMA free-running の連続背景タスク**として常時更新し (1 block ≈ TEMP_DMA_N
-/// サンプル)、gen_capture_task が温度FF入力として同期コアへ渡し、PPSGEN ログにも出す。**生の 12bit code
+/// サンプル)、gen_capture_task が温度FF入力として gnssdo へ渡し、PPSGEN ログにも出す。**生の 12bit code
 /// に戻すには TEMP_RAW / TEMP_RAW_SCALE** (=×256、生 code に戻すには /256)。重オーバーサンプル
 /// (N=TEMP_DMA_N) で ADC ノイズ (~1-2 LSB) を natural dither にして √N で sub-LSB 分解能を得る
 /// (1/256 LSB ≈ 0.002°C)。℃ 換算は raw code を `27-(code*3.3/4096-0.706)/0.001721`。水晶/受信機でなく
-/// MCU 温度で単発はノイジー。**同期コア (gnssdo) は温度非依存** — 温度の取り込みは firmware 配線で、
+/// MCU 温度で単発はノイジー。**gnssdo は温度非依存** — 温度の取り込みは firmware 配線で、
 /// 温度FF も runtime トグル (TEMP_FF_ENABLE) で明示的に有効化したときだけ効く。
 static TEMP_RAW: AtomicU32 = AtomicU32::new(0);
 /// TEMP_RAW の固定小数スケール (平均 ADC code をこの倍率で格納)。解析・℃換算は割って戻す。
@@ -478,7 +478,7 @@ async fn naive_pps_out_task(mut out: Output<'static>) {
 /// 非PIO 素朴 1PPS 入力タスク (S0/S1)。GP2 の GPS 1PPS を GPIO 割込 + Instant で soft 捕捉
 /// (µs オーダ下限 = M0+ critical-section 全 IRQ マスク。σ は負荷で ~2〜10µs)。連続エッジ差から interval を作り、production と
 /// **同一の** `on_pps_edge` (raw 非参照を host テストで確認済) へ縮退 TimedEdge を渡して水晶 ppb を
-/// 同期コアに食わせる (S0=推定のみ・周期不適用 / S1=周期へ適用)。出力 vs GPS の開ループ modulo phase を
+/// gnssdo に食わせる (S0=推定のみ・周期不適用 / S1=周期へ適用)。出力 vs GPS の開ループ modulo phase を
 /// `fold_phase_ns` で作り hwphase 欄に soft err として載せ、段共通スキーマの PPS/PPSGEN 行で出す。
 #[embassy_executor::task]
 async fn naive_pps_in_task(mut gps: Input<'static>) {
@@ -492,7 +492,7 @@ async fn naive_pps_in_task(mut gps: Input<'static>) {
             None => 0,
         };
         last_edge_ns = Some(edge_ns);
-        // production と同一の同期経路。capture==query の縮退 (両者 Instant)、raw=0 (非参照)。
+        // production と同一の補正経路。capture==query の縮退 (両者 Instant)、raw=0 (非参照)。
         let step = CLOCK.lock(|g| {
             g.borrow_mut().on_pps_edge(
                 TimedEdge {
@@ -531,7 +531,7 @@ async fn naive_pps_in_task(mut gps: Input<'static>) {
             missed,
             freq
         );
-        // 最初のエッジは interval が無い (同期も phase も意味がない) のでスキップ。
+        // 最初のエッジは interval が無い (周波数の更新も phase も意味がない) のでスキップ。
         if interval_ns == 0 {
             continue;
         }
@@ -608,7 +608,7 @@ fn switch_jmp_pin(sm: usize, pin: u8) {
         .modify(|w| w.set_jmp_pin(pin));
 }
 
-/// PIO がラッチした PPS エッジを読み、間隔を ns で求めて出す + 周波数を合わせ込むタスク。
+/// PIO がラッチした PPS エッジを読み、間隔を ns で求めて出す + 周波数推定を更新するタスク。
 #[embassy_executor::task]
 async fn pps_task(
     mut capture: TimedPpsCapture<'static, PIO0, 0>,
@@ -635,7 +635,7 @@ async fn pps_task(
             c3n += 1;
         }
 
-        // 周波数同期 (Locked のみ・復帰 quarantine) + 次の RMC 用にエッジ記録を PpsGpsdo に委譲。
+        // 周波数推定の更新 (Locked のみ・復帰 quarantine) + 次の RMC 用にエッジ記録を PpsGpsdo に委譲。
         // PPS_TS signal は不要に: エッジは共有 state に記録され、main の feed_nmea が拾う。ここは log だけ。
         count += 1;
         let step = CLOCK.lock(|g| g.borrow_mut().on_pps_edge(edge, query_ns));
@@ -677,7 +677,7 @@ async fn pps_task(
             PpsEvent::Irregular { missed, .. } => ("Irregular", missed),
             PpsEvent::NonMonotonic { .. } => ("NonMono", 0),
         };
-        // freq= は同期した時だけ ok/sane/gate/quar、同期しなかったエッジは none。
+        // freq= は推定を更新した時だけ ok/sane/gate/quar、更新しなかったエッジは none。
         let freq = step.freq.map_or("none", |fu| fu.as_str());
         info!(
             "PPS count={} interval_us={} interval_ns={} state={=str} missed={} freq={}",
@@ -691,7 +691,7 @@ async fn pps_task(
     }
 }
 
-/// 1Hz タスク: GPSDO の UTC を出す + GPSDO PPS 生成 (SM1) の周期を ppb 補正で更新する。
+/// 1Hz タスク: 現在時刻を出す + GPSDO PPS 生成 (SM1) の周期を ppb 補正で更新する。
 /// PPS が切れていても周波数外挿で時刻/周期を保つ (holdover)。
 #[embassy_executor::task]
 async fn time_task() {
@@ -831,9 +831,9 @@ async fn recal_k(
 }
 
 /// GPSDO PPS 出力の周期管理 + ループバック計測 (GP3 生成 / GP4 捕捉)。**エッジに同期して**
-/// 1 出力エッジにつき 1 回だけ次周期を更新する (= freq 同期 + 位相同期を 1 箇所で・1 サンプル遅れで)。
+/// 1 出力エッジにつき 1 回だけ次周期を更新する (= freq 補正 + 位相同期を 1 箇所で・1 サンプル遅れで)。
 /// time_task の 1Hz タイマと非同期に補正すると位相が発振したので、ここに集約した。
-/// ※ freq/位相同期はループバック (GP3→GP4 ジャンパ) 接続が前提。未接続だと初期周期で自走する。
+/// ※ freq 補正と位相同期はループバック (GP3→GP4 ジャンパ) 接続が前提。未接続だと初期周期で自走する。
 #[embassy_executor::task]
 async fn gen_capture_task(
     mut output: SteeredPpsOutput<'static, PIO0, 1>,
@@ -1008,7 +1008,7 @@ async fn gen_capture_task(
             err_ns: ctrl,
             valid,
         });
-        // 温度を同期コアへ連続供給 (自己クロック=連続量という前提)。ロック中の各エッジで最新 fractional
+        // 温度を gnssdo へ連続供給 (自己クロック=連続量という前提)。ロック中の各エッジで最新 fractional
         // TEMP_RAW を update_temp に渡す (~1Hz、温度FF の EMA は呼び出し回数単位なので PPS 1Hz と整合)。
         // TEMP_FF_ENABLE=false (実験A) なら model は値の記録/learn のみで predicted_freq は不変。B/C で
         // enable すると温度の leading 推定が holdover/出力周期に効く。
@@ -1529,17 +1529,17 @@ async fn main(spawner: Spawner) {
         spawner_high.spawn(gen_capture_task(output, sm2, k, cfg_gp2, cfg_gp4).unwrap());
     } else {
         // 非PIO 素朴経路 (S0/S1): PIO0 は未消費。GP2=GPS soft 割込、GP3=Ticker トグル、GP4 放置。
-        // CLOCK (同期コア) は production と同一、front-end (TimedEdge を作る部分) だけが違う。
+        // CLOCK (gnssdo) は production と同一、front-end (TimedEdge を作る部分) だけが違う。
         let gps_in = Input::new(p.PIN_2, Pull::None);
         let pps_out = Output::new(p.PIN_3, Level::Low);
         spawner_high.spawn(naive_pps_in_task(gps_in).unwrap());
         spawner_high.spawn(naive_pps_out_task(pps_out).unwrap());
     }
 
-    // GPSDO の UTC 出力タスクは両経路共通 (CLOCK をどちらの front-end が養っても動く)。
+    // 時刻出力タスクは両経路共通 (CLOCK をどちらの front-end が養っても動く)。
     spawner.spawn(time_task().unwrap());
 
-    // 内蔵温度センサ (運用時の熱監視。同期には未使用、PPSGEN ログに temp_raw を出すだけ)。
+    // 内蔵温度センサ (運用時の熱監視。補正には未使用、PPSGEN ログに temp_raw を出すだけ)。
     // DMA free-running で最大レート連続サンプリングする。DMA_CH0 は本 firmware 唯一の DMA 利用先。
     let adc = embassy_rp::adc::Adc::new(p.ADC, Irqs, embassy_rp::adc::Config::default());
     let ts = embassy_rp::adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR);

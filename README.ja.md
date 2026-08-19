@@ -6,12 +6,12 @@
 
 [English](README.md) | **日本語**
 
-RP2040 上に構築した GNSS **PPS 同期クロック (GPSDO/GNSSDO)**。再利用可能な `no_std`
+RP2040 上に構築した GNSS **1PPS を基準にした時計 (GPSDO/GNSSDO)**。再利用可能な `no_std`
 コアクレートと、リアルタイム Web ダッシュボードを含みます。
 
 GNSS 受信機の 1Hz PPS は、パルスの始まりで UTC 秒境界を刻みます (この GPS-R は active low なので立ち下がりです)。本プロジェクトはそのエッジを
 ナノ秒分解能で捕捉し、ローカル水晶の周波数誤差を推定して、**PPS が切れている間
-(holdover) も含めて** GPSDO の UTC を保ちます。
+(holdover) も含めて** UTC を保ちます。
 
 ![pico-gnss ハードウェア](docs/pico-gnss-hardware.jpg)
 
@@ -23,7 +23,7 @@ GNSS 受信機の 1Hz PPS は、パルスの始まりで UTC 秒境界を刻み�
 
 ![pico-gnss リアルタイムダッシュボード](docs/dashboard.png)
 
-*リアルタイム Web ダッシュボード (`webapp/`): GPSDO の UTC・PPS ジッタ・周波数同期と
+*リアルタイム Web ダッシュボード (`webapp/`): UTC 時刻・PPS ジッタ・周波数の推定と
 holdover・スカイプロット / C/N₀・測位 fix。(位置はプライバシーのためマスク — ダッシュボード
 には座標・地図マーカー・NMEA 緯度経度を伏せる privacy モードを内蔵。)*
 
@@ -31,9 +31,9 @@ holdover・スカイプロット / C/N₀・測位 fix。(位置はプライバ�
 
 | パス | 内容 |
 |---|---|
-| [`gnssdo/`](gnssdo/) | **同期コア** ([crate `gnssdo`](gnssdo/README.md))。`no_std`・HAL 非依存・整数演算のみ・**依存ゼロ**。周波数 (ppb) 推定、holdover、PPS エッジ追跡、出力位相ロック servo (PLL)。timestamp と UTC epoch を消費。host テスト可能。 |
+| [`gnssdo/`](gnssdo/) | **時刻同期のコア** ([crate `gnssdo`](gnssdo/README.md))。`no_std`・HAL 非依存・整数演算のみ・**依存ゼロ**。周波数 (ppb) 推定、holdover、PPS エッジ追跡、出力位相ロック servo (PLL)。timestamp と UTC epoch を消費。host テスト可能。 |
 | [`rp-pps/`](rp-pps/) | **RP2040/RP2350 PIO + 受信機 I/O** (crate `rp-pps`)。PPS エッジのハード捕捉・操舵可能な 1PPS 出力、NMEA フレーミング/パース、PPS↔UTC 秒の対応付け — `gnssdo` が消費する timestamp と epoch を生産。HAL 非依存コア (host テスト可) + embassy-rp / rp2040-hal backend。 |
-| [`pico-gnss/`](pico-gnss/) | RP2040 firmware (embassy-rp)。PIO ハード PPS 捕捉、クロック同期、GPSDO PPS 出力。embedded 専用で `gnssdo` + `rp-pps` を配線。 |
+| [`pico-gnss/`](pico-gnss/) | RP2040 firmware (embassy-rp)。PIO ハード PPS 捕捉、時刻同期、GPSDO PPS 出力。embedded 専用で `gnssdo` + `rp-pps` を配線。 |
 | [`webapp/`](webapp/) | リアルタイムダッシュボード (React 19 + Vite + TypeScript)。firmware の defmt/RTT 出力を依存ゼロの Node ブリッジ経由で表示。 |
 | [`docs/report/`](docs/report/) | 実機評価のログと図。 |
 | [`NOTES.md`](NOTES.md) | 設計判断とハマった罠の記録。 |
