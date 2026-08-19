@@ -1384,7 +1384,7 @@ async fn main(spawner: Spawner) {
         //
         // ループバック計測 (SM2) も同じ GP2 を見るので、ここで反転しておけば両方が秒境界のエッジを
         // 見る。K の較正は両者の生カウンタ差なので、片方だけ反転すると 100 ms ずれる。
-        pico_gnss::pps::align_capture_edge(2).await;
+        pico_gnss::pps::configure_capture(2);
 
         // stage②: SM2 (ループバック位相計測。rp-pps 外の実験機能) は capture と GP2 を共有して生カウンタ差
         // K=C0−C2 を較正する。embassy の set_jmp_pin は &Pin を要求し GP2 は一度しか make できないので、
