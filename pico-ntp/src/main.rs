@@ -70,8 +70,8 @@ use static_cell::StaticCell;
 use pico_10base_t::embassy::Tx10BaseT;
 use pico_10base_t::frame::{Ipv4Addr, MacAddr, UdpFrameSpec, build_udp_frame, frame_len};
 use pico_10base_t::phy::{NLP_INTERVAL_US, encode_frame, encoded_words};
-use rp_pps::PpsGpsdo;
-use rp_pps::embassy::{TimedPpsCapture, run_capture, run_nmea};
+use rp_pps::embassy::{TimedPpsCapture, run_capture, run_nmea, set_capture_polarity};
+use rp_pps::{PpsGpsdo, PpsPolarity};
 use tiny_ntp::packet::PACKET_LEN;
 use tiny_ntp::server::{
     ClockState, LeapWarning, ServeDecision, ServerConfig, Source, broadcast, silent_reason,
@@ -229,62 +229,23 @@ fn now_ns() -> u64 {
     Instant::now().as_micros() * 1000
 }
 
-/// Point the capture at whichever edge of the 1PPS actually marks the second, by measuring the
-/// pulse rather than assuming its polarity.
+/// The polarity of the 1PPS this firmware is built for.
 ///
-/// A 1PPS is one short pulse a second, and the short excursion is the mark. `rp-pps` captures
-/// rising edges, so an idle-low signal needs nothing and an idle-high one has to be inverted into
-/// PIO — otherwise the capture lands one pulse width past the second.
+/// [`rp_pps::pps_capture_program`] only ever watches for a rising edge, so an active-low receiver
+/// has to be inverted into PIO. Without that the capture lands on the *end* of the pulse — one
+/// pulse width past the second — and nothing on this board can tell: every interval is still
+/// exactly one second and the frequency estimate is unaffected. It took a client on the other side
+/// of the wire, which saw this server 100.23 ms slow (sd 0.55 ms, n=299).
 ///
-/// Measured rather than configured because nothing offers a say in it. The receiver's documented
-/// PPS commands set availability, width and phase (`PMTK285`, `PMTK326`) and say nothing about
-/// polarity, and no document found so far states which level is asserted. A constant here would be
-/// a guess that a different module, or a different `PMTK285` width, would quietly invalidate.
+/// The AE-GNSS-EXTANT carrier passes the module's 1PPS through one gate of its 74HC04, and its
+/// manual gives the result as `1PPS 出力 : C-MOS ロジック (3.3V) レベル,
+/// パルス幅 :100mS (アクティブ Low)`.
 ///
-/// This pin idles high and pulses low, and the low excursion tracks the configured width: 100 ms
-/// wide measures 104 ms, 200 ms wide measures 201 ms. Capturing the rising edge — the *end* of that
-/// pulse — left a client seeing this server late by exactly the width, 100.23 ms and 196.46 ms
-/// respectively. Reading the falling edge instead brings it inside a few ms.
-///
-/// So the assertion here is only what those measurements support: the short excursion is the pulse,
-/// and its leading edge is the mark. Why this module asserts low is not established — nothing
-/// between it and this pin inverts anything, so the likeliest reading is that its PPS output is
-/// simply active-low.
-async fn align_pps_capture_edge(pin: usize) {
-    // Long enough to contain a whole second either way, so both levels are seen whichever is short.
-    const WINDOW_MS: u64 = 1_500;
-    const STEP_US: u64 = 500;
-
-    let mut high = 0u32;
-    let mut total = 0u32;
-    let deadline = Instant::now() + Duration::from_millis(WINDOW_MS);
-    while Instant::now() < deadline {
-        if embassy_rp::pac::SIO.gpio_in(0).read() & (1 << pin) != 0 {
-            high += 1;
-        }
-        total += 1;
-        Timer::after_micros(STEP_US).await;
-    }
-
-    let pct = if total == 0 { 0 } else { high * 100 / total };
-    // Idle-high means the pulse is the low excursion and the second is marked by the falling edge.
-    // Inverting the pin into PIO puts the existing rising-edge capture onto it.
-    if pct > 50 {
-        embassy_rp::pac::IO_BANK0
-            .gpio(pin)
-            .ctrl()
-            .modify(|w| w.set_inover(embassy_rp::pac::io::vals::Inover::INVERT));
-        info!(
-            "PPS on GP{}: {}% high — falling edge marks the second, inverting",
-            pin, pct
-        );
-    } else {
-        info!(
-            "PPS on GP{}: {}% high — rising edge marks the second",
-            pin, pct
-        );
-    }
-}
+/// Configured rather than probed at boot. A probe needs a pulse to be running, and the receiver
+/// drives 1PPS only once it has a fix, so at boot the pin is often resting — and a resting pin
+/// still yields a majority level, which reads like a measurement and is a guess. On an unknown
+/// board, sample the pin during bring-up with `rp_pps::PolarityProbe` and put the answer here.
+const PPS_POLARITY: PpsPolarity = PpsPolarity::ActiveLow;
 
 #[embassy_executor::task]
 async fn pps_task(capture: TimedPpsCapture<'static, PIO0, 0>) {
@@ -604,7 +565,8 @@ async fn main(spawner: Spawner) {
     // After the capture has claimed the pin, never before: assigning it to PIO rewrites the same
     // control register the inversion lives in, so an earlier setting is silently dropped. Found by
     // measuring — the offset came back at −98 ms with the log still saying it had inverted.
-    align_pps_capture_edge(PPS_PIN).await;
+    set_capture_polarity(PPS_PIN, PPS_POLARITY);
+    info!("PPS on GP{}: configured active low", PPS_PIN);
 
     // PIO1: the Ethernet serialiser. A separate PIO block so the two never contend for a state
     // machine or for instruction memory.
