@@ -129,6 +129,30 @@ fn lateness_ns(utc_ns: i64) -> i64 {
     }
 }
 
+/// Watch the 1PPS pin from the inside, and say what fraction of the time it is high.
+///
+/// A pin assigned to PIO is still readable through SIO, so this is the output as the chip sees it.
+/// It answers a question an oscilloscope cannot: when a probe shows nothing, whether the pin is
+/// idle or the probe is. A 100 ms pulse once a second should read about a tenth.
+#[embassy_executor::task]
+async fn pin_watch_task() {
+    const SAMPLES: u32 = 1000;
+    loop {
+        let mut high = 0u32;
+        for _ in 0..SAMPLES {
+            if embassy_rp::pac::SIO.gpio_in(0).read() & (1 << 6) != 0 {
+                high += 1;
+            }
+            Timer::after(Duration::from_micros(2000)).await;
+        }
+        // The pin as the chip sees it is only half the answer: a PIO pin whose input enable is
+        // off reads zero however hard it is being driven. The routing is the other half, and it is
+        // the half that failed silently - see the note in `main` about keeping `Common`.
+        let funcsel = embassy_rp::pac::IO_BANK0.gpio(6).ctrl().read().funcsel() as u8;
+        info!("GP6 high {}/1000, funcsel {}", high, funcsel);
+    }
+}
+
 /// Count a capture that went nowhere, and say so from time to time.
 ///
 /// Every second brings another, so reporting each one would bury everything else; the count is what
@@ -297,6 +321,18 @@ async fn main(spawner: Spawner) {
         initial_period,
     );
 
+    // Neither `Common` may be dropped. embassy-rp releases a PIO block's pins - resets their
+    // FUNCSEL to NULL - once the `Common` and the state machines it handed out are all gone, and
+    // `main` returning is enough to start that. The state machines live on in their tasks and keep
+    // running; the pin they were driving quietly stops being connected to them.
+    //
+    // It cost an afternoon. GP6 read funcsel 7 at the last line of `main` and 31 two seconds later,
+    // with the state machine still enabled and still consuming a period every second, driving a pad
+    // that was no longer listening. Nothing in the firmware's own telemetry could see it.
+    core::mem::forget(common);
+    core::mem::forget(pps_common);
+
     spawner.spawn(link_task(rx).unwrap());
     spawner.spawn(pps_task(out, schedule).unwrap());
+    spawner.spawn(pin_watch_task().unwrap());
 }

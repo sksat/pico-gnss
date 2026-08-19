@@ -793,6 +793,17 @@ async fn main(spawner: Spawner) {
         pps_initial,
     );
 
+    // Neither `Common` may be dropped. embassy-rp releases a PIO block's pins - resets their
+    // FUNCSEL to NULL - once the `Common` and the state machines it handed out are all gone, and
+    // `main` returning is enough to start that. The state machines live on in their tasks and keep
+    // running; the pin they were driving quietly stops being connected to them.
+    //
+    // It cost an afternoon. GP6 read funcsel 7 at the last line of `main` and 31 two seconds later,
+    // with the state machine still enabled and still consuming a period every second, driving a pad
+    // that was no longer listening. Nothing in the firmware's own telemetry could see it.
+    core::mem::forget(common);
+    core::mem::forget(eth_common);
+
     spawner.spawn(pps_task(capture).unwrap());
     spawner.spawn(nmea_task(uart_rx).unwrap());
     spawner.spawn(ntp_task(tx).unwrap());
