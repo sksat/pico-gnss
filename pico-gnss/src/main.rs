@@ -1379,6 +1379,12 @@ async fn main(spawner: Spawner) {
             clk_sys_freq(),
             &capture_prog,
         );
+        // GP2 が PIO に渡ったあとで極性を合わせる。渡す処理が同じ制御レジスタを書き直すので、先に
+        // 設定すると黙って消える。詳細は `pico_gnss::pps`。
+        //
+        // ループバック計測 (SM2) も同じ GP2 を見るので、ここで反転しておけば両方が秒境界のエッジを
+        // 見る。K の較正は両者の生カウンタ差なので、片方だけ反転すると 100 ms ずれる。
+        pico_gnss::pps::align_capture_edge(2).await;
 
         // stage②: SM2 (ループバック位相計測。rp-pps 外の実験機能) は capture と GP2 を共有して生カウンタ差
         // K=C0−C2 を較正する。embassy の set_jmp_pin は &Pin を要求し GP2 は一度しか make できないので、

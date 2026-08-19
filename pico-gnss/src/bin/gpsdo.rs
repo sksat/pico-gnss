@@ -95,6 +95,9 @@ async fn main(spawner: Spawner) {
         mut common, sm0, ..
     } = Pio::new(p.PIO0, Irqs);
     let capture = TimedPpsCapture::new(&mut common, sm0, p.PIN_2, clk_sys_freq());
+    // After the pin is handed to PIO, never before: the assignment rewrites the same control
+    // register the inversion lives in. See `pico_gnss::pps`.
+    pico_gnss::pps::align_capture_edge(2).await;
 
     // UART0 RX=GP1 for the receiver's NMEA (TX=GP0 unused here).
     static TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
