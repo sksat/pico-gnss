@@ -150,6 +150,15 @@ const SYMBOL_WORDS: usize = encoded_words(FRAME_LEN);
 /// timestamps, real framing, real checksums — with only the line coding and the wire left over.
 const FRAME_DUMPS: u32 = 3;
 
+/// Which GPIO carries the receiver's 1PPS.
+const PPS_PIN: usize = 2;
+
+/// Diagnostic only: ask the receiver for this 1PPS pulse width (ms) at boot, to find out which
+/// excursion at the pin is the pulse.
+///
+/// `None` in normal builds — this changes the receiver's configuration, which outlives a reflash.
+const PPS_WIDTH_EXPERIMENT: Option<u32> = None;
+
 /// The receiver's power-on baud rate.
 const GNSS_BOOT_BAUD: u32 = 9600;
 /// What it would be raised to, to get the NMEA burst out of the way of the next PPS edge.
@@ -218,6 +227,63 @@ static SOURCE_TRUSTED: AtomicBool = AtomicBool::new(false);
 /// `Instant` as nanoseconds (µs resolution) — the query timebase for the disciplined clock.
 fn now_ns() -> u64 {
     Instant::now().as_micros() * 1000
+}
+
+/// Point the capture at whichever edge of the 1PPS actually marks the second, by measuring the
+/// pulse rather than assuming its polarity.
+///
+/// A 1PPS is one short pulse a second, and the short excursion is the mark. `rp-pps` captures
+/// rising edges, so an idle-low signal needs nothing and an idle-high one has to be inverted into
+/// PIO — otherwise the capture lands one pulse width past the second.
+///
+/// Measured rather than configured because nothing offers a say in it. The receiver's documented
+/// PPS commands set availability, width and phase (`PMTK285`, `PMTK326`) and say nothing about
+/// polarity, and no document found so far states which level is asserted. A constant here would be
+/// a guess that a different module, or a different `PMTK285` width, would quietly invalidate.
+///
+/// This pin idles high and pulses low, and the low excursion tracks the configured width: 100 ms
+/// wide measures 104 ms, 200 ms wide measures 201 ms. Capturing the rising edge — the *end* of that
+/// pulse — left a client seeing this server late by exactly the width, 100.23 ms and 196.46 ms
+/// respectively. Reading the falling edge instead brings it inside a few ms.
+///
+/// So the assertion here is only what those measurements support: the short excursion is the pulse,
+/// and its leading edge is the mark. Why this module asserts low is not established — nothing
+/// between it and this pin inverts anything, so the likeliest reading is that its PPS output is
+/// simply active-low.
+async fn align_pps_capture_edge(pin: usize) {
+    // Long enough to contain a whole second either way, so both levels are seen whichever is short.
+    const WINDOW_MS: u64 = 1_500;
+    const STEP_US: u64 = 500;
+
+    let mut high = 0u32;
+    let mut total = 0u32;
+    let deadline = Instant::now() + Duration::from_millis(WINDOW_MS);
+    while Instant::now() < deadline {
+        if embassy_rp::pac::SIO.gpio_in(0).read() & (1 << pin) != 0 {
+            high += 1;
+        }
+        total += 1;
+        Timer::after_micros(STEP_US).await;
+    }
+
+    let pct = if total == 0 { 0 } else { high * 100 / total };
+    // Idle-high means the pulse is the low excursion and the second is marked by the falling edge.
+    // Inverting the pin into PIO puts the existing rising-edge capture onto it.
+    if pct > 50 {
+        embassy_rp::pac::IO_BANK0
+            .gpio(pin)
+            .ctrl()
+            .modify(|w| w.set_inover(embassy_rp::pac::io::vals::Inover::INVERT));
+        info!(
+            "PPS on GP{}: {}% high — falling edge marks the second, inverting",
+            pin, pct
+        );
+    } else {
+        info!(
+            "PPS on GP{}: {}% high — rising edge marks the second",
+            pin, pct
+        );
+    }
 }
 
 #[embassy_executor::task]
@@ -535,6 +601,10 @@ async fn main(spawner: Spawner) {
         mut common, sm0, ..
     } = Pio::new(p.PIO0, Irqs);
     let capture = TimedPpsCapture::new(&mut common, sm0, p.PIN_2, clk_sys_freq());
+    // After the capture has claimed the pin, never before: assigning it to PIO rewrites the same
+    // control register the inversion lives in, so an earlier setting is silently dropped. Found by
+    // measuring — the offset came back at −98 ms with the log still saying it had inverted.
+    align_pps_capture_edge(PPS_PIN).await;
 
     // PIO1: the Ethernet serialiser. A separate PIO block so the two never contend for a state
     // machine or for instruction memory.
@@ -588,6 +658,19 @@ async fn main(spawner: Spawner) {
     } else {
         GNSS_BOOT_BAUD
     };
+
+    // Diagnostic: ask the receiver for a specific 1PPS pulse width, so the pin can be watched to
+    // see which excursion follows. The vendor documents the *rising* edge as the time mark, and
+    // this pin measures idle-high — one of those has to give, and the width is the fingerprint that
+    // says which. `PMTK285,Type,WidthMs`; type 4 keeps the pulse coming regardless of fix.
+    if let Some(width_ms) = PPS_WIDTH_EXPERIMENT {
+        let mut cmd: heapless::String<32> = heapless::String::new();
+        if core::fmt::Write::write_fmt(&mut cmd, format_args!("PMTK285,4,{width_ms}")).is_ok() {
+            send_pmtk(&mut uart, &cmd).await;
+            info!("PPS width experiment: asked for {} ms", width_ms);
+            Timer::after_millis(500).await;
+        }
+    }
     if gnss_baud == GNSS_FAST_BAUD {
         SOURCE_TRUSTED.store(true, Ordering::Relaxed);
     } else {

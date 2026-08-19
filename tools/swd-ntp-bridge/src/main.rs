@@ -44,11 +44,23 @@ const PACKET_LEN: usize = 48;
 const ANSWER_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let elf = args
-        .next()
-        .context("usage: swd-ntp-bridge <pico-ntp.elf> [udp-port]")?;
-    let port: u16 = args.next().unwrap_or_else(|| "10123".into()).parse()?;
+        .first()
+        .context("usage: swd-ntp-bridge <pico-ntp.elf> [udp-port | --duty <gpio> <seconds>]")?
+        .clone();
+
+    // `--duty` samples a pin instead of serving. Which edge of the receiver's 1PPS marks the second
+    // decides whether the captured timestamp is the boundary or a pulse width past it, and the duty
+    // cycle is what says which edge is the short one. An oscilloscope answers this directly; absent
+    // one, the probe can still count.
+    if args.get(1).map(String::as_str) == Some("--duty") {
+        let pin: u32 = args.get(2).context("--duty needs a GPIO number")?.parse()?;
+        let seconds: f64 = args.get(3).map_or(Ok(5.0), |s| s.parse())?;
+        return duty(pin, seconds);
+    }
+
+    let port: u16 = args.get(1).map_or(Ok(10123), |s| s.parse())?;
 
     let base = mailbox_address(&elf)?;
     println!("mailbox at {base:#010x} (from {elf})");
@@ -144,6 +156,74 @@ fn exchange(
 
 fn read_u32(session: &mut Session, address: u64) -> Result<u32> {
     Ok(session.core(0)?.read_word_32(address)?)
+}
+
+/// RP2040 SIO `GPIO_IN` — the raw state of every pin, readable while the core runs.
+const SIO_GPIO_IN: u64 = 0xd000_0004;
+
+/// Sample one pin as fast as the probe allows and report how much of the time it is high.
+///
+/// A 1PPS is one short pulse a second, and the short part is the one that marks the boundary. So
+/// the fraction says which edge is the mark, without needing an instrument on the wire: 10% high
+/// means a 100 ms pulse and a rising-edge mark, 90% high means the pulse is the *low* period and
+/// the falling edge is the mark.
+///
+/// Also reports the longest run of consecutive same-value samples, which puts a number on the pulse
+/// itself rather than only on the ratio.
+fn duty(pin: u32, seconds: f64) -> Result<()> {
+    let lister = Lister::new();
+    let probes = lister.list_all();
+    let probe = probes
+        .first()
+        .context("no debug probe found")?
+        .open()
+        .context("could not open the probe")?;
+    let mut session = probe.attach("RP2040", Permissions::default())?;
+    let mut core = session.core(0)?;
+
+    let mask = 1u32 << pin;
+    let started = Instant::now();
+    let (mut high, mut total) = (0u64, 0u64);
+    // Longest observed run of each level, in samples, and where the level last changed.
+    let (mut run_high, mut run_low) = (0u64, 0u64);
+    let (mut run, mut last) = (0u64, None::<bool>);
+
+    while started.elapsed().as_secs_f64() < seconds {
+        let is_high = core.read_word_32(SIO_GPIO_IN)? & mask != 0;
+        total += 1;
+        if is_high {
+            high += 1;
+        }
+        match last {
+            Some(prev) if prev == is_high => run += 1,
+            Some(prev) => {
+                if prev {
+                    run_high = run_high.max(run);
+                } else {
+                    run_low = run_low.max(run);
+                }
+                run = 1;
+            }
+            None => run = 1,
+        }
+        last = Some(is_high);
+    }
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let per_sample_ms = elapsed / total as f64 * 1000.0;
+    println!(
+        "GP{pin}: {:.1}% high over {:.1} s ({} samples, {:.3} ms/sample)",
+        high as f64 / total as f64 * 100.0,
+        elapsed,
+        total,
+        per_sample_ms,
+    );
+    println!(
+        "  longest run  high {:.1} ms   low {:.1} ms",
+        run_high as f64 * per_sample_ms,
+        run_low as f64 * per_sample_ms,
+    );
+    Ok(())
 }
 
 /// Find `NTP_SWD_MAILBOX` in the firmware's symbol table.
