@@ -71,6 +71,50 @@ pub const fn pio_clock_divider_bits(clk_hz: u32) -> u32 {
     (((clk_hz as u64) << 8) / PIO_CLOCK_HZ as u64) as u32
 }
 
+/// PIO clock for the deserialiser: **two** instructions per 50 ns half-bit.
+///
+/// The serialiser gets away with one instruction per symbol because `.wrap` costs nothing. A
+/// receiver has to count, and a counter in the sampling loop would stretch every sixteenth symbol
+/// by a cycle — a 6% rate error, which drifts a whole symbol inside one frame. Running at twice the
+/// symbol rate buys the second instruction for free: `in` and `jmp x--` together take exactly one
+/// symbol period.
+pub const RX_PIO_CLOCK_HZ: u32 = 2 * PIO_CLOCK_HZ;
+
+/// System clock to deserialiser PIO clock divider, in the hardware's 8-fractional-bit form.
+///
+/// At the usual 125 MHz this is exactly 3.125, so the sampling period is exactly 25 ns.
+pub const fn rx_pio_clock_divider_bits(clk_hz: u32) -> u32 {
+    (((clk_hz as u64) << 8) / RX_PIO_CLOCK_HZ as u64) as u32
+}
+
+/// The 10BASE-T deserialiser, as a HAL-agnostic [`pio::Program`].
+///
+/// Waits for the line to leave idle, then samples the pair once per symbol for as many symbols as
+/// the caller asked for, and starts waiting again.
+///
+/// # Backend setup contract
+///
+/// - IN pins: 2, TX- first then TX+, so a sampled pair reads as the same value the transmitter's
+///   side-set wrote. `wait 1 pin 0` therefore triggers on TX-, which is the half the preamble's
+///   first bit raises.
+/// - Clock: [`RX_PIO_CLOCK_HZ`].
+/// - ISR: shift **right**, autopush at 32 bits, so the first symbol sampled ends up in the low two
+///   bits, which is where [`crate::rx::symbols_of`] looks for it.
+/// - The caller pushes one word before each capture: the number of symbols to take, minus one.
+pub fn des_10base_t_program() -> pio::Program<32> {
+    pio::pio_asm!(
+        ".wrap_target",
+        "    pull block", // how many symbols this capture should take, minus one
+        "    mov x, osr",
+        "    wait 1 pin 0", // TX- goes high on the preamble's first half-bit
+        "sample:",
+        "    in pins, 2",
+        "    jmp x-- sample",
+        ".wrap",
+    )
+    .program
+}
+
 /// The 10BASE-T serialiser, as a HAL-agnostic [`pio::Program`].
 ///
 /// Three instructions, and the addresses carry the meaning: the symbol pulled by `out pc, 2` is the
@@ -327,6 +371,24 @@ mod tests {
         let p = ser_10base_t_program();
         assert_eq!(p.wrap.source, 2);
         assert_eq!(p.wrap.target, 0);
+    }
+
+    #[test]
+    fn the_deserialiser_samples_at_twice_the_symbol_rate() {
+        // One symbol is 50 ns. Two instructions have to fit inside it, so the clock is 40 MHz and
+        // at 125 MHz the divider is exactly 3.125 - no fractional residue to drift on.
+        assert_eq!(RX_PIO_CLOCK_HZ, 40_000_000);
+        assert_eq!(rx_pio_clock_divider_bits(125_000_000), 3 * 256 + 32);
+    }
+
+    #[test]
+    fn the_deserialiser_waits_then_counts() {
+        let p = des_10base_t_program();
+        // pull, mov, wait, in, jmp - and the loop goes back to the `in`, not to the `pull`, so one
+        // capture takes one word from the CPU rather than one per symbol.
+        assert_eq!(p.code.len(), 5, "pull, mov, wait, in, jmp");
+        assert_eq!(p.wrap.target, 0, "a new capture starts at the pull");
+        assert_eq!(p.wrap.source, 4, "the last instruction is the loop back");
     }
 
     #[test]
