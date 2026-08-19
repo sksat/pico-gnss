@@ -13,7 +13,7 @@
 ## 可視化
 fix サマリ / 地図 (現在地+軌跡) / スカイプロット / C/N₀ バー / **衛星テーブル** /
 **測位精度** (DOP・2DRMS/CEP・散布図) / **PPS 時刻精度** (jitter σ・ヒストグラム・ppm) /
-**時系列** (高度・衛星数・速度) / PPS規律 UTC / 生 NMEA コンソール (ドラッグでリサイズ)。
+**時系列** (高度・衛星数・速度) / PPS と GPSDO の UTC / 生 NMEA コンソール (ドラッグでリサイズ)。
 
 ## 使い方
 
@@ -49,7 +49,7 @@ uv run tune_gains.py exp.log out.png                  # 外乱を実機ログか
 uv run plot_smith.py pid.log smith.log out.png        # Smith 予測子の before/after (σ300→35ns)
 uv run plot_ctrl.py ctrl5.log out.png                  # 実機の制御構成 P/PD/PI/PID/PID+Smith 比較 (巡回ログ)
 ```
-測位精度 (CEP/R95/2DRMS)・PPS ジッタ・GPSDO 安定度・時刻補正残差 (snap 済)・規律 PPS 出力ジッタ・
+測位精度 (CEP/R95/2DRMS)・PPS ジッタ・GPSDO 安定度・時刻補正残差 (snap 済)・GPSDO PPS 出力ジッタ・
 位相同期の収束・holdover 誤差・衛星/C/N0 を出す。±1ms フィルタ・snap は firmware と揃えてある。
 生成例は [../docs/report/REPORT.md](../docs/report/REPORT.md)。
 

@@ -19,7 +19,7 @@ GYSFFMANC ──NMEA(UART0 RX=GP1)──┐
   - `PPS count=<n> interval_us=<us> state=<First|Locked|Irregular> missed=<m>`
   - `SYNC pps_local_us=<t> unix_s=<s> drift_us=<d>`
 - **host テスト可能なロジックを 2 つのコア crate に分離** (Cargo workspace, ともに host で `cargo test`):
-  - **`gnssdo/`** = 規律そのもの・**依存ゼロ** no_std lib。GPSDO 規律=`gpsdo.rs`、PPS エッジ分類=`pps.rs`、
+  - **`gnssdo/`** = 同期そのもの・**依存ゼロ** no_std lib。GPSDO の同期=`gpsdo.rs`、PPS エッジ分類=`pps.rs`、
     出力位相 PLL=`pll.rs`。`update_epoch` で epoch を消費するだけで、時刻ソースには非依存。
   - **`rp-pps/`** = RP2040 PIO I/O **+ 時刻取り込み**。PIO program/capture/output/dither、NMEA フレーミング=
     `assembler.rs`、PPS↔UTC 秒の対応付け=`timesync.rs` (`PpsTimeSync`→`SyncEpoch`)。embassy-rp/rp2040-hal backend。
@@ -30,7 +30,7 @@ GYSFFMANC ──NMEA(UART0 RX=GP1)──┐
 
 PPS のパルスの始まりが UTC 秒境界 (この GPS-R は active low なので立ち下がり)。**そのエッジを 2 系統 (capture=PIO ns / query=Instant ns) で打刻し、
 後続 NMEA(RMC) の UTC 秒と対応付けて** UTC エポックを device 上に確立する。対応付けは rp-pps の
-[`PpsTimeSync`] が担い (`on_pps_edge`/`set_date`/`on_time`→`SyncEpoch`)、その epoch を gnssdo の規律
+[`PpsTimeSync`] が担い (`on_pps_edge`/`set_date`/`on_time`→`SyncEpoch`)、その epoch を gnssdo の同期
 クロック (`Gnssdo::on_utc`/`DisciplinedClock::update_epoch`) に渡す。
 
 **なぜ firmware 側でやるか**: host (probe-rs RTT 経由) で同期すると USB/probe の往復ジッタ
@@ -60,9 +60,9 @@ PPS のパルスの始まりが UTC 秒境界 (この GPS-R は active low な�
   1s±数µs なので 1ms でも余裕。firmware (`DisciplinedClock::SANE_DEV_NS`) と webapp 両方で ±1ms。
 - firmware は `PPS ... interval_ns=<ns> ...` を出し、webapp は ns でジッタ σ を表示する。
 
-### GPSDO (GPS 規律発振器)
+### GPSDO (GPS 同期発振器)
 
-PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを推定**し、UTC を規律する
+PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを推定**し、UTC を GPS に合わせ込む
 ([`DisciplinedClock`], host テスト済み)。**PPS が切れている間 (holdover) も推定周波数で外挿**して
 時刻を保つのが GPSDO の肝。
 
@@ -70,8 +70,8 @@ PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを�
   実測 ≈ **+2.6 ppm (= +2600 ppb)** (RP2040 水晶)。これを EMA (α=1/32) で平滑する。
 - 周波数推定は PIO の精密間隔から、UTC エポックは連続して読める local clock (embassy Instant) から
   と別々に与える (Instant の µs ジッタは絶対オフセットにのみ効き、周波数=holdover ドリフトには効かない)。
-- firmware は 1Hz で `TIME unix_ns=<規律UTC> ppb=<推定> holdover_ms=<経過> locked=<0|1>` を出す。
-  webapp はこれで device 規律クロックを表示し、PPS 断時は holdover カウンタを出す。
+- firmware は 1Hz で `TIME unix_ns=<GPSDO の UTC> ppb=<推定> holdover_ms=<経過> locked=<0|1>` を出す。
+  webapp はこれで device の同期クロックを表示し、PPS 断時は holdover カウンタを出す。
 - 補正式: 真の経過 = local 経過 − local経過 × ppb/1e9 (local が ppb 分速い/遅いぶんを補正)。
   ロック後 holdover に入ると、残差周波数誤差ぶんだけ時刻がドリフトする (フル ppm でなく)。
 - **時刻補正 API (capture/query 二系統)**: クロックは 2 つの local 時刻でアンカーする (RP2040 では capture=PIO, query=Instant)。
@@ -89,14 +89,14 @@ PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを�
   sub 秒残差だけ残す。これで **N 秒 holdover の真の時刻誤差**が読める (実データ: 25s holdover → 360ns)。
 - **補正タイマ**: `true_to_local_ns(true_ns)` で「真の時間で N 待つ」のに必要なローカル ns を得る
   (生の `Timer::after` は水晶公差 +2.7ppm 分ズレる)。これと `query_ns_for_unix_ns` が補正の素。
-- **規律 PPS 出力 — 2 段階**:
+- **GPSDO PPS 出力 — 2 段階**:
   - ソフト版 (旧 `pps_out_task`): `query_ns_for_unix_ns` で UTC 秒境界をスケジュールし GPIO トグル。
     holdover 対応だが `late` は embassy executor ジッタが下限 (実機 mean ~1.4ms / σ ~244µs) → 廃止。
-  - **PIO 版 (現行)**: SM1 が GP3 に規律パルスを**ハード生成** (周期 = clk×(1+ppb/1e9)-overhead を CPU が
+  - **PIO 版 (現行)**: SM1 が GP3 に GPSDO のパルスを**ハード生成** (周期 = clk×(1+ppb/1e9)-overhead を CPU が
     毎秒 push、`pull noblock` で保持)。エッジは executor 非依存。SM2 が GP4 で**ループバック捕捉** (GP3→GP4
     ジャンパ) し周期を計測。実機 **ジッタ 16ns (= PIO 1 tick、量子化限界)**・GPS PPS と ~24ppb 一致。
     `PPSGEN count= interval_ns= dev_ns=` を出力。ソフト版比 ~1.5 万倍クリーン。
-- **規律 PPS 出力の UTC 位相同期 (stage ①, ソフト)**: 周波数規律は周期が合うだけで、エッジが UTC 秒境界に
+- **GPSDO PPS 出力の UTC 位相同期 (stage ①, ソフト)**: 周波数同期は周期が合うだけで、エッジが UTC 秒境界に
   乗るとは限らない (位相は任意)。位相を合わせるべく gen_capture_task で出力エッジの UTC (Instant 経由) →
   秒境界ズレ `phase_ns` を測り、周期を 1 周だけ伸縮して引き込む。**到達点: 周期 16ns クリーンを保ったまま
   UTC 位相を ~±1〜2ms に整定**。`PPSGEN ... phase_ns=` を出力。制御で踏んだ罠 → 罠 12。
@@ -136,7 +136,7 @@ PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを�
       水晶/GPS は白色でない)。**AR1 相関ノイズ**に直すと実機 PID(σ286) と sim PID(σ249) の滑らかさ・振幅が一致。
       閉ループからの外乱/プラント同定は本質的に難しいので **sim は定性ツール、最終ゲインは実機判断**。
   - **更なる将来**: freq(EMA, GPS 間隔から)と位相 I 項(出力から)を 1 本の type-II ループに完全統合 +
-    ループ遅れ d を実測した PI 設計。今は freq=入力規律 / 位相 PID=出力整相 で分離。
+    ループ遅れ d を実測した PI 設計。今は freq=入力同期 / 位相 PID=出力整相 で分離。
 - **精度限界の分析 (smart-friend + 実機)**: σ~300ns の支配律速を誤差二乗和で切り分け:
   測定量子化 16ns→σ≈16/√12≈4.6ns、GPS PPS ~10ns、RSS≈11ns vs 観測300ns → **測定+GPS 起因は分散の 0.13%**。
   残り 99.9% は**制御のリミットサイクル**(決定論的振動, ガウスノイズでない)。
@@ -204,20 +204,20 @@ config 変更が一切効いてないのに「PMTK が効かない」と誤診)�
 バックグラウンド実行や `| tail` でエラーを見落としやすいので特に注意。
 
 ### 10. PIO 自走カウンタ生成器: 周期保持は X、カウントダウンは Y に分ける
-規律 PPS 生成 (SM1) で `pull noblock; mov x,osr; ...; delay: jmp x-- delay` と書くと、`jmp x--` が
+GPSDO PPS 生成 (SM1) で `pull noblock; mov x,osr; ...; delay: jmp x-- delay` と書くと、`jmp x--` が
 **周期を保持しているはずの X を 0/0xFFFFFFFF まで潰す**。次周の `pull noblock` (FIFO 空→`mov osr,x` 仕様)
 がゴミを再ロードし、2 発目以降が ~34s 周期に化けた。→ **周期は X に保持、カウントダウンは Y** (`mov y,osr;
 jmp y-- delay`)。出力ピンは起動時に `set pindirs, 1` で出力許可する (SET ピン = 生成ピン)。
 
 ### 11. 新しい firmware ログ行は「観測経路」にも必ず通す (phantom バグの温床)
-PIO 規律出力のループバック計測で `PPSGEN` が全く出ず、「3 個目の SM(SM2) が壊れている」と何度も
+PIO の GPSDO 出力のループバック計測で `PPSGEN` が全く出ず、「3 個目の SM(SM2) が壊れている」と何度も
 リフラッシュして誤デバッグした。真因は **webapp server の `--log` フィルタ (NMEA/PPS/SYNC/TIME/… の
 include リスト) に `PPSGEN` を入れ忘れていただけ** で、firmware は最初から正常に出していた。
 → **新ログ行を足したら server のフィルタ/パースにも足す。疑わしいときは server を介さず
 `probe-rs run <elf>` で生出力を直接 grep** して切り分ける (これで一発で判明した)。
 
 ### 12. 位相同期の制御ループ: 測定遅れ → 連続フィードバックは発振、平滑 one-shot に
-規律 PPS 出力の UTC 位相同期で、出力エッジの位相を測って周期を補正する制御を入れたら **±1.5ms で発振**した。
+GPSDO PPS 出力の UTC 位相同期で、出力エッジの位相を測って周期を補正する制御を入れたら **±1.5ms で発振**した。
 - **原因**: 補正は「1 つ前のエッジで測った位相」に基づき効くのは「次のエッジ」= **1 サンプル遅れ**。
   これに連続比例制御 (ゲイン k) をかけると `λ²−λ+k=0`。k=1 (デッドビート) で発振、k=1/2 でリンギング
   (複素根 \|λ\|=0.707, 偏角45°→周期8ステップ。実測の振動周期とぴったり一致)、**k=1/4 が実根境界=臨界減衰**。
@@ -247,7 +247,7 @@ stage② の位相ロックが sub-µs に収束した後、長尺 (~10分) で�
 - **対処②(外れ値除去, smart-friend 助言)**: 弱信号は「存在するが不正(ジッタ/ハーフ秒スリップ)」な PPS も出す。
   水晶ドリフトは ~数十ns/s なので **ロック中に 50µs/1s も跳ぶ位相は非物理 = garbage**。ロック成立後 (連続で
   小位相) は 50µs 超の位相を単発棄却 (最大 N 回; それ以上続けば本物として再ロック)。→ これでロック後の蹴りが
-  消え σ~460ns 維持。**教訓**: GNSS 規律ループの定石は「欠落ホールド + 外れ値棄却 + 補正のスルーレート制限」。
+  消え σ~460ns 維持。**教訓**: GNSS 同期ループの定石は「欠落ホールド + 外れ値棄却 + 補正のスルーレート制限」。
   欠落検出だけでは「受理した garbage」を防げない。
 
 ### 16. 周波数 EMA も「Locked のときだけ + 多段ゲート + 復帰検疫」(smart-friend GPT-5.5)

@@ -3,8 +3,8 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 `pico-gnss-rs` は RP2040 で GNSS の PPS 時刻同期を扱うプロジェクトである。
-GNSS の 1PPS を PIO で ns 分解能で捕捉し、水晶を規律して規律 UTC と規律 1PPS 出力を保ち (GPSDO。PPS が切れているあいだも holdover で外挿する)、PPS を NMEA の UTC 秒に対応づけ、リアルタイムに可視化する。
-規律コアは HAL 非依存の再利用可能な `no_std` crate に切り出してある。
+GNSS の 1PPS を PIO で ns 分解能で捕捉し、水晶を GPS に合わせ込んで、GPSDO の UTC と 1PPS 出力を保ち (PPS が切れているあいだも holdover で外挿する)、PPS を NMEA の UTC 秒に対応づけ、リアルタイムに可視化する。
+同期コアは HAL 非依存の再利用可能な `no_std` crate に切り出してある。
 
 ## 開発の作法
 
@@ -46,7 +46,7 @@ GPS-R PPS が基準で、出力位相は独立計器であるオシロで実測�
 **層の境界を跨ぐのは整数ナノ秒のタイムスタンプと UTC エポックだけで、HAL の型は跨がない。**
 これがコアを host や任意の MCU で動かせてテストもできる理由なので、境界に HAL の型や浮動小数を持ち込まない。
 
-- **`gnssdo`**: 移植可能な規律コア。水晶の周波数オフセット (ppb) を推定して holdover する `DisciplinedClock`、PPS エッジを分類する `PpsTracker`、出力位相の type-II servo `PhaseLockLoop` (P/I/D と Smith 予測子)、受信機の量子化誤差を引く `QErrCorrector` を持つ。no_std、整数のみ、依存ゼロ。
+- **`gnssdo`**: 移植可能な同期コア。水晶の周波数オフセット (ppb) を推定して holdover する `DisciplinedClock`、PPS エッジを分類する `PpsTracker`、出力位相の type-II servo `PhaseLockLoop` (P/I/D と Smith 予測子)、受信機の量子化誤差を引く `QErrCorrector` を持つ。no_std、整数のみ、依存ゼロ。
 - **`rp-pps`**: その入力を作る RP2040/RP2350 の PIO building block。PIO で 1PPS を ~16ns でハード捕捉し (GPIO 割込の µs ジッタを避ける)、操舵できる 1PPS を出し、NMEA を framing と parse し、PPS と UTC 秒をペアリングする。HAL 非依存の core (host テスト可) に、薄い embassy-rp / rp2040-hal backend を載せた構成。
 - **`pico-gnss`**: 上記を embassy で配線する実機ファーム。
 

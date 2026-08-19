@@ -10,7 +10,7 @@
 
 設定内容 (このベンチの物理結線に固定):
   CH1 = GPS PPS     : probe 1x (同軸直結), 1 V/div, offset -1.5V, DISPlay ON
-  CH2 = 規律出力     : probe 10x (×10 プローブ), 1 V/div, offset -1.5V, DISPlay ON
+  CH2 = GPSDO 出力     : probe 10x (×10 プローブ), 1 V/div, offset -1.5V, DISPlay ON
   Trigger           : EDGE, source CH1, slope POSitive, level 1.65V, sweep NORMal
   Timebase          : 200 ns/div (2e-7), offset 0
   最後に            : :MEASure:CLEar, :RUN
@@ -36,7 +36,7 @@ sys.path.insert(0, ".claude/skills/oscilloscope-timing/scripts")
 from rigol_scpi import Rigol
 
 REF_CH = int(os.environ.get("REF_CH", "1"))  # GPS PPS (trigger 基準), 1x 直結
-SIG_CH = int(os.environ.get("SIG_CH", "2"))  # 規律出力, 10x プローブ
+SIG_CH = int(os.environ.get("SIG_CH", "2"))  # GPSDO 出力, 10x プローブ
 
 # 送るコマンド列。順序が重要: 各 CH は PROBe を SCALe/OFFSet より先に
 # (probe 比が縦軸/レベルの解釈を決める。SKILL #3)。
@@ -47,7 +47,7 @@ SETUP_COMMANDS = [
     f":CHANnel{REF_CH}:COUPling DC",    # ロジックレベルのエッジは DC 結合で
     f":CHANnel{REF_CH}:SCALe 1",        # 1 V/div
     f":CHANnel{REF_CH}:OFFSet -1.5",    # 0–3.3V を画面内に収める。SKILL #7
-    # --- CH2 = 規律出力, 10x プローブ ---
+    # --- CH2 = GPSDO 出力, 10x プローブ ---
     f":CHANnel{SIG_CH}:DISPlay ON",
     f":CHANnel{SIG_CH}:PROBe 10",       # ×10 プローブに合わせる。SKILL #8
     f":CHANnel{SIG_CH}:COUPling DC",
