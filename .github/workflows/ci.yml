@@ -13,6 +13,7 @@ jobs:
   cores:
     name: cores (host) — gnssdo + rp-pps + tiny-ntp
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # stable (SHA固定)
@@ -23,7 +24,18 @@ jobs:
       # tiny-ntp cross-checks its wire encoding against Wireshark's dissector. Without these
       # the test skips itself, which would leave the check silently unexercised in CI — the one
       # place it most needs to run. `tshark` pulls in `text2pcap` via wireshark-common.
-      - run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+      #
+      # wireshark-common's postinst asks whether non-root users may capture. Preseed the answer:
+      # sudo resets the environment, so DEBIAN_FRONTEND set on the command line does not reach
+      # debconf, and the install sits waiting for input until the job's six-hour limit.
+      - name: Install tshark
+        run: |
+          sudo apt-get update
+          echo 'wireshark-common wireshark-common/install-setuid boolean false' \
+            | sudo debconf-set-selections
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark
+          tshark --version | head -1
+          command -v text2pcap
       - run: cargo fmt -p gnssdo --check
       - run: cargo fmt -p rp-pps --check
       - run: cargo fmt -p tiny-ntp --check
