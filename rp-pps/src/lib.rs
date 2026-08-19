@@ -49,7 +49,7 @@ mod ticks;
 mod timesync;
 
 pub use schedule::{PpsSchedule, PpsScheduleConfig, PpsStep, first_edge_ns};
-pub use ticks::{TickTimeline, ns_to_ticks, ticks_to_ns};
+pub use ticks::{TickTimeline, ns_to_ticks, ticks_between, ticks_to_ns};
 
 pub use assembler::{MAX_SENTENCE_LEN, NmeaLineAssembler, nmea_checksum, nmea_checksum_valid};
 pub use timesync::{

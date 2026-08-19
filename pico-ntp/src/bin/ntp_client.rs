@@ -48,7 +48,7 @@ use pico_10base_t::rx::{decode_frame, symbols_of};
 use rp_pps::embassy::{EventCapture, PpsOutput, start_in_sync};
 use rp_pps::{
     EVENT_CAPTURE_TOLL_TICKS, PpsSchedule, PpsScheduleConfig, TickTimeline, event_blank_counts,
-    event_capture_program, output_high_cycles, output_period_cycles, ticks_to_ns,
+    event_capture_program, output_high_cycles, output_period_cycles, ticks_between, ticks_to_ns,
 };
 use tiny_ntp::client::{accept_broadcast, measure, request};
 use tiny_ntp::discipline::{DisciplineConfig, NtpDiscipline};
@@ -175,8 +175,18 @@ const REQ_SYMBOL_WORDS: usize = encoded_words(REQ_FRAME_LEN);
 /// One at a time. The reply is matched on the transmit timestamp it echoes, so a second question
 /// asked before the first is answered would make the first unmatchable - and a client with two
 /// unanswered questions has no more information than one with one.
-static OUTSTANDING: BlockingMutex<CriticalSectionRawMutex, RefCell<Option<NtpPacket>>> =
+static OUTSTANDING: BlockingMutex<CriticalSectionRawMutex, RefCell<Option<Outstanding>>> =
     BlockingMutex::new(RefCell::new(None));
+
+/// The question that is out, and when it left the pin.
+#[derive(Clone, Copy)]
+struct Outstanding {
+    packet: NtpPacket,
+    /// The counter value at the request's first bit, and how many times that counter had already
+    /// stopped to capture — both are needed to compare it against a value from the other counter.
+    departed_raw: u32,
+    departed_captures: u64,
+}
 
 /// The pins the two monitors watch: what we send on, and what arrives.
 const EGRESS_GPIO: u8 = 16;
@@ -268,6 +278,8 @@ async fn link_task(
     // The counter has no origin, so the first difference between the two clocks is
     // whatever it is. What matters is what it does after that.
     let mut hw_gap_base: Option<i64> = None;
+    // Captures by the arrival counter, for comparing its value against the egress counter's.
+    let mut arrival_captures_seen: u64 = 0;
 
     loop {
         rx.capture(&mut words).await;
@@ -280,6 +292,14 @@ async fn link_task(
         let hw_raw = arrival.try_read();
         let surplus = arrival.drain();
         let hw_ticks = hw_raw.map(|raw| ARRIVAL.lock(|a| a.borrow_mut().observe(raw)));
+        let arrival_captures = {
+            let n = arrival_captures_seen;
+            if hw_raw.is_some() {
+                arrival_captures_seen += 1;
+            }
+            n
+        };
+        let mut hw_rtt_ns: Option<i64> = None;
         seen = seen.wrapping_add(1);
 
         // How much of the capture the frame actually took. A 94-byte frame is 1638 symbols with
@@ -330,7 +350,21 @@ async fn link_task(
                     note(&mut dropped, "a reply to nothing", seen);
                     continue;
                 };
-                match measure(&sent, &packet, hint) {
+                // The round trip as the pins saw it: from the request's first bit leaving to the
+                // reply's first bit arriving, with no software on either end of the measurement.
+                // On this link the two wires are nanoseconds, so all of this is the far side's
+                // turnaround - and the far side reports that separately.
+                if let Some(raw4) = hw_raw {
+                    let ticks = ticks_between(
+                        sent.departed_raw,
+                        sent.departed_captures,
+                        raw4,
+                        arrival_captures,
+                        EVENT_CAPTURE_TOLL_TICKS,
+                    );
+                    hw_rtt_ns = Some(ticks * 1_000_000_000 / (125_000_000 / 2));
+                }
+                match measure(&sent.packet, &packet, hint) {
                     Ok(m) => {
                         OUTSTANDING.lock(|o| *o.borrow_mut() = None);
                         m
@@ -392,15 +426,21 @@ async fn link_task(
             warn!("HWRX no hardware timestamp for this frame");
         }
 
+        // Every exchange, not every sixteenth: this is paired against the server's own measurement
+        // of the same exchange, and the turnaround varies by milliseconds between them.
+        if let Some(rtt) = hw_rtt_ns {
+            info!("HWRTT n={} rtt_ns={}", used, rtt);
+        }
         if update.stepped || used.is_multiple_of(16) {
             info!(
-                "NTPRX seen={} used={} beacons={} stratum={} step={} delay_ns={} resid_ns={} offset_ns={} drift_ppb={}",
+                "NTPRX seen={} used={} beacons={} stratum={} step={} delay_ns={} hw_rtt_ns={} resid_ns={} offset_ns={} drift_ppb={}",
                 seen,
                 used,
                 broadcasts,
                 measurement.stratum,
                 update.stepped,
                 measurement.delay_ns,
+                hw_rtt_ns.unwrap_or(i64::MIN),
                 update.residual_ns,
                 update.offset_ns,
                 update.drift_ppb
@@ -427,6 +467,9 @@ async fn ask_task(
     let mut symbols = [0u32; REQ_SYMBOL_WORDS];
     let mut ip_id: u16 = 0;
     let mut asked: u32 = 0;
+    // How many times this counter has stopped to capture. The correction when its value is
+    // compared against the other counter's is a count, not a constant.
+    let mut captures: u64 = 0;
 
     loop {
         Timer::after(Duration::from_secs(POLL_INTERVAL_S)).await;
@@ -469,13 +512,22 @@ async fn ask_task(
         if slack_ns > 0 {
             Timer::after(Duration::from_micros((slack_ns / 1000) as u64)).await;
         }
-        OUTSTANDING.lock(|o| *o.borrow_mut() = Some(packet));
         // Clear anything the monitor picked up while the line was otherwise busy, so the first
         // value after the send is this frame's first bit and not something older.
         egress.drain();
         tx.send(&symbols[..words]).await;
         let sent_raw = egress.try_read();
         egress.drain();
+        if let Some(raw) = sent_raw {
+            OUTSTANDING.lock(|o| {
+                *o.borrow_mut() = Some(Outstanding {
+                    packet,
+                    departed_raw: raw,
+                    departed_captures: captures,
+                })
+            });
+            captures += 1;
+        }
         asked = asked.wrapping_add(1);
 
         if asked <= 3 || asked.is_multiple_of(16) {

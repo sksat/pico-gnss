@@ -81,6 +81,30 @@ impl TickTimeline {
     }
 }
 
+/// Ticks between two events timestamped by *different* counters in the same started set.
+///
+/// The counters were started together and are equal — that much was measured on the board. What
+/// they are not is identical over time: each one stops for [`crate::EVENT_CAPTURE_TOLL_TICKS`]
+/// every time *it* captures, so two counters watching different pins fall behind each other in
+/// proportion to how often each one fires. On a link where one pin carries a frame a second and
+/// the other carries two, that is thirty-two nanoseconds a second of divergence.
+///
+/// So the correction is not a constant, it is a count. `captures_before` is how many times each
+/// counter had already captured when it took the value it is being asked about; the value itself
+/// is pushed before its own toll and does not need to include it.
+///
+/// Returns the ticks from `earlier` to `later`. Both are raw down-counter values.
+pub fn ticks_between(
+    earlier: u32,
+    earlier_captures: u64,
+    later: u32,
+    later_captures: u64,
+    toll: u64,
+) -> i64 {
+    let counted = earlier.wrapping_sub(later) as i64;
+    counted - toll as i64 * (earlier_captures as i64 - later_captures as i64)
+}
+
 /// Ticks to nanoseconds at a given system clock.
 ///
 /// Multiplies before dividing, in `u128`, so there is no per-tick truncation to accumulate — exact
@@ -157,6 +181,27 @@ mod tests {
             let ns = ticks_to_ns(ticks, CLK);
             assert_eq!(ns, second * 1_000_000_000, "second {second}");
         }
+    }
+
+
+    #[test]
+    fn two_counters_that_have_captured_equally_need_no_correction() {
+        // 1000 ticks apart, and each has stopped the same number of times.
+        assert_eq!(ticks_between(10_000, 7, 9_000, 7, 2), 1_000);
+    }
+
+    #[test]
+    fn a_counter_that_has_stopped_more_often_reads_high() {
+        // The earlier counter has captured five more times than the later one, so it is ten ticks
+        // behind - it reads ten higher than it would have, and the gap looks ten too long.
+        assert_eq!(ticks_between(10_000, 12, 9_000, 7, 2), 990);
+        // And the other way round.
+        assert_eq!(ticks_between(10_000, 7, 9_000, 12, 2), 1_010);
+    }
+
+    #[test]
+    fn the_gap_is_carried_across_the_wrap() {
+        assert_eq!(ticks_between(100, 3, u32::MAX - 899, 3, 2), 1_000);
     }
 
     #[test]

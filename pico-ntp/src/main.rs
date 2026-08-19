@@ -94,7 +94,7 @@ use rp_pps::embassy::{
 use rp_pps::{
     EVENT_CAPTURE_TOLL_TICKS, PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, TickTimeline,
     event_blank_counts, event_capture_program, output_high_cycles, output_period_cycles,
-    ticks_to_ns,
+    ticks_between, ticks_to_ns,
 };
 use tiny_ntp::packet::{NtpPacket, PACKET_LEN};
 use tiny_ntp::server::{
@@ -420,6 +420,9 @@ const RX_MAX_FRAME: usize = 256;
 struct PendingRequest {
     packet: NtpPacket,
     receive_unix_ns: i64,
+    /// The counter value at the request's first bit, and that counter's capture count at the time.
+    arrived_raw: Option<u32>,
+    arrived_captures: u64,
     src_mac: MacAddr,
     src_ip: Ipv4Addr,
     src_port: u16,
@@ -441,6 +444,8 @@ async fn link_rx_task(
     let mut frame = [0u8; RX_MAX_FRAME];
     let mut seen: u32 = 0;
     let mut taken: u32 = 0;
+    // Captures by the arrival counter, for comparing its value against the egress counter's.
+    let mut arrival_captures: u64 = 0;
 
     loop {
         rx.capture(&mut words).await;
@@ -450,10 +455,13 @@ async fn link_rx_task(
         // watched first, because a timestamp that is right for the wrong reason is worse than one
         // that is visibly wrong.
         let arrived_local = now_ns() as i64 - RX_CAPTURE_NS - RX_LAG_NS;
-        let hw_ticks = arrival
-            .try_read()
-            .map(|raw| ARRIVAL_TICKS.lock(|a| a.borrow_mut().observe(raw)));
+        let hw_raw = arrival.try_read();
+        let hw_ticks = hw_raw.map(|raw| ARRIVAL_TICKS.lock(|a| a.borrow_mut().observe(raw)));
         let surplus = arrival.drain();
+        let arrived_captures = arrival_captures;
+        if hw_raw.is_some() {
+            arrival_captures += 1;
+        }
         seen = seen.wrapping_add(1);
         let Some(arrived_ns) = CLOCK.lock(|g| g.borrow().now_from_query_ns(arrived_local as u64))
         else {
@@ -477,6 +485,8 @@ async fn link_rx_task(
         let request = PendingRequest {
             packet,
             receive_unix_ns: arrived_ns,
+            arrived_raw: hw_raw,
+            arrived_captures,
             src_mac: datagram.src_mac,
             src_ip: datagram.src_ip,
             src_port: datagram.src_port,
@@ -611,6 +621,7 @@ fn clock_state() -> (Option<i64>, ClockState) {
 async fn answer(
     tx: &mut Tx10BaseT<'static, PIO1, 0>,
     egress: &mut EventCapture<'static, PIO0, 3>,
+    egress_captures: u64,
     request: &PendingRequest,
     ip_id: u16,
     frame: &mut [u8; FRAME_LEN],
@@ -672,15 +683,32 @@ async fn answer(
     tx.send(&symbols[..words]).await;
     let hw_egress = egress.try_read();
     egress.drain();
+    // How long this board held the question, as its own pins saw it: the request's first bit
+    // arriving to the reply's first bit leaving. The client measures the whole round trip the same
+    // way; on a link two wires long, the difference between the two is the path, and the path is
+    // nanoseconds. Anything else in it is a constant that should not be there.
+    let hw_turnaround_ns = match (request.arrived_raw, hw_egress) {
+        (Some(r2), Some(r3)) => Some(
+            ticks_between(
+                r2,
+                request.arrived_captures,
+                r3,
+                egress_captures,
+                EVENT_CAPTURE_TOLL_TICKS,
+            ) * 1_000_000_000
+                / (clk_sys_freq() as i64 / 2),
+        ),
+        _ => None,
+    };
 
     info!(
-        "NTPREPLY rx_ns={} claimed_tx_ns={} handover_ns={} slack_ns={} bytes={} hw_egress={}",
+        "NTPREPLY rx_ns={} claimed_tx_ns={} handover_ns={} slack_ns={} bytes={} hw_turnaround_ns={}",
         request.receive_unix_ns,
         departure,
         handover_ns,
         slack_ns,
         len,
-        hw_egress.is_some()
+        hw_turnaround_ns.unwrap_or(i64::MIN)
     );
     if slack_ns <= 0 {
         // The build overran the departure it had promised. Every reply from here is late by
@@ -707,13 +735,25 @@ async fn ntp_task(
     // is otherwise reachable: after transmitting we can still be a few hundred microseconds *before*
     // the boundary we aimed at, and would then aim at it again.
     let mut last_target_ns: i64 = i64::MIN;
+    // Captures by the egress counter, for comparing its value against the arrival counter's.
+    let mut egress_captures: u64 = 0;
 
     loop {
         // A question outranks the beacon. Answering is the whole point of having a receive path:
         // it is what lets a client measure the round trip instead of assuming it.
         if let Ok(request) = REQUESTS.try_receive() {
             ip_id = ip_id.wrapping_add(1);
-            answer(&mut tx, &mut egress, &request, ip_id, &mut frame, &mut symbols).await;
+            answer(
+                &mut tx,
+                &mut egress,
+                egress_captures,
+                &request,
+                ip_id,
+                &mut frame,
+                &mut symbols,
+            )
+            .await;
+            egress_captures += 1;
             continue;
         }
 
