@@ -580,21 +580,13 @@ async fn main(spawner: Spawner) {
 
     // Two counters on the same block, watching the pins the link already uses. They claim nothing:
     // the serialiser drives GP16 and the deserialiser reads GP18, and both stay theirs.
-    let counter = event_capture_program();
-    let mut arrival = EventCapture::<PIO0, 2>::new_stopped(
-        &mut common,
-        sm2,
-        embassy_rp::pac::PIO0,
-        ARRIVAL_GPIO,
-        &counter,
-    );
-    let mut egress = EventCapture::<PIO0, 3>::new_stopped(
-        &mut common,
-        sm3,
-        embassy_rp::pac::PIO0,
-        EGRESS_GPIO,
-        &counter,
-    );
+    // Loaded once. Two eleven-instruction copies plus the serialiser and deserialiser would not
+    // leave room in the block's 32 instructions.
+    let counter = common.load_program(&event_capture_program());
+    let mut arrival =
+        EventCapture::<PIO0, 2>::new_stopped_shared(sm2, embassy_rp::pac::PIO0, ARRIVAL_GPIO, &counter);
+    let mut egress =
+        EventCapture::<PIO0, 3>::new_stopped_shared(sm3, embassy_rp::pac::PIO0, EGRESS_GPIO, &counter);
     // The program blocks on its first instruction until it has this, so arm before starting.
     let blank = event_blank_counts(FRAME_BLANK_NS, clk);
     arrival.arm(blank);

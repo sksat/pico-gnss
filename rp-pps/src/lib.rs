@@ -250,6 +250,8 @@ pub const EVENT_CAPTURE_TOLL_TICKS: u64 = 2;
 
 /// Blanking counts for a line that stays busy for `ns` after its first edge.
 ///
+/// Must exceed the *pulse*, not merely the burst — see [`event_capture_program`].
+///
 /// The blanking counter runs at the same rate as the timestamp counter, one count per
 /// [`CAPTURE_CYCLES_PER_TICK`] cycles.
 pub fn event_blank_counts(ns: u32, clk_hz: u32) -> u32 {
@@ -264,6 +266,14 @@ pub fn event_blank_counts(ns: u32, clk_hz: u32) -> u32 {
 /// at 32 µs a second on a link with two frames on it, which is not a timebase at all.
 ///
 /// This captures once and then stops looking for as long as the caller says, while still counting.
+///
+/// **The blanking has to outlast the pulse, not just the burst.** [`pps_capture_program`] waits for
+/// the pin to fall before arming again, which is what a 100 ms-wide 1PPS needs and what costs a
+/// wire an edge's worth of counting eight hundred times a frame. This waits out a fixed time
+/// instead — so a blanking shorter than the pulse comes back to a pin that is still high and
+/// captures it again. On the board that read as a 1PPS arriving every 95 µs, and the frequency
+/// estimate built on it never locked. The length is pushed per state machine, so a 1PPS and a link
+/// on the same timebase can each have their own.
 /// A frame's first bit is timestamped; the eight hundred edges behind it are not. What a capture
 /// still costs is fixed and known: [`EVENT_CAPTURE_TOLL_TICKS`], the same for every capture, which
 /// is what makes it something the caller can add back rather than something that accumulates.

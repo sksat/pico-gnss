@@ -101,8 +101,13 @@ pub fn set_jmp_pin_unclaimed(pio: embassy_rp::pac::pio::Pio, sm: usize, gpio: u8
 /// bit. See [`EventCapture::drain`].
 pub struct EventCapture<'d, PIO: Instance, const SM: usize> {
     sm: StateMachine<'d, PIO, SM>,
+    /// Kept alive only when this capture loaded it. Several state machines running the same
+    /// program share one copy — a PIO block has 32 instructions, and three copies of an
+    /// eleven-instruction counter do not fit in them. Holding it is bookkeeping rather than
+    /// lifetime: what frees a block's instruction memory is the `Common` going away, and a
+    /// firmware that keeps its state machines running must not let that happen anyway.
     #[allow(dead_code)]
-    prog: LoadedProgram<'d, PIO>,
+    prog: Option<LoadedProgram<'d, PIO>>,
 }
 
 impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
@@ -116,18 +121,34 @@ impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
     /// block has not claimed is exactly the thing embassy's API declines to express.
     pub fn new_stopped(
         common: &mut Common<'d, PIO>,
-        mut sm: StateMachine<'d, PIO, SM>,
+        sm: StateMachine<'d, PIO, SM>,
         pio_regs: embassy_rp::pac::pio::Pio,
         gpio: u8,
         program: &pio::Program<32>,
     ) -> Self {
         let prog = common.load_program(program);
+        let mut me = Self::new_stopped_shared(sm, pio_regs, gpio, &prog);
+        me.prog = Some(prog);
+        me
+    }
+
+    /// Like [`EventCapture::new_stopped`], but onto a program already in the block.
+    ///
+    /// A PIO block holds 32 instructions and every counter in a set runs the same program, so
+    /// loading it once and pointing several state machines at it is not an optimisation — three
+    /// copies of an eleven-instruction counter do not fit. The caller keeps the program alive.
+    pub fn new_stopped_shared(
+        mut sm: StateMachine<'d, PIO, SM>,
+        pio_regs: embassy_rp::pac::pio::Pio,
+        gpio: u8,
+        prog: &LoadedProgram<'d, PIO>,
+    ) -> Self {
         let mut cfg = Config::default();
-        cfg.use_program(&prog, &[]);
+        cfg.use_program(prog, &[]);
         sm.set_config(&cfg);
         // After `set_config`, which writes the whole of `EXECCTRL`.
         set_jmp_pin_unclaimed(pio_regs, SM, gpio);
-        Self { sm, prog }
+        Self { sm, prog: None }
     }
 
     /// This capture's bit in its PIO's `CTRL` register, for [`start_in_sync`].
@@ -171,9 +192,10 @@ impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
 /// PPS input capture on one state machine (see [`crate::pps_capture_program`]).
 pub struct PpsCapture<'d, PIO: Instance, const SM: usize> {
     sm: StateMachine<'d, PIO, SM>,
-    // Kept alive for the lifetime of the capture (RAII over the loaded program).
+    // Kept alive for the lifetime of the capture (RAII over the loaded program), unless the
+    // program was loaded by someone else and is being shared.
     #[allow(dead_code)]
-    prog: LoadedProgram<'d, PIO>,
+    prog: Option<LoadedProgram<'d, PIO>>,
     pin: Pin<'d, PIO>,
 }
 
@@ -201,35 +223,58 @@ impl<'d, PIO: Instance, const SM: usize> PpsCapture<'d, PIO, SM> {
         capture
     }
 
+    /// Like [`PpsCapture::new_with_program`], but leaves the state machine stopped.
+    ///
+    /// For a set of counters that will be compared: configure them all, then bring them up with
+    /// one [`start_in_sync`]. A capture enabled on its own is a capture whose counter has no fixed
+    /// relationship to any other.
+    pub fn new_stopped(
+        common: &mut Common<'d, PIO>,
+        sm: StateMachine<'d, PIO, SM>,
+        pps_pin: Peri<'d, impl PioPin>,
+        program: &pio::Program<32>,
+    ) -> Self {
+        let prog = common.load_program(program);
+        let mut me = Self::new_stopped_shared(common, sm, pps_pin, &prog);
+        me.prog = Some(prog);
+        me
+    }
+
+    /// Like [`PpsCapture::new_stopped`], but onto a program already in the block — see
+    /// [`EventCapture::new_stopped_shared`] for why that matters.
+    pub fn new_stopped_shared(
+        common: &mut Common<'d, PIO>,
+        mut sm: StateMachine<'d, PIO, SM>,
+        pps_pin: Peri<'d, impl PioPin>,
+        prog: &LoadedProgram<'d, PIO>,
+    ) -> Self {
+        let pin = common.make_pio_pin(pps_pin);
+        sm.set_pin_dirs(Direction::In, &[&pin]);
+        let mut cfg = Config::default();
+        cfg.use_program(prog, &[]);
+        cfg.set_jmp_pin(&pin);
+        sm.set_config(&cfg);
+        // Same known zero as `new_stopped`: without it the count starts wherever `X` was, and a
+        // counter with no origin cannot be lined up with the others this write will start.
+        unsafe { sm.exec_instr(crate::zero_x_instruction()) };
+        Self {
+            sm,
+            prog: None,
+            pin,
+        }
+    }
+
     /// This capture's bit in its PIO's `CTRL` register, for [`start_in_sync`].
     pub const fn sm_mask() -> u8 {
         1 << SM
     }
 
-    /// Like [`PpsCapture::new_with_program`], but left stopped with its counter at a known zero.
+    /// Hand [`crate::event_capture_program`] its blanking length, before starting.
     ///
-    /// Two things a running capture cannot give: a start instant shared with another state machine
-    /// (that needs one [`start_in_sync`] write), and a counter whose origin is known (the programs
-    /// count `X` down and never load it, so it starts wherever it was). Both are what
-    /// [`crate::PpsEdgeTimeline::from_counter_start`] needs, and together they are what lets the
-    /// 1PPS output be placed without reading a software clock.
-    pub fn new_stopped(
-        common: &mut Common<'d, PIO>,
-        mut sm: StateMachine<'d, PIO, SM>,
-        pps_pin: Peri<'d, impl PioPin>,
-        program: &pio::Program<32>,
-    ) -> Self {
-        let prog = common.load_program(program);
-        let pin = common.make_pio_pin(pps_pin);
-        sm.set_pin_dirs(Direction::In, &[&pin]);
-        let mut cfg = Config::default();
-        cfg.use_program(&prog, &[]);
-        cfg.set_jmp_pin(&pin);
-        sm.set_config(&cfg);
-        // `SMx_INSTR` executes whether or not the machine is enabled, which is the only way to set
-        // a register the program never writes.
-        unsafe { sm.exec_instr(crate::zero_x_instruction()) };
-        Self { sm, prog, pin }
+    /// Only for that program; [`crate::pps_capture_program`] wants nothing pushed and would take
+    /// this as a symbol count it has no use for. Returns whether the word was taken.
+    pub fn arm(&mut self, blank_counts: u32) -> bool {
+        self.sm.tx().try_push(blank_counts)
     }
 
     /// Await the next rising edge; returns the raw down-counter value. Feed consecutive values to
@@ -295,6 +340,35 @@ impl<'d, PIO: Instance, const SM: usize> TimedPpsCapture<'d, PIO, SM> {
         }
     }
 
+    /// Like [`TimedPpsCapture::new_with_program`] but leaves the state machine stopped, so it can
+    /// be brought up together with the other counters it will be compared against.
+    pub fn new_stopped(
+        common: &mut Common<'d, PIO>,
+        sm: StateMachine<'d, PIO, SM>,
+        pps_pin: Peri<'d, impl PioPin>,
+        clk_hz: u32,
+        program: &pio::Program<32>,
+    ) -> Self {
+        Self {
+            capture: PpsCapture::new_stopped(common, sm, pps_pin, program),
+            timeline: crate::PpsEdgeTimeline::from_counter_start(clk_hz),
+        }
+    }
+
+    /// Like [`TimedPpsCapture::new_stopped`], but onto a program already in the block.
+    pub fn new_stopped_shared(
+        common: &mut Common<'d, PIO>,
+        sm: StateMachine<'d, PIO, SM>,
+        pps_pin: Peri<'d, impl PioPin>,
+        clk_hz: u32,
+        prog: &LoadedProgram<'d, PIO>,
+    ) -> Self {
+        Self {
+            capture: PpsCapture::new_stopped_shared(common, sm, pps_pin, prog),
+            timeline: crate::PpsEdgeTimeline::from_counter_start(clk_hz),
+        }
+    }
+
     /// Await the next rising edge and return it timed against the previous one
     /// ([`PpsCapture::wait_edge`] then [`crate::PpsEdgeTimeline::observe`]).
     pub async fn next_edge(&mut self) -> crate::TimedEdge {
@@ -317,22 +391,6 @@ impl<'d, PIO: Instance, const SM: usize> TimedPpsCapture<'d, PIO, SM> {
         1 << SM
     }
 
-    /// Like [`PpsCapture::new_stopped`], paired with a timeline that starts where the counter does.
-    ///
-    /// The pairing matters: a timeline whose zero is the first edge cannot be compared with a
-    /// state machine started by the same write, and a capture left running cannot share that write.
-    pub fn new_stopped(
-        common: &mut Common<'d, PIO>,
-        sm: StateMachine<'d, PIO, SM>,
-        pps_pin: Peri<'d, impl PioPin>,
-        clk_hz: u32,
-        program: &pio::Program<32>,
-    ) -> Self {
-        Self {
-            capture: PpsCapture::new_stopped(common, sm, pps_pin, program),
-            timeline: crate::PpsEdgeTimeline::from_counter_start(clk_hz),
-        }
-    }
 }
 
 /// Steerable 1PPS output on one state machine (see [`crate::pps_output_program`]).

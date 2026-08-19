@@ -87,11 +87,14 @@ use pico_10base_t::frame::{
 use pico_10base_t::phy::{NLP_INTERVAL_US, encode_frame, encoded_words};
 use pico_10base_t::rx::decode_frame;
 use rp_pps::embassy::{
-    PpsCapture, PpsOutput, TimedPpsCapture, run_capture, run_nmea, set_capture_polarity,
+    EventCapture, PpsCapture, PpsOutput, TimedPpsCapture, run_capture, run_nmea,
+    set_capture_polarity,
     start_in_sync,
 };
 use rp_pps::{
-    PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, output_high_cycles, output_period_cycles,
+    EVENT_CAPTURE_TOLL_TICKS, PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, TickTimeline,
+    event_blank_counts, event_capture_program, output_high_cycles, output_period_cycles,
+    ticks_to_ns,
 };
 use tiny_ntp::packet::{NtpPacket, PACKET_LEN};
 use tiny_ntp::server::{
@@ -366,6 +369,30 @@ async fn pps_task(capture: TimedPpsCapture<'static, PIO0, 0>) {
 /// delay is nanoseconds.
 const REPLY_LAG_NS: i64 = 1_000_000;
 
+/// The pins the two link monitors watch: what this board sends on, and what arrives.
+const EGRESS_GPIO: u8 = 16;
+const ARRIVAL_GPIO: u8 = 18;
+
+/// How long the line stays busy after a frame's first bit — a 94-byte frame is 81.6 µs on the wire
+/// and the gap after it is another 9.6 µs.
+const FRAME_BLANK_NS: u32 = 95_000;
+
+/// How long the 1PPS input stays high after its edge, with room to spare.
+///
+/// Not the same number as the link's, and it must not be: the pulse is 100 ms wide, and blanking
+/// for less than that comes back to a pin that is still high and captures it again. That read as a
+/// 1PPS every 95 µs, and the frequency estimate on it never locked.
+const PPS_BLANK_NS: u32 = 200_000_000;
+
+/// A frame's first bit, timestamped by the state machine watching the pin rather than by software.
+///
+/// On the same counter as the receiver's own 1PPS, which is what makes it convertible to UTC
+/// without a software clock anywhere on the path. All three counters run the same program and were
+/// started by one write; a counter that ran a *different* program would tick at the same rate and
+/// pay a different toll at every capture, which is a drift and not an offset.
+static ARRIVAL_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
+    BlockingMutex::new(RefCell::new(TickTimeline::with_toll(EVENT_CAPTURE_TOLL_TICKS)));
+
 /// Words per capture on the receive side. See the client for the arithmetic; a request is smaller
 /// than a reply, and this covers either.
 const RX_CAPTURE_WORDS: usize = 256;
@@ -406,7 +433,10 @@ static REQUESTS: Channel<CriticalSectionRawMutex, PendingRequest, 2> = Channel::
 
 /// Read the link and hand any request on it to [`ntp_task`].
 #[embassy_executor::task]
-async fn link_rx_task(mut rx: Rx10BaseT<'static, PIO1, 1>) {
+async fn link_rx_task(
+    mut rx: Rx10BaseT<'static, PIO1, 1>,
+    mut arrival: EventCapture<'static, PIO0, 2>,
+) {
     let mut words = [0u32; RX_CAPTURE_WORDS];
     let mut frame = [0u8; RX_MAX_FRAME];
     let mut seen: u32 = 0;
@@ -414,9 +444,16 @@ async fn link_rx_task(mut rx: Rx10BaseT<'static, PIO1, 1>) {
 
     loop {
         rx.capture(&mut words).await;
-        // Local, then UTC. `respond` puts this on the wire for a client to subtract from its own
-        // timestamps, so it has to be in the client's units, not this board's uptime.
+        // Two arrival times for the same frame: one worked backwards from the DMA completion
+        // through two constants, one taken at the pad by a counter that never stopped running.
+        // Only the software one is used for time so far — what the hardware one is doing is being
+        // watched first, because a timestamp that is right for the wrong reason is worse than one
+        // that is visibly wrong.
         let arrived_local = now_ns() as i64 - RX_CAPTURE_NS - RX_LAG_NS;
+        let hw_ticks = arrival
+            .try_read()
+            .map(|raw| ARRIVAL_TICKS.lock(|a| a.borrow_mut().observe(raw)));
+        let surplus = arrival.drain();
         seen = seen.wrapping_add(1);
         let Some(arrived_ns) = CLOCK.lock(|g| g.borrow().now_from_query_ns(arrived_local as u64))
         else {
@@ -450,7 +487,17 @@ async fn link_rx_task(mut rx: Rx10BaseT<'static, PIO1, 1>) {
             warn!("NTPRX {} dropped, still answering the last one", seen);
         }
         if taken.is_multiple_of(16) {
-            info!("NTPRX seen={} requests={}", seen, taken);
+            match hw_ticks {
+                Some(ticks) => info!(
+                    "NTPRX seen={} requests={} hw_ticks={=u64} sw-hw={} ns surplus={}",
+                    seen,
+                    taken,
+                    ticks,
+                    arrived_local - ticks_to_ns(ticks, clk_sys_freq()) as i64,
+                    surplus
+                ),
+                None => info!("NTPRX seen={} requests={} (no hardware timestamp)", seen, taken),
+            }
         }
     }
 }
@@ -563,6 +610,7 @@ fn clock_state() -> (Option<i64>, ClockState) {
 /// constant was set from.
 async fn answer(
     tx: &mut Tx10BaseT<'static, PIO1, 0>,
+    egress: &mut EventCapture<'static, PIO0, 3>,
     request: &PendingRequest,
     ip_id: u16,
     frame: &mut [u8; FRAME_LEN],
@@ -620,11 +668,19 @@ async fn answer(
     if slack_ns > 0 {
         Timer::after_micros((slack_ns / 1000) as u64).await;
     }
+    egress.drain();
     tx.send(&symbols[..words]).await;
+    let hw_egress = egress.try_read();
+    egress.drain();
 
     info!(
-        "NTPREPLY rx_ns={} claimed_tx_ns={} handover_ns={} slack_ns={} bytes={}",
-        request.receive_unix_ns, departure, handover_ns, slack_ns, len
+        "NTPREPLY rx_ns={} claimed_tx_ns={} handover_ns={} slack_ns={} bytes={} hw_egress={}",
+        request.receive_unix_ns,
+        departure,
+        handover_ns,
+        slack_ns,
+        len,
+        hw_egress.is_some()
     );
     if slack_ns <= 0 {
         // The build overran the departure it had promised. Every reply from here is late by
@@ -638,7 +694,10 @@ async fn answer(
 /// Both jobs live in one task because they share the transmitter. Interleaving them here also keeps
 /// the ordering obvious: a link pulse is never emitted while a frame is going out.
 #[embassy_executor::task]
-async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
+async fn ntp_task(
+    mut tx: Tx10BaseT<'static, PIO1, 0>,
+    mut egress: EventCapture<'static, PIO0, 3>,
+) {
     let mut frame = [0u8; FRAME_LEN];
     let mut symbols = [0u32; SYMBOL_WORDS];
     let mut ip_id: u16 = 0;
@@ -654,7 +713,7 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
         // it is what lets a client measure the round trip instead of assuming it.
         if let Ok(request) = REQUESTS.try_receive() {
             ip_id = ip_id.wrapping_add(1);
-            answer(&mut tx, &request, ip_id, &mut frame, &mut symbols).await;
+            answer(&mut tx, &mut egress, &request, ip_id, &mut frame, &mut symbols).await;
             continue;
         }
 
@@ -928,23 +987,41 @@ async fn main(spawner: Spawner) {
         mut common,
         sm0,
         sm1,
+        sm2,
+        sm3,
         ..
     } = Pio::new(p.PIO0, Irqs);
-    // Stopped, and started later in the same write as the 1PPS output. The two counters are then
-    // one timebase, which is what lets the output be placed without reading a software clock.
-    let capture = TimedPpsCapture::new_stopped(
-        &mut common,
-        sm0,
-        p.PIN_2,
-        clk_sys_freq(),
-        &rp_pps::pps_capture_program(),
-    );
+    // One program for every counter in this block. They tick at the same rate whatever they run,
+    // but each pays a toll when it captures, and two programs with different tolls drift apart at
+    // a rate set by how often each one fires — 32 ppb between a 1PPS and a link, which is a drift
+    // and not something a constant can absorb.
+    //
+    // All of them stopped, and started later in the same write as the 1PPS output: the counters
+    // are one timebase then, and the output can be placed without reading a software clock.
+    let counter = common.load_program(&event_capture_program());
+    let mut capture =
+        TimedPpsCapture::new_stopped_shared(&mut common, sm0, p.PIN_2, clk_sys_freq(), &counter);
     // After the capture has claimed the pin, never before: assigning it to PIO rewrites the same
     // control register the inversion lives in, so an earlier setting is silently dropped. Found by
     // Without that ordering the inversion is silently dropped and the offset comes back at −98 ms
     // while the log still says it inverted.
     set_capture_polarity(PPS_PIN, PPS_POLARITY);
     info!("PPS on GP{}: configured active low", PPS_PIN);
+
+    // The two link monitors, on the same block and so on the same timebase as the 1PPS above. They
+    // claim nothing: both pins belong to the serialiser and deserialiser over in PIO1, and reading
+    // a pad is not driving it.
+    let mut arrival =
+        EventCapture::<PIO0, 2>::new_stopped_shared(sm2, embassy_rp::pac::PIO0, ARRIVAL_GPIO, &counter);
+    let mut egress =
+        EventCapture::<PIO0, 3>::new_stopped_shared(sm3, embassy_rp::pac::PIO0, EGRESS_GPIO, &counter);
+    let blank = event_blank_counts(FRAME_BLANK_NS, clk_sys_freq());
+    capture
+        .capture_mut()
+        .arm(event_blank_counts(PPS_BLANK_NS, clk_sys_freq()));
+    arrival.arm(blank);
+    egress.arm(blank);
+    info!("link monitors armed on GP{} and GP{}", EGRESS_GPIO, ARRIVAL_GPIO);
 
     // PIO1: the Ethernet serialiser. A separate PIO block so the two never contend for a state
     // machine or for instruction memory.
@@ -1057,10 +1134,16 @@ async fn main(spawner: Spawner) {
     );
     start_in_sync(
         embassy_rp::pac::PIO0,
-        PpsCapture::<PIO0, 0>::sm_mask() | PpsOutput::<PIO0, 1>::sm_mask(),
+        PpsCapture::<PIO0, 0>::sm_mask()
+            | PpsOutput::<PIO0, 1>::sm_mask()
+            | EventCapture::<PIO0, 2>::sm_mask()
+            | EventCapture::<PIO0, 3>::sm_mask(),
     );
     // Next line, deliberately: see `COUNTER_ORIGIN_NS`.
     COUNTER_ORIGIN_NS.lock(|o| o.set(now_ns() as i64));
+    // Whatever crossed the watched pins between arming and starting.
+    arrival.drain();
+    egress.drain();
 
     // Neither `Common` may be dropped. embassy-rp releases a PIO block's pins - resets their
     // FUNCSEL to NULL - once the `Common` and the state machines it handed out are all gone, and
@@ -1075,8 +1158,8 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(pps_task(capture).unwrap());
     spawner.spawn(nmea_task(uart_rx).unwrap());
-    spawner.spawn(ntp_task(tx).unwrap());
-    spawner.spawn(link_rx_task(eth_rx).unwrap());
+    spawner.spawn(ntp_task(tx, egress).unwrap());
+    spawner.spawn(link_rx_task(eth_rx, arrival).unwrap());
     spawner.spawn(pps_out_task(pps_out, pps_schedule).unwrap());
     // Debug only: a unicast exchange carried over the probe, so a real client can be measured
     // against a link that cannot receive. See `swd_rx`.
