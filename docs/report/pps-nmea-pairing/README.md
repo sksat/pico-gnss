@@ -259,10 +259,10 @@ Telit の MT GNSS Software User Guide には `PMTK255` があり、"enables or d
 ## 基準にしていたエッジ
 
 ここまで「エッジ」と呼んできたのは、firmware が捕捉していた立ち上がりである。
-この GPS-R の 1PPS はアクティブ Low で、秒境界を指すのはパルスの始まり、つまり立ち下がりのほうだった。
+この GPS-R の 1PPS は active low で、秒境界を指すのはパルスの始まり、つまり立ち下がりのほうだった。
 立ち上がりはその 100 ms 後に来るパルスの終わりにすぎない。
 
-![アクティブ High と アクティブ Low で、秒境界を指すエッジが入れ替わる](fig-polarity.svg)
+![active high と active low で、秒境界を指すエッジが入れ替わる](fig-polarity.svg)
 
 極性を作っているのはモジュールではなく基板で、1PPS だけが 74HC04 を 1 段通って反転して出てくる。
 上で引いた `PMTK255` の説明が "behind the rising edge of PPS" と言っているのは、その手前、モジュールのピンでの話である。

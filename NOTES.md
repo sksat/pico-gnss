@@ -28,7 +28,7 @@ GYSFFMANC ──NMEA(UART0 RX=GP1)──┐
 
 ## 時刻同期の設計
 
-PPS のパルスの始まりが UTC 秒境界 (この GPS-R はアクティブ Low なので立ち下がり)。**そのエッジを 2 系統 (capture=PIO ns / query=Instant ns) で打刻し、
+PPS のパルスの始まりが UTC 秒境界 (この GPS-R は active low なので立ち下がり)。**そのエッジを 2 系統 (capture=PIO ns / query=Instant ns) で打刻し、
 後続 NMEA(RMC) の UTC 秒と対応付けて** UTC エポックを device 上に確立する。対応付けは rp-pps の
 [`PpsTimeSync`] が担い (`on_pps_edge`/`set_date`/`on_time`→`SyncEpoch`)、その epoch を gnssdo の規律
 クロック (`Gnssdo::on_utc`/`DisciplinedClock::update_epoch`) に渡す。
