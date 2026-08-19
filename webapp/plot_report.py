@@ -63,7 +63,7 @@ for ln in log:
         gen_dev.append(int(m.group(1))); ph_t.append(t); phase.append(int(m.group(2)))
 
 fig, ax = plt.subplots(2, 2, figsize=(13, 8))
-fig.suptitle(L("pico-gnss: GPSDO 時刻同期・規律 PPS 出力 の実機評価",
+fig.suptitle(L("pico-gnss: GPSDO 時刻同期・GPSDO PPS 出力 の実機評価",
                "pico-gnss: on-hardware evaluation of GPSDO time sync & disciplined PPS output"),
              fontsize=14, fontweight="bold")
 
@@ -113,7 +113,7 @@ if len(hp) > 4 and len(ho) > 4:
     # grouped (side-by-side) per bin rather than overlay = clear heights
     a.hist([hp, ho], bins=bins, color=["#0a9", "#e0a000"],
            label=[L(f"① 受信 GPS PPS σ{hp.std():.0f}ns", f"(1) received GPS PPS σ{hp.std():.0f}ns"),
-                   L(f"② 自作 規律 PPS σ{ho.std():.0f}ns", f"(2) our disciplined PPS σ{ho.std():.0f}ns")])
+                   L(f"② 自作 GPSDO PPS σ{ho.std():.0f}ns", f"(2) our disciplined PPS σ{ho.std():.0f}ns")])
 for v in (16, -16):
     a.axvline(v, color="#bbb", lw=0.7, ls="--")
 a.set_xlim(-56, 56)
@@ -140,7 +140,7 @@ if len(phase) > 2:
     a.axhline(0, color="#888", lw=0.7)
     fin = ph[len(ph) * 2 // 3:]; fin = fin[np.isfinite(fin) & (np.abs(fin) < 50000)]
     settle = np.std(fin) if len(fin) > 5 else float("nan")
-    a.set_title(L(f"D. 規律出力の UTC 位相 (PIO測定+PID+Smith): σ≈{settle:.0f}ns に貼付 (旧ソフトは ±1.4ms)",
+    a.set_title(L(f"D. GPSDO 出力の UTC 位相 (PIO測定+PID+Smith): σ≈{settle:.0f}ns に貼付 (旧ソフトは ±1.4ms)",
                   f"D. Disciplined-output UTC phase (PIO-measured, PID+Smith): σ≈{settle:.0f}ns (old soft: ±1.4ms)"),
                 fontsize=9.5)
     a.set_xlabel(L("起動からの時間 [s]", "Time since boot [s]"))

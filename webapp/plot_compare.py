@@ -67,7 +67,7 @@ ot, oph, ohw = parse(old_path)
 nt, nph, nhw = parse(new_path)
 
 fig, ax = plt.subplots(1, 2, figsize=(15, 5.5))
-fig.suptitle(L("stage②: 規律 PPS 出力の UTC 位相同期 — 制御方式・制御項(A) と 測定精度(B) の比較",
+fig.suptitle(L("stage②: GPSDO PPS 出力の UTC 位相同期 — 制御方式・制御項(A) と 測定精度(B) の比較",
                "stage 2: UTC phase sync of the disciplined PPS output — control (A) and measurement precision (B)"),
              fontsize=13, fontweight="bold")
 

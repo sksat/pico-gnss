@@ -10,7 +10,7 @@
     probe-rs run --chip RP2040 <elf> > x.log 2>&1 && python3 analyze.py x.log
 
 NMEA / PPS / SYNC(err_ns,holdover) / TIME / PPSGEN を集計し、測位精度・PPS 時刻精度・
-GPSDO 安定度・時刻補正残差・規律 PPS 出力ジッタ・holdover 誤差・衛星/C/N0 を出す。
+GPSDO 安定度・時刻補正残差・GPSDO PPS 出力ジッタ・holdover 誤差・衛星/C/N0 を出す。
 webapp ダッシュボードのオフライン版。±1ms フィルタや snap は firmware と揃えてある。
 """
 import re, sys, math, statistics as st
@@ -132,9 +132,9 @@ hold = [(h / 1000, snap(e)) for (_, _, e, h) in sync if h > 2000]
 if hold:
     print(f"  holdover 復帰 (h>2s) {len(hold)} 件: " + ", ".join(f"{h:.0f}s→{abs(e)}ns" for h, e in sorted(hold)[-6:]))
 
-# ---- 規律 PPS 出力 (PPSGEN) ----
+# ---- GPSDO PPS 出力 (PPSGEN) ----
 if (r := stats([x for x in ppsgen if 1000 < abs(x) < 100000])):
-    print(f"\n=== 規律 PPS 出力 (GP3→GP4 ループバック) ===")
+    print(f"\n=== GPSDO PPS 出力 (GP3→GP4 ループバック) ===")
     print(f"  n={r[0]} | 周期 dev mean={r[1]:.0f}ns σ={r[2]:.1f}ns p-p={r[3]}ns (瞬時エッジジッタ ~16ns)")
 
 # ---- 衛星 / C/N0 ----

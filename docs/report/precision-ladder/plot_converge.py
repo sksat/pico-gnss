@@ -72,7 +72,7 @@ def main():
 
     fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11, 4.0))
     fig.suptitle(
-        L("規律 1PPS のロック収束 (自己申告 + オシロ外部観測)",
+        L("GPSDO 1PPS のロック収束 (自己申告 + オシロ外部観測)",
           "Disciplined 1PPS lock-in convergence (self-reported + external scope)"),
         fontsize=12, fontweight="bold",
     )

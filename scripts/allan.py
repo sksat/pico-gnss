@@ -93,7 +93,7 @@ def main():
     fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11, 4.0))
     fig.suptitle(
         L(
-            f"規律 1PPS 出力の安定度 (loopback hwphase, 外部基準なし, N={n}s)",
+            f"GPSDO の 1PPS 出力の安定度 (loopback hwphase, 外部基準なし, N={n}s)",
             f"Disciplined 1PPS output stability (loopback hwphase, no external ref, N={n}s)",
         ),
         fontsize=12, fontweight="bold",
