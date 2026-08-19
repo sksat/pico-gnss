@@ -61,31 +61,36 @@ use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::uart::{
     BufferedInterruptHandler, BufferedUart, BufferedUartRx, Config as UartConfig,
 };
+use embassy_sync::channel::Channel;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::Read as _;
 use static_cell::StaticCell;
 
-use pico_10base_t::embassy::Tx10BaseT;
-use pico_10base_t::frame::{Ipv4Addr, MacAddr, UdpFrameSpec, build_udp_frame, frame_len};
+use pico_10base_t::embassy::{Rx10BaseT, Tx10BaseT};
+use pico_10base_t::frame::{
+    Ipv4Addr, MacAddr, UdpFrameSpec, build_udp_frame, frame_len, parse_udp_frame,
+};
 use pico_10base_t::phy::{NLP_INTERVAL_US, encode_frame, encoded_words};
+use pico_10base_t::rx::decode_frame;
 use rp_pps::embassy::{PpsOutput, TimedPpsCapture, run_capture, run_nmea, set_capture_polarity};
 use rp_pps::{
     PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, output_high_cycles,
     output_period_cycles,
 };
-use tiny_ntp::packet::PACKET_LEN;
+use tiny_ntp::packet::{NtpPacket, PACKET_LEN};
 use tiny_ntp::server::{
-    ClockState, LeapWarning, ServeDecision, ServerConfig, Source, broadcast, silent_reason,
+    ClockState, LeapWarning, ServeDecision, ServerConfig, Source, broadcast, respond, silent_reason,
 };
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
-    // The Ethernet serialiser's symbol feed. This firmware uses exactly one DMA channel.
-    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>;
+    // The Ethernet serialiser's symbol feed, and the deserialiser's. One channel each.
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>,
+                 embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH1>;
 });
 
 // --- Network identity -------------------------------------------------------------------------
@@ -308,10 +313,120 @@ async fn pps_task(capture: TimedPpsCapture<'static, PIO0, 0>) {
     run_capture(capture, &CLOCK, now_ns).await
 }
 
+/// How far ahead a reply's departure is set when the reply is built (ns).
+///
+/// The transmit timestamp has to be written before the bytes it sits in are checksummed and
+/// Manchester-encoded, so it is always a claim about a moment that has not happened. A broadcast
+/// gets away with it by choosing the moment first and building into the wait. A reply can do the
+/// same: pick a departure far enough ahead to build into, and then hold the frame until the clock
+/// reaches it.
+///
+/// It has to clear the worst build, not the typical one - a reply that misses its own departure is
+/// a reply that lies. Building was measured at 400-700 us on this board, so a millisecond.
+///
+/// Setting this from a measured average instead, and handing the frame over as soon as it was
+/// ready, put the round-trip delay at -510 us on a link whose true delay is nanoseconds. The error
+/// was not the average being wrong; it was that the build time varies by hundreds of microseconds
+/// and no single number can stand for it.
+const REPLY_LAG_NS: i64 = 1_000_000;
+
+/// Words per capture on the receive side. See the client for the arithmetic; a request is smaller
+/// than a reply, and this covers either.
+const RX_CAPTURE_WORDS: usize = 256;
+
+/// How long one capture covers (ns). The state machine starts on the frame's first bit and takes a
+/// fixed number of samples, so the DMA finishes exactly this long after that bit arrived.
+const RX_CAPTURE_NS: i64 = (RX_CAPTURE_WORDS as i64) * 16 * 25;
+
+/// Everything between the capture ending and the timestamp taken for it (ns): the DMA interrupt,
+/// the executor waking the task, and the clock read.
+///
+/// Measured on the client, which runs the same code on the same silicon — its 1PPS sat 21.41 us
+/// (sd 3.68, n=24) past the second with nothing here. It is the receive-side counterpart of
+/// `WIRE_LAG_NS`, and like it, a constant standing in for a timestamp nobody took.
+const RX_LAG_NS: i64 = 21_400;
+
+/// Largest frame the receive path will hold.
+const RX_MAX_FRAME: usize = 256;
+
+/// A request that arrived, and when.
+///
+/// The reply is not built here. Building it needs the transmitter, which belongs to [`ntp_task`],
+/// so what crosses is the question and the moment it was asked - the two things that cannot be
+/// recovered later.
+struct PendingRequest {
+    packet: NtpPacket,
+    receive_unix_ns: i64,
+    src_mac: MacAddr,
+    src_ip: Ipv4Addr,
+    src_port: u16,
+}
+
+/// Requests waiting for an answer.
+///
+/// Two deep. A client that asks faster than we answer is not owed a queue - it is owed the truth
+/// about a recent moment, and a stale request answered late is worse than one dropped.
+static REQUESTS: Channel<CriticalSectionRawMutex, PendingRequest, 2> = Channel::new();
+
+/// Read the link and hand any request on it to [`ntp_task`].
+#[embassy_executor::task]
+async fn link_rx_task(mut rx: Rx10BaseT<'static, PIO1, 1>) {
+    let mut words = [0u32; RX_CAPTURE_WORDS];
+    let mut frame = [0u8; RX_MAX_FRAME];
+    let mut seen: u32 = 0;
+    let mut taken: u32 = 0;
+
+    loop {
+        rx.capture(&mut words).await;
+        // Local, then UTC. `respond` puts this on the wire for a client to subtract from its own
+        // timestamps, so it has to be in the client's units, not this board's uptime.
+        let arrived_local = now_ns() as i64 - RX_CAPTURE_NS - RX_LAG_NS;
+        seen = seen.wrapping_add(1);
+        let Some(arrived_ns) = CLOCK.lock(|g| g.borrow().now_from_query_ns(arrived_local as u64))
+        else {
+            continue;
+        };
+
+        let Some(len) = decode_frame(&words, &mut frame) else {
+            continue;
+        };
+        let Some(datagram) = parse_udp_frame(&frame[..len]) else {
+            continue;
+        };
+        if datagram.dst_port != DST_PORT {
+            continue;
+        }
+        let Some(packet) = NtpPacket::decode(datagram.payload) else {
+            continue;
+        };
+
+        taken = taken.wrapping_add(1);
+        let request = PendingRequest {
+            packet,
+            receive_unix_ns: arrived_ns,
+            src_mac: datagram.src_mac,
+            src_ip: datagram.src_ip,
+            src_port: datagram.src_port,
+        };
+        // Never block the receiver on the transmitter: a full queue means the answer is already
+        // late, and waiting here would make us miss the next question as well.
+        if REQUESTS.try_send(request).is_err() {
+            warn!("NTPRX {} dropped, still answering the last one", seen);
+        }
+        if taken.is_multiple_of(16) {
+            info!("NTPRX seen={} requests={}", seen, taken);
+        }
+    }
+}
+
 /// Width of the 1PPS on GP6, matching the receiver's own so the two traces have the same shape.
 const PPS_OUT_PULSE_NS: u32 = 100_000_000;
 
 /// How far this firmware's idea of the second sits behind the receiver's (ns).
+///
+/// Used by everything that puts a clock reading on a wire or a pin *without* going through the
+/// scheduled-second path. The beacon does go through it and must not have this applied twice:
+/// `TX_LAG_NS` was measured from the receiver's own edge, so it already carries this.
 ///
 /// The disciplined clock is not the receiver's 1PPS; it is an estimate built from that pulse, the
 /// sentence that names it, and the capture path in between, and it comes out a constant behind.
@@ -323,7 +438,7 @@ const PPS_OUT_PULSE_NS: u32 = 100_000_000;
 ///
 /// So: measured on an oscilloscope, against the receiver's 1PPS, and subtracted here alone. It does
 /// not touch the clock, and so does not disturb the transmit lag that already accounts for it.
-const PPS_OUT_LAG_NS: i64 = 53_160;
+const CLOCK_OFFSET_NS: i64 = 53_160;
 
 /// How early the word for the next edge is pushed, measured against the edge before it. See
 /// [`rp_pps::PpsSchedule`]: what the state machine pulls before an edge is the interval that
@@ -353,7 +468,7 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
 
         let step = match utc {
             Some(utc) if trusted => {
-                schedule.advance(0, pps_lateness_ns(utc + PPS_OUT_LAG_NS))
+                schedule.advance(0, pps_lateness_ns(utc + CLOCK_OFFSET_NS))
             }
             // Nothing to steer by yet: free-run at the nominal second so the FIFO stays fed.
             _ => schedule.step(0, 0),
@@ -366,17 +481,17 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
             warn!("PPSOUT push dropped, FIFO full");
         }
         edges = edges.wrapping_add(1);
-        if edges <= 8 || edges % 16 == 0 {
+        if edges <= 8 || edges.is_multiple_of(16) {
             let landed = CLOCK
                 .lock(|g| g.borrow().now_from_query_ns(step.edge_ns as u64))
-                .map(|utc| pps_lateness_ns(utc + PPS_OUT_LAG_NS))
+                .map(|utc| pps_lateness_ns(utc + CLOCK_OFFSET_NS))
                 .unwrap_or(0);
             info!(
                 "PPSOUT edges={} word={} corr_ns={} asked_late_ns={} landed_late_ns={}",
                 edges,
                 step.period_word,
                 step.correction_ns,
-                utc.map(|u| pps_lateness_ns(u + PPS_OUT_LAG_NS)).unwrap_or(0),
+                utc.map(|u| pps_lateness_ns(u + CLOCK_OFFSET_NS)).unwrap_or(0),
                 landed
             );
         }
@@ -421,6 +536,84 @@ fn clock_state() -> (Option<i64>, ClockState) {
     })
 }
 
+/// Build and send one reply.
+///
+/// The transmit timestamp is written before the frame is encoded, so it is a claim about a moment
+/// that has not happened yet: `REPLY_LAG_NS` is what stands in for the encoding, the handover and
+/// the wire. `build_ns` in the log is the part of that this firmware can see, and is what the
+/// constant was set from.
+async fn answer(
+    tx: &mut Tx10BaseT<'static, PIO1, 0>,
+    request: &PendingRequest,
+    ip_id: u16,
+    frame: &mut [u8; FRAME_LEN],
+    symbols: &mut [u32; SYMBOL_WORDS],
+) {
+    let started = now_ns() as i64;
+    let (now, state) = clock_state();
+    let Some(now) = now else {
+        return;
+    };
+    // Both timestamps go on the wire for a client to subtract from its own, so both are moved on
+    // to the receiver's second. A common shift would cancel out of the client's round-trip delay
+    // but not out of its offset, which is exactly the number it sets its clock by: without this the
+    // client tracked this board's clock faithfully, 51.73 us (sd 7.76, n=16) behind the receiver.
+    let decision = respond(
+        &CFG,
+        &state,
+        &request.packet,
+        request.receive_unix_ns + CLOCK_OFFSET_NS,
+        now + CLOCK_OFFSET_NS + REPLY_LAG_NS,
+    );
+    let packet = match decision {
+        ServeDecision::Silent(reason) => {
+            warn!("NTP reply withheld: {}", defmt::Debug2Format(&reason));
+            return;
+        }
+        ServeDecision::Serve(packet) => packet,
+    };
+
+    let payload = packet.encode();
+    let spec = UdpFrameSpec {
+        src_mac: SRC_MAC,
+        dst_mac: request.src_mac,
+        src_ip: SRC_IP,
+        dst_ip: request.src_ip,
+        src_port: DST_PORT,
+        dst_port: request.src_port,
+        ip_id,
+        ttl: 1,
+        payload: &payload,
+    };
+    let Some(len) = build_udp_frame(&spec, frame) else {
+        warn!("reply does not fit the frame buffer");
+        return;
+    };
+    let Some(words) = encode_frame(&frame[..len], symbols) else {
+        warn!("reply does not fit the symbol buffer");
+        return;
+    };
+    // The frame is ready; the moment it claims is not yet. Hold it until the clock is one wire lag
+    // short of the departure written inside it, so that what goes out is what was promised.
+    let departure = now + CLOCK_OFFSET_NS + REPLY_LAG_NS;
+    let handover_ns = now_ns() as i64 - started;
+    let slack_ns = departure - WIRE_LAG_NS - (now + CLOCK_OFFSET_NS + handover_ns);
+    if slack_ns > 0 {
+        Timer::after_micros((slack_ns / 1000) as u64).await;
+    }
+    tx.send(&symbols[..words]).await;
+
+    info!(
+        "NTPREPLY rx_ns={} claimed_tx_ns={} handover_ns={} slack_ns={} bytes={}",
+        request.receive_unix_ns, departure, handover_ns, slack_ns, len
+    );
+    if slack_ns <= 0 {
+        // The build overran the departure it had promised. Every reply from here is late by
+        // whatever this says, and no client can tell.
+        warn!("NTP reply missed its own departure by {} ns", -slack_ns);
+    }
+}
+
 /// Broadcast one NTP packet per UTC second, and keep the link alive in between.
 ///
 /// Both jobs live in one task because they share the transmitter. Interleaving them here also keeps
@@ -438,6 +631,14 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
     let mut last_target_ns: i64 = i64::MIN;
 
     loop {
+        // A question outranks the beacon. Answering is the whole point of having a receive path:
+        // it is what lets a client measure the round trip instead of assuming it.
+        if let Ok(request) = REQUESTS.try_receive() {
+            ip_id = ip_id.wrapping_add(1);
+            answer(&mut tx, &request, ip_id, &mut frame, &mut symbols).await;
+            continue;
+        }
+
         // The receiver never reached the rate the pairing depends on, so the second this clock is
         // built on may be wrong. Hold the link up — a dropped link is harder to diagnose than a
         // quiet one — and serve nothing. `main` has already said why on RTT.
@@ -722,6 +923,7 @@ async fn main(spawner: Spawner) {
     let Pio {
         common: mut eth_common,
         sm0: eth_sm,
+        sm1: eth_sm1,
         ..
     } = Pio::new(p.PIO1, Irqs);
     let dma = embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs);
@@ -731,6 +933,19 @@ async fn main(spawner: Spawner) {
         p.PIN_16, // TX−
         p.PIN_17, // TX+
         dma,
+        clk_sys_freq(),
+    );
+
+    // The same block's second state machine reads the other pair, which is where a client's
+    // question arrives. The serialiser is loaded first and is pinned to offset zero (`out pc`
+    // indexes it by symbol value), so the deserialiser lands after it.
+    let eth_rx_dma = embassy_rp::dma::Channel::new(p.DMA_CH1, Irqs);
+    let eth_rx = Rx10BaseT::new(
+        &mut eth_common,
+        eth_sm1,
+        p.PIN_18, // TX− from the other board
+        p.PIN_19, // TX+
+        eth_rx_dma,
         clk_sys_freq(),
     );
 
@@ -823,6 +1038,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(pps_task(capture).unwrap());
     spawner.spawn(nmea_task(uart_rx).unwrap());
     spawner.spawn(ntp_task(tx).unwrap());
+    spawner.spawn(link_rx_task(eth_rx).unwrap());
     spawner.spawn(pps_out_task(pps_out, pps_schedule).unwrap());
     // Debug only: a unicast exchange carried over the probe, so a real client can be measured
     // against a link that cannot receive. See `swd_rx`.
