@@ -17,4 +17,6 @@ fn main() {
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=build.rs");
+    // 測定用に送信先ポートを変えたとき、焼き直しても古いバイナリのままにならないように。
+    println!("cargo:rerun-if-env-changed=NTP_DST_PORT");
 }

@@ -104,29 +104,82 @@ const DST_MAC: MacAddr = MacAddr::BROADCAST;
 /// Source port. Always 123: a client checks it, and it is what makes this an NTP server rather
 /// than a host that happens to emit 48-byte datagrams.
 const SRC_PORT: u16 = 123;
-/// Destination port. 123 in production.
+/// Destination port. 123 in production, or whatever `NTP_DST_PORT` said at build time.
 ///
 /// Set it above 1024 to measure from an **unprivileged** listener: binding 123 needs root, which is
 /// a real obstacle on a machine where the developer cannot elevate. Nothing about the frame changes
 /// — same timestamps, same checksums, same line coding — so "did it arrive, and how far off was it"
 /// is answered identically. Only a real NTP client needs 123, and that is the one thing a high port
 /// cannot test.
-const DST_PORT: u16 = 123;
+///
+/// ```sh
+/// NTP_DST_PORT=10123 cargo run --release
+/// ```
+const DST_PORT: u16 = match option_env!("NTP_DST_PORT") {
+    Some(s) => parse_port(s),
+    None => 123,
+};
+
+/// Decimal `&str` to `u16` at compile time, so a typo in `NTP_DST_PORT` fails the build rather
+/// than shipping a firmware that transmits somewhere unintended.
+const fn parse_port(s: &str) -> u16 {
+    let bytes = s.as_bytes();
+    assert!(!bytes.is_empty(), "NTP_DST_PORT is empty");
+    let mut value: u32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let digit = bytes[i];
+        assert!(
+            digit >= b'0' && digit <= b'9',
+            "NTP_DST_PORT must be decimal"
+        );
+        value = value * 10 + (digit - b'0') as u32;
+        assert!(value <= u16::MAX as u32, "NTP_DST_PORT is out of range");
+        i += 1;
+    }
+    value as u16
+}
 
 // --- Server policy ----------------------------------------------------------------------------
 
-/// How long it takes from `send()` returning control to the first bit reaching the wire.
+/// How long after the second boundary the packet says it left: the whole path from the instant we
+/// aim at to the first bit on the pair.
 ///
-/// **Currently a placeholder.** It has to be measured — a broadcast client cannot sound the path,
-/// so this offset lands directly in every client's clock. Until then the transmit timestamp is
-/// systematically early by whatever this really is, and `PRECISION` is set to say so.
-const TX_LEAD_NS: i64 = 0;
+/// A broadcast client cannot sound the path, so whatever this misses lands directly in its clock.
+/// Split in two because the two halves are measured by different instruments, and only one of them
+/// is visible from inside.
+///
+/// Applied to the timestamp rather than by firing early. Firing early was tried and made things
+/// worse: the residual moved 118.4 µs → 73.5 µs instead of to zero, its spread grew from 5.4 µs to
+/// 26.5 µs, and 13% of seconds ran out of sleep and handed over immediately. The approach lands
+/// anywhere within a 16 ms link-pulse interval, so taking 118 µs off what is left of it sometimes
+/// takes all of it. Correcting the timestamp leaves the schedule alone.
+const TX_LAG_NS: i64 = HANDOVER_LAG_NS + WIRE_LAG_NS;
+
+/// Second boundary to the handover, from `residual_ns` below over 389 seconds: median 118.4 µs,
+/// 102.4 to 133.4 µs, standard deviation 5.4 µs. The firmware can see this one because both ends
+/// of it are clock reads it makes itself.
+const HANDOVER_LAG_NS: i64 = 118_400;
+
+/// Handover to the first bit on the pair. Nothing the firmware reads can show this: it starts at
+/// the last instant the code can timestamp and ends outside the chip.
+///
+/// Measured on an oscilloscope with the GPS receiver's 1PPS as the reference, 60 single shots:
+/// 236.19 µs mean from the second boundary to the first bit, standard deviation 6.87 µs. What each
+/// shot caught was confirmed to be the frame and not a link pulse — the activity ran 81.8 µs, and
+/// 102 byte at 10 Mbit/s is 81.6 µs. Subtracting the half above leaves this.
+const WIRE_LAG_NS: i64 = 117_800;
 
 const CFG: ServerConfig = ServerConfig {
     // log2 seconds of the resolution at which we can actually *timestamp* a transmission — not the
-    // oscillator's. Deliberately pessimistic at ~1 µs until TX_LEAD_NS is measured; over-claiming
-    // here corrupts a client's source selection, which is worse than under-claiming.
-    precision: -20,
+    // oscillator's. Over-claiming corrupts a client's source selection, so this covers the whole
+    // observed spread rather than its standard deviation: with `TX_LAG_NS` carrying the median,
+    // the residual runs −16.0 to +15.0 µs, and −15 is 30.5 µs.
+    //
+    // RFC 5905 defines precision as the system clock's, and strictly the transmit-timestamping
+    // error is neither that nor root dispersion — the protocol has no field for it. Carrying it
+    // here as a floor tells a client something true about the timestamps it is being handed.
+    precision: -15,
     // Broadcast interval, log2 seconds: one per second.
     poll: 0,
     source: Source::ReferenceClock { id: *b"GPS\0" },
@@ -320,7 +373,7 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
         if target_unix_ns <= last_target_ns {
             target_unix_ns = last_target_ns + 1_000_000_000;
         }
-        let wait_ns = target_unix_ns - now - TX_LEAD_NS;
+        let wait_ns = target_unix_ns - now;
 
         // Sleep towards the boundary, but **never past it**: the sleep is capped at the link-pulse
         // interval rather than being a fixed tick. Polling on a fixed 16 ms period with a 16 ms
@@ -333,9 +386,10 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
         }
         last_target_ns = target_unix_ns;
 
-        // Build *before* sleeping. The transmit timestamp we are about to write says the frame's
-        // first bit is at `target_unix_ns`, so everything between waking and handing the buffer to
-        // the PIO is a systematic lag added to every packet we serve. Encoding 48 NTP bytes into a
+        // Build *before* sleeping. The transmit timestamp we are about to write says the frame
+        // left at `target_unix_ns + TX_LAG_NS`, so anything between waking and handing the buffer
+        // to the PIO that `TX_LAG_NS` does not already account for is a systematic lag added to
+        // every packet we serve. Encoding 48 NTP bytes into a
         // ~90-byte frame and then into Manchester symbols is far more than the ~1 µs of timestamp
         // resolution `CFG.precision` advertises, so it cannot sit on that path.
         //
@@ -351,7 +405,7 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
             state
         };
 
-        match broadcast(&CFG, &state, target_unix_ns) {
+        match broadcast(&CFG, &state, target_unix_ns + TX_LAG_NS) {
             ServeDecision::Silent(reason) => {
                 // Deliberately quiet: an unsynchronised beacon is only noise to a client that
                 // cannot interrogate us. Say why on RTT so the reason is visible.
@@ -389,15 +443,15 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
                 // exists to remove.
                 let (before_wait, _) = clock_state();
                 if let Some(before_wait) = before_wait {
-                    let remaining_ns = target_unix_ns - before_wait - TX_LEAD_NS;
+                    let remaining_ns = target_unix_ns - before_wait;
                     Timer::after_micros((remaining_ns.max(0) / 1000) as u64).await;
                 }
 
-                // Disciplined UTC as close to the handover as we can read it. `sched_ns` below is
-                // this minus the instant we advertised, i.e. the residual lag that `TX_LEAD_NS`
-                // exists to cancel — and it is what has to be measured before that constant can be
-                // anything but zero. Reading it costs a lock and lands inside the number it
-                // reports, so the figure errs high, which is the safe direction for a correction.
+                // Disciplined UTC as close to the handover as we can read it. `residual_ns` below
+                // is this minus where `HANDOVER_LAG_NS` says the handover should be, so zero means
+                // that half is still calibrated. It says nothing about `WIRE_LAG_NS`, which starts
+                // after this read. Taking it costs a lock and lands inside the number it reports,
+                // so the figure errs high.
                 let (utc_at_handover, state_at_handover) = clock_state();
 
                 // The packet above was built from the clock as it stood before the sleep, so its
@@ -429,11 +483,13 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
                 // what we believed we were sending, and to see the scheduling error separately from
                 // the path delay.
                 info!(
-                    "NTPTX n={} target_unix_ns={} sched_ns={} tx_lead_ns={} dma_us={} bytes={} words={} disp_ns={} holdover_ns={}",
+                    "NTPTX n={} target_unix_ns={} residual_ns={} tx_lag_ns={} dma_us={} bytes={} words={} disp_ns={} holdover_ns={}",
                     sent,
                     target_unix_ns,
-                    utc_at_handover.map(|u| u - target_unix_ns).unwrap_or(0),
-                    TX_LEAD_NS,
+                    utc_at_handover
+                        .map(|u| u - target_unix_ns - HANDOVER_LAG_NS)
+                        .unwrap_or(0),
+                    TX_LAG_NS,
                     (after - before) / 1000,
                     len,
                     words,

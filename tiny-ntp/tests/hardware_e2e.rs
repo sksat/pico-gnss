@@ -5,8 +5,8 @@
 //! that need a bench:
 //!
 //! ```text
-//! # terminal 1 — with DST_PORT set to the measurement port
-//! cd pico-ntp && cargo run --release
+//! # terminal 1
+//! cd pico-ntp && NTP_DST_PORT=10123 cargo run --release
 //! # terminal 2
 //! cargo test -p tiny-ntp --test hardware_e2e -- --ignored --nocapture
 //! ```
@@ -39,7 +39,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_ntp::packet::{Mode, NtpPacket};
 use tiny_ntp::server::{ClockState, LeapWarning, ServeDecision, ServerConfig, Source, respond};
 
-/// Where the firmware broadcasts while `DST_PORT` is set to the measurement port.
+/// Where the firmware broadcasts when built with `NTP_DST_PORT=10123`.
+///
+/// Above 1024 so the listener needs no privilege. The frame is identical either way, so this
+/// tests everything except the port a real NTP client would look at.
 const HARDWARE_PORT: u16 = 10123;
 /// How long to wait for the hardware to say something.
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -136,7 +139,7 @@ fn a_real_ntp_client_synchronises_to_the_hardware() {
     let Some(hw) = receive_one_broadcast() else {
         panic!(
             "no NTP broadcast on UDP :{HARDWARE_PORT} within {RECEIVE_TIMEOUT:?} — is the firmware \
-             running, and is DST_PORT set to {HARDWARE_PORT}?"
+             running, and was it built with NTP_DST_PORT={HARDWARE_PORT}?"
         );
     };
 
