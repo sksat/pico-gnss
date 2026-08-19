@@ -78,11 +78,13 @@ pub const OUTPUT_OVERHEAD_CYCLES: u32 = 7;
 /// can tell, because every interval is still exactly one second and the output still locks to the
 /// input within nanoseconds. Only a comparison against an outside clock shows it.
 ///
-/// Do not assume it. The AE-GNSS-EXTANT board this project is built around documents
-/// `1PPS 出力 : C-MOS ロジック (3.3V) レベル, パルス幅 :100mS (アクティブ Low)`, while the MediaTek
-/// software specifications underneath it describe the pulse against its *rising* edge and state no
-/// polarity anywhere. Either document alone leads to the wrong answer; the pin settles it, and
-/// [`PolarityProbe`] is how to ask.
+/// Polarity is a property of the receiver and the board it sits on, so it belongs in the firmware's
+/// configuration — but finding out what to configure can take work. The AE-GNSS-EXTANT board this
+/// project is built around documents `1PPS 出力 : C-MOS ロジック (3.3V) レベル,
+/// パルス幅 :100mS (アクティブ Low)`, while the MediaTek software specifications underneath it
+/// describe the pulse against its *rising* edge and state no polarity anywhere; the two agree only
+/// once the schematic shows the 1PPS passing through one gate of a 74HC04. Where the documents run
+/// out, [`PolarityProbe`] reads it off the pin.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum PpsPolarity {
     /// Idle low, pulses high. The rising edge marks the second, which is what the capture program
@@ -99,9 +101,10 @@ pub enum PpsPolarity {
 /// level and the short one is the pulse. Feed samples taken at a steady rate over more than a full
 /// second — both levels have to appear or there is nothing to compare.
 ///
-/// Measured rather than configured because the pulse width is often settable at runtime (MediaTek's
-/// `PMTK285`, for one) and such settings can outlive a power cycle. A build-time constant would be
-/// a claim about a device's current configuration, which is not a thing a build can know.
+/// A bring-up tool, not a boot step. It can only answer while a pulse is running — a receiver
+/// without a fix drives none — and a resting pin yields an answer that looks measured and is a
+/// guess, which is what [`Self::saw_pulse`] is for. Once the answer is known it is a fact about the
+/// hardware, so it belongs in a constant rather than in a window the firmware repeats every boot.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct PolarityProbe {
     high: u32,
@@ -129,6 +132,14 @@ impl PolarityProbe {
     /// Fraction of samples that were high, in percent. `None` before any sample.
     pub fn duty_percent(&self) -> Option<u32> {
         (self.total != 0).then(|| self.high * 100 / self.total)
+    }
+
+    /// Whether a pulse was actually seen: both levels appeared in the window.
+    ///
+    /// A pin held at one level the whole time carries no 1PPS, and [`Self::polarity`] would still
+    /// name a polarity for it. Check this before believing that answer.
+    pub fn saw_pulse(&self) -> bool {
+        self.high != 0 && self.high != self.total
     }
 
     /// The polarity these samples imply, or `None` before any sample.
@@ -684,6 +695,43 @@ mod tests {
         assert_eq!(probe.polarity(), None);
         assert_eq!(probe.duty_percent(), None);
         assert_eq!(probe.samples(), 0);
+    }
+
+    #[test]
+    fn a_pulse_is_seen_only_when_both_levels_appear() {
+        let mut high_pulse = PolarityProbe::new();
+        let mut low_pulse = PolarityProbe::new();
+        for i in 0..100 {
+            high_pulse.sample(i < 10);
+            low_pulse.sample(i >= 10);
+        }
+        assert!(high_pulse.saw_pulse());
+        assert!(low_pulse.saw_pulse());
+    }
+
+    #[test]
+    fn a_pin_that_never_moves_saw_no_pulse() {
+        // The level is all there is to report, so polarity() answers while saw_pulse() denies it.
+        let mut stuck_high = PolarityProbe::new();
+        let mut stuck_low = PolarityProbe::new();
+        for _ in 0..100 {
+            stuck_high.sample(true);
+            stuck_low.sample(false);
+        }
+        assert!(!stuck_high.saw_pulse());
+        assert!(!stuck_low.saw_pulse());
+    }
+
+    #[test]
+    fn no_samples_is_no_pulse() {
+        assert!(!PolarityProbe::new().saw_pulse());
+    }
+
+    #[test]
+    fn a_single_sample_is_not_yet_a_pulse() {
+        let mut probe = PolarityProbe::new();
+        probe.sample(true);
+        assert!(!probe.saw_pulse());
     }
 
     #[test]

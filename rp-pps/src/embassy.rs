@@ -9,10 +9,36 @@
 //! chip-feature-agnostic. There is no shared trait with the `rp2040-hal` backend — the two HALs
 //! differ enough (async vs blocking, ownership) that each is its own small concrete type.
 
+use crate::PpsPolarity;
 use embassy_rp::Peri;
 use embassy_rp::pio::{
     Common, Config, Direction, Instance, LoadedProgram, Pin, PioPin, StateMachine,
 };
+
+/// Route `pin` into PIO so that [`crate::pps_capture_program`]'s rising-edge capture lands on the
+/// edge that marks the second.
+///
+/// The program only ever watches for a rising edge, so an [`PpsPolarity::ActiveLow`] receiver has
+/// to have its input inverted; an [`PpsPolarity::ActiveHigh`] one is already right and this clears
+/// any inversion left over.
+///
+/// Call this **after** the pin has been handed to PIO. Assigning a pin to PIO rewrites the same
+/// `GPIO_CTRL` register the inversion lives in, so an inversion set beforehand is silently dropped.
+///
+/// The inversion also applies to SIO, so `GPIO_IN` reads the inverted level afterwards. Anything
+/// sampling the raw pin (a duty measurement, say) has to run before this or account for it.
+pub fn set_capture_polarity(pin: usize, polarity: PpsPolarity) {
+    use embassy_rp::pac::io::vals::Inover;
+
+    let inover = match polarity {
+        PpsPolarity::ActiveLow => Inover::INVERT,
+        PpsPolarity::ActiveHigh => Inover::NORMAL,
+    };
+    embassy_rp::pac::IO_BANK0
+        .gpio(pin)
+        .ctrl()
+        .modify(|w| w.set_inover(inover));
+}
 
 /// PPS input capture on one state machine (see [`crate::pps_capture_program`]).
 pub struct PpsCapture<'d, PIO: Instance, const SM: usize> {
