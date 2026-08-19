@@ -66,6 +66,99 @@ pub fn start_in_sync(pio: embassy_rp::pac::pio::Pio, mask: u8) {
     });
 }
 
+/// Point a state machine's `jmp` pin at a GPIO another block claimed.
+///
+/// Only one PIO block can *drive* a pin, and that is what `FUNCSEL` selects. Reading is not
+/// driving: the input path belongs to the pad, and every block sees it. So a state machine can
+/// watch a pin the other block is driving — which is exactly what timestamping an outgoing frame
+/// at the pad means.
+///
+/// What embassy's API cannot express is that, because the type its `set_jmp_pin` takes is proof of
+/// a claim this block has not made and must not make: claiming it would rewrite `FUNCSEL` and take
+/// the pin away from whatever is driving it. All that is wanted is the pin *number*, so that is
+/// what this writes.
+///
+/// The field lives in `EXECCTRL`, not `PINCTRL`, and `set_config` writes the whole of both — so
+/// call this after the state machine's config has been set, or it is undone.
+pub fn set_jmp_pin_unclaimed(pio: embassy_rp::pac::pio::Pio, sm: usize, gpio: u8) {
+    pio.sm(sm).execctrl().modify(|w| w.set_jmp_pin(gpio));
+}
+
+/// A counter that timestamps a pin it does not own.
+///
+/// [`PpsCapture`] claims its pin, which is right for a 1PPS input and wrong for everything else on
+/// a board where the pins are already spoken for. An outgoing frame is driven by a state machine in
+/// the other block; a 1PPS output is driven by one in this block; both want timestamping at the
+/// pad, and neither can be claimed a second time.
+///
+/// So this claims nothing. It runs the same counter program, watches a pin by number, and pushes
+/// the counter on every rising edge. What it gives up is any check that the pin is configured at
+/// all — an unconnected number reads as a pin that never moves.
+///
+/// **Every rising edge**, which for a 1PPS is one a second and for a frame is one per zero bit.
+/// The program pushes without blocking, so the counter keeps running and the surplus is dropped
+/// rather than stalling it; the first value in the FIFO after a quiet line is the frame's first
+/// bit. See [`EventCapture::drain`].
+pub struct EventCapture<'d, PIO: Instance, const SM: usize> {
+    sm: StateMachine<'d, PIO, SM>,
+    #[allow(dead_code)]
+    prog: LoadedProgram<'d, PIO>,
+}
+
+impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
+    /// Load `program` onto `sm` and point it at `gpio`, leaving it stopped.
+    ///
+    /// Stopped, because a counter is only a timebase together with the others it will be compared
+    /// against — bring the set up with one [`start_in_sync`].
+    ///
+    /// `pio_regs` is this block's register file, e.g. `embassy_rp::pac::PIO0`. It has to be handed
+    /// in because embassy's `Instance` does not expose it, and pointing a `jmp` pin at a GPIO this
+    /// block has not claimed is exactly the thing embassy's API declines to express.
+    pub fn new_stopped(
+        common: &mut Common<'d, PIO>,
+        mut sm: StateMachine<'d, PIO, SM>,
+        pio_regs: embassy_rp::pac::pio::Pio,
+        gpio: u8,
+        program: &pio::Program<32>,
+    ) -> Self {
+        let prog = common.load_program(program);
+        let mut cfg = Config::default();
+        cfg.use_program(&prog, &[]);
+        sm.set_config(&cfg);
+        // After `set_config`, which writes the whole of `EXECCTRL`.
+        set_jmp_pin_unclaimed(pio_regs, SM, gpio);
+        Self { sm, prog }
+    }
+
+    /// This capture's bit in its PIO's `CTRL` register, for [`start_in_sync`].
+    pub const fn sm_mask() -> u8 {
+        1 << SM
+    }
+
+    /// The oldest counter value waiting, if any.
+    pub fn try_read(&mut self) -> Option<u32> {
+        self.sm.rx().try_pull()
+    }
+
+    /// Await the next edge.
+    pub async fn wait_edge(&mut self) -> u32 {
+        self.sm.rx().wait_pull().await
+    }
+
+    /// Throw away everything waiting, and say how much there was.
+    ///
+    /// A frame raises the watched pin hundreds of times. Only the first matters, so the rest are
+    /// cleared before the next one is expected — and the count is worth having, because a FIFO that
+    /// was already full when the frame started means the first value in it was not the first bit.
+    pub fn drain(&mut self) -> u32 {
+        let mut n = 0;
+        while self.sm.rx().try_pull().is_some() {
+            n += 1;
+        }
+        n
+    }
+}
+
 /// PPS input capture on one state machine (see [`crate::pps_capture_program`]).
 pub struct PpsCapture<'d, PIO: Instance, const SM: usize> {
     sm: StateMachine<'d, PIO, SM>,
@@ -90,6 +183,22 @@ impl<'d, PIO: Instance, const SM: usize> PpsCapture<'d, PIO, SM> {
     /// other should all run the same variant.
     pub fn new_with_program(
         common: &mut Common<'d, PIO>,
+        sm: StateMachine<'d, PIO, SM>,
+        pps_pin: Peri<'d, impl PioPin>,
+        program: &pio::Program<32>,
+    ) -> Self {
+        let mut capture = Self::new_stopped(common, sm, pps_pin, program);
+        capture.sm.set_enable(true);
+        capture
+    }
+
+    /// Like [`PpsCapture::new_with_program`], but leaves the state machine stopped.
+    ///
+    /// For a set of counters that will be compared: configure them all, then bring them up with
+    /// one [`start_in_sync`]. A capture enabled on its own is a capture whose counter has no fixed
+    /// relationship to any other.
+    pub fn new_stopped(
+        common: &mut Common<'d, PIO>,
         mut sm: StateMachine<'d, PIO, SM>,
         pps_pin: Peri<'d, impl PioPin>,
         program: &pio::Program<32>,
@@ -101,7 +210,6 @@ impl<'d, PIO: Instance, const SM: usize> PpsCapture<'d, PIO, SM> {
         cfg.use_program(&prog, &[]);
         cfg.set_jmp_pin(&pin);
         sm.set_config(&cfg);
-        sm.set_enable(true);
         Self { sm, prog, pin }
     }
 
