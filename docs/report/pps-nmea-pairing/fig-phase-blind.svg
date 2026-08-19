@@ -11,10 +11,10 @@
   <line x1="380" y1="36" x2="380" y2="178" stroke="#333" stroke-width="0.9" stroke-dasharray="4 4"/>
   <line x1="386" y1="36" x2="386" y2="178" stroke="#2e7d5b" stroke-width="0.9" stroke-dasharray="4 4"/>
 
-  <text x="204" y="62" font-size="11.5" fill="#333">GPS-R 1PPS (基準)</text>
-  <path fill="none" stroke="#333" stroke-width="2.2" d="M200,96 L380,96 L380,74 L428,74 L428,96 L620,96"/>
+  <text x="192" y="89" font-size="11.5" fill="#333" text-anchor="end">GPS-R 1PPS (基準、アクティブ Low)</text>
+  <path fill="none" stroke="#333" stroke-width="2.2" d="M200,74 L380,74 L380,96 L428,96 L428,74 L620,74"/>
 
-  <text x="204" y="128" font-size="11.5" fill="#2e7d5b">GPSDO 1PPS</text>
+  <text x="192" y="157" font-size="11.5" fill="#2e7d5b" text-anchor="end">GPSDO 1PPS</text>
   <path fill="none" stroke="#2e7d5b" stroke-width="2.2" d="M200,164 L386,164 L386,142 L434,142 L434,164 L620,164"/>
 
   <!-- 位相差 -->

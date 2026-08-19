@@ -23,9 +23,9 @@
   <!-- 1PPS 波形 -->
   <text x="72" y="94" font-size="13" fill="#333" text-anchor="end">1PPS</text>
   <path fill="none" stroke="#333" stroke-width="2.2"
-        d="M80,110 L110,110 L110,66 L129,66 L129,110 L300,110 L300,66 L319,66 L319,110
-           L490,110 L490,66 L509,66 L509,110 L680,110 L680,66 L699,66 L699,110 L740,110"/>
-  <text x="118" y="128" font-size="11.5" fill="#333">立ち上がりが UTC の秒境界</text>
+        d="M80,66 L110,66 L110,110 L129,110 L129,66 L300,66 L300,110 L319,110 L319,66
+           L490,66 L490,110 L509,110 L509,66 L680,66 L680,110 L699,110 L699,66 L740,66"/>
+  <text x="118" y="128" font-size="11.5" fill="#333">パルスの始まり (立ち下がり) が UTC の秒境界</text>
 
   <!-- NMEA センテンス -->
   <text x="72" y="176" font-size="13" fill="#333" text-anchor="end">NMEA</text>
