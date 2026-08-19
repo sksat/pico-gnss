@@ -61,6 +61,21 @@ const CAPTURE_WORDS: usize = 256;
 /// how a receive timestamp is recovered from a completion that happens well after the fact.
 const CAPTURE_NS: i64 = (CAPTURE_WORDS as i64) * 16 * 25;
 
+/// Everything between the frame's last bit and the timestamp taken for it (ns).
+///
+/// The capture ends, the DMA raises its interrupt, the executor wakes this task, and only then is
+/// the clock read. All of that is time the frame has already spent arriving, and none of it is
+/// visible from in here: the firmware's own numbers are consistent with a clock that is out by any
+/// constant at all. It took the oscilloscope. With this at zero, the client's 1PPS sat 21.41 us
+/// (sd 3.68, n=24) past the receiver's second while the server's own sat 55.02 us (sd 1.13) past
+/// it - and the server's transmit lag was calibrated against that same second, so its packets are
+/// right and what was left over was this.
+///
+/// The counterpart of `TX_LAG_NS` on the server, arrived at the same way and no more satisfying:
+/// a constant measured once, on a rig, at a temperature. Timestamping the edge in PIO is what
+/// replaces it.
+const RX_LAG_NS: i64 = 21_400;
+
 /// Room for the largest frame this link carries.
 const MAX_FRAME: usize = 256;
 
@@ -176,9 +191,10 @@ async fn link_task(mut rx: Rx10BaseT<'static, PIO0, 0>) {
     loop {
         rx.capture(&mut words).await;
         // The capture began on the frame's first bit and ran for a fixed span, so that bit is one
-        // capture behind the completion. This is the receive timestamp, and on a link two boards
-        // long the propagation from the far pad to this one is nanoseconds.
-        let arrived_ns = now_ns() - CAPTURE_NS;
+        // capture behind the completion - less what it took to get from the completion to here.
+        // On a link two boards long the propagation from the far pad to this one is nanoseconds,
+        // and the software between the two is not.
+        let arrived_ns = now_ns() - CAPTURE_NS - RX_LAG_NS;
         seen = seen.wrapping_add(1);
 
         let Some(len) = decode_frame(&words, &mut frame) else {

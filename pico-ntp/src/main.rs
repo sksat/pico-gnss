@@ -311,6 +311,20 @@ async fn pps_task(capture: TimedPpsCapture<'static, PIO0, 0>) {
 /// Width of the 1PPS on GP6, matching the receiver's own so the two traces have the same shape.
 const PPS_OUT_PULSE_NS: u32 = 100_000_000;
 
+/// How far this firmware's idea of the second sits behind the receiver's (ns).
+///
+/// The disciplined clock is not the receiver's 1PPS; it is an estimate built from that pulse, the
+/// sentence that names it, and the capture path in between, and it comes out a constant behind.
+/// The transmit path never had to know: `WIRE_LAG_NS` was measured from the receiver's own edge to
+/// the first bit on the wire, so this offset was inside it from the start and the packets are
+/// right. A pin has no such calibration, and with nothing here the 1PPS on GP6 sat 53.16 us
+/// (sd 0.92, n=24) past the receiver's second while the client taking its time from those same
+/// packets sat within a microsecond of it.
+///
+/// So: measured on an oscilloscope, against the receiver's 1PPS, and subtracted here alone. It does
+/// not touch the clock, and so does not disturb the transmit lag that already accounts for it.
+const PPS_OUT_LAG_NS: i64 = 53_160;
+
 /// How early the word for the next edge is pushed, measured against the edge before it. See
 /// [`rp_pps::PpsSchedule`]: what the state machine pulls before an edge is the interval that
 /// follows, so the deadline is one edge earlier than the edge being positioned.
@@ -338,7 +352,9 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
         let trusted = SOURCE_TRUSTED.load(Ordering::Relaxed);
 
         let step = match utc {
-            Some(utc) if trusted => schedule.advance(0, pps_lateness_ns(utc)),
+            Some(utc) if trusted => {
+                schedule.advance(0, pps_lateness_ns(utc + PPS_OUT_LAG_NS))
+            }
             // Nothing to steer by yet: free-run at the nominal second so the FIFO stays fed.
             _ => schedule.step(0, 0),
         };
@@ -353,14 +369,14 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
         if edges <= 8 || edges % 16 == 0 {
             let landed = CLOCK
                 .lock(|g| g.borrow().now_from_query_ns(step.edge_ns as u64))
-                .map(pps_lateness_ns)
+                .map(|utc| pps_lateness_ns(utc + PPS_OUT_LAG_NS))
                 .unwrap_or(0);
             info!(
                 "PPSOUT edges={} word={} corr_ns={} asked_late_ns={} landed_late_ns={}",
                 edges,
                 step.period_word,
                 step.correction_ns,
-                utc.map(pps_lateness_ns).unwrap_or(0),
+                utc.map(|u| pps_lateness_ns(u + PPS_OUT_LAG_NS)).unwrap_or(0),
                 landed
             );
         }
