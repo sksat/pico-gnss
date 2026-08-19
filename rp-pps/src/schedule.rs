@@ -26,6 +26,13 @@ pub struct PpsScheduleConfig {
     /// The most one period may be stretched or squeezed for phase (ns). A large correction is a
     /// large frequency excursion, and this is a 1PPS output.
     pub max_correction_ns: i64,
+    /// An edge this far out (ns) is put back in one period rather than steered.
+    ///
+    /// The clock this is driven by can move under it — a GPSDO that has just paired its first
+    /// sentence, an NTP client that has just stepped — and what it moves by is not something the
+    /// per-period clamp can absorb. At a millisecond a second, a third of a second takes five
+    /// minutes to walk in, and the output is wrong for all of it.
+    pub reacquire_ns: i64,
 }
 
 impl Default for PpsScheduleConfig {
@@ -33,6 +40,7 @@ impl Default for PpsScheduleConfig {
         Self {
             phase_gain_inv: 4,
             max_correction_ns: 1_000_000,
+            reacquire_ns: 2_000_000,
         }
     }
 }
@@ -47,6 +55,8 @@ pub struct PpsStep {
     /// The phase correction asked for, after the clamp (ns). What the edge actually moved by is
     /// this to within a cycle; the remainder is carried to the next edge rather than dropped.
     pub correction_ns: i64,
+    /// The edge was placed in one period rather than steered towards.
+    pub acquired: bool,
 }
 
 /// Tracks where the output's edges are, from the words it hands out.
@@ -98,6 +108,19 @@ impl PpsSchedule {
         s
     }
 
+    /// Position the next edge: steer it if it is close, put it there if it is not.
+    ///
+    /// This is the one a caller wants. Steering keeps the output smooth, which matters while it is
+    /// nearly right; it is the wrong answer entirely when the clock underneath has just moved, and
+    /// [`PpsScheduleConfig::reacquire_ns`] is where one stops being the case and the other starts.
+    pub fn advance(&mut self, freq_mppb: i64, lateness_ns: i64) -> PpsStep {
+        if lateness_ns.abs() > self.cfg.reacquire_ns {
+            self.acquire(freq_mppb, lateness_ns)
+        } else {
+            self.step(freq_mppb, lateness_ns)
+        }
+    }
+
     /// Put the next edge on a second boundary in one step, instead of walking it there.
     ///
     /// Steering moves an edge by at most [`PpsScheduleConfig::max_correction_ns`] per second, so an
@@ -122,6 +145,7 @@ impl PpsSchedule {
             period_word,
             edge_ns: self.edge_ns,
             correction_ns: -delay,
+            acquired: true,
         }
     }
 
@@ -166,6 +190,7 @@ impl PpsSchedule {
             period_word,
             edge_ns: self.edge_ns,
             correction_ns: correction,
+            acquired: false,
         }
     }
 
@@ -232,6 +257,32 @@ mod tests {
         // Without the carry this stalls at four cycles - the gain reciprocal times the 8 ns
         // a whole cycle is worth.
         assert!(lateness.abs() < 10, "still {lateness} ns late");
+    }
+
+    #[test]
+    fn a_small_error_is_steered_and_a_large_one_is_placed() {
+        let cfg = PpsScheduleConfig::default();
+        let mut s = schedule(0);
+        assert!(!s.advance(0, cfg.reacquire_ns).acquired, "just inside");
+        let mut s = schedule(0);
+        assert!(s.advance(0, cfg.reacquire_ns + 1).acquired, "just outside");
+        let mut s = schedule(0);
+        assert!(s.advance(0, -cfg.reacquire_ns - 1).acquired, "and the other way");
+    }
+
+    #[test]
+    fn a_clock_that_jumps_is_followed_in_one_edge_not_five_minutes() {
+        // What the server does at boot: the estimate underneath moves by a third of a second once
+        // the first sentence pairs. At the per-period clamp that is minutes of wrong output.
+        let mut s = schedule(0);
+        s.advance(0, 0);
+        let step = s.advance(0, 348_160_848);
+        assert!(step.acquired);
+        let landed = step.edge_ns - 2_000_000_000 + 348_160_848;
+        assert!(
+            landed.rem_euclid(1_000_000_000) <= 1_000_000_000 / CLK as i64,
+            "landed at {landed}"
+        );
     }
 
     #[test]

@@ -70,8 +70,11 @@ use static_cell::StaticCell;
 use pico_10base_t::embassy::Tx10BaseT;
 use pico_10base_t::frame::{Ipv4Addr, MacAddr, UdpFrameSpec, build_udp_frame, frame_len};
 use pico_10base_t::phy::{NLP_INTERVAL_US, encode_frame, encoded_words};
-use rp_pps::embassy::{TimedPpsCapture, run_capture, run_nmea, set_capture_polarity};
-use rp_pps::{PpsGpsdo, PpsPolarity};
+use rp_pps::embassy::{PpsOutput, TimedPpsCapture, run_capture, run_nmea, set_capture_polarity};
+use rp_pps::{
+    PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, output_high_cycles,
+    output_period_cycles,
+};
 use tiny_ntp::packet::PACKET_LEN;
 use tiny_ntp::server::{
     ClockState, LeapWarning, ServeDecision, ServerConfig, Source, broadcast, silent_reason,
@@ -303,6 +306,75 @@ const PPS_POLARITY: PpsPolarity = PpsPolarity::ActiveLow;
 #[embassy_executor::task]
 async fn pps_task(capture: TimedPpsCapture<'static, PIO0, 0>) {
     run_capture(capture, &CLOCK, now_ns).await
+}
+
+/// Width of the 1PPS on GP6, matching the receiver's own so the two traces have the same shape.
+const PPS_OUT_PULSE_NS: u32 = 100_000_000;
+
+/// How early the word for the next edge is pushed, measured against the edge before it. See
+/// [`rp_pps::PpsSchedule`]: what the state machine pulls before an edge is the interval that
+/// follows, so the deadline is one edge earlier than the edge being positioned.
+const PPS_OUT_LEAD_NS: i64 = 200_000_000;
+
+/// Put the disciplined clock on GP6, so the thing this server is announcing can be seen.
+///
+/// The clock is already being read once a second for the packet; this reads it for a pin. The two
+/// answers come from the same estimate, so an oscilloscope comparing GP6 against the receiver's own
+/// 1PPS is measuring what the packets carry — including any constant this firmware is wrong by,
+/// which is the point.
+#[embassy_executor::task]
+async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSchedule) {
+    let mut edges: u32 = 0;
+
+    loop {
+        let push_at = schedule.edge_ns() - PPS_OUT_LEAD_NS;
+        let now = now_ns() as i64;
+        if push_at > now {
+            Timer::after(Duration::from_micros(((push_at - now) / 1000) as u64)).await;
+        }
+
+        let predicted = schedule.predicted_edge_ns();
+        let utc = CLOCK.lock(|g| g.borrow().now_from_query_ns(predicted as u64));
+        let trusted = SOURCE_TRUSTED.load(Ordering::Relaxed);
+
+        let step = match utc {
+            Some(utc) if trusted => schedule.advance(0, pps_lateness_ns(utc)),
+            // Nothing to steer by yet: free-run at the nominal second so the FIFO stays fed.
+            _ => schedule.step(0, 0),
+        };
+        if step.acquired {
+            info!("PPSOUT placed, corr_ns={}", step.correction_ns);
+        }
+
+        if !out.set_period(step.period_word) {
+            warn!("PPSOUT push dropped, FIFO full");
+        }
+        edges = edges.wrapping_add(1);
+        if edges <= 8 || edges % 16 == 0 {
+            let landed = CLOCK
+                .lock(|g| g.borrow().now_from_query_ns(step.edge_ns as u64))
+                .map(pps_lateness_ns)
+                .unwrap_or(0);
+            info!(
+                "PPSOUT edges={} word={} corr_ns={} asked_late_ns={} landed_late_ns={}",
+                edges,
+                step.period_word,
+                step.correction_ns,
+                utc.map(pps_lateness_ns).unwrap_or(0),
+                landed
+            );
+        }
+    }
+}
+
+/// Signed distance from `utc_ns` to the nearest second boundary: positive when it is past one.
+fn pps_lateness_ns(utc_ns: i64) -> i64 {
+    let into = utc_ns.rem_euclid(1_000_000_000);
+    if into > 500_000_000 {
+        into - 1_000_000_000
+    } else {
+        into
+    }
 }
 
 #[embassy_executor::task]
@@ -611,11 +683,16 @@ async fn probe_gnss_baud(uart: &mut BufferedUart) -> Option<u32> {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    info!("pico-ntp: Stratum-1 NTP broadcast (NMEA UART0/GP1 @9600, PPS GP2, 10BASE-T GP16/GP17)");
+    info!(
+        "pico-ntp: Stratum-1 NTP broadcast (NMEA UART0/GP1 @9600, PPS in GP2, PPS out GP6, 10BASE-T GP16/GP17)"
+    );
 
     // PIO0: the 1PPS capture that disciplines the clock.
     let Pio {
-        mut common, sm0, ..
+        mut common,
+        sm0,
+        sm1,
+        ..
     } = Pio::new(p.PIO0, Irqs);
     let capture = TimedPpsCapture::new(&mut common, sm0, p.PIN_2, clk_sys_freq());
     // After the capture has claimed the pin, never before: assigning it to PIO rewrites the same
@@ -700,9 +777,26 @@ async fn main(spawner: Spawner) {
 
     let (_uart_tx, uart_rx) = uart.split();
 
+    // The 1PPS out on GP6, on the capture's block. Built here rather than with the capture, and the
+    // ordering is not cosmetic: the state machine starts running the moment it is enabled and wants
+    // a fresh period every second, but its task cannot run until this function stops. Enabling it
+    // before the baud negotiation above left it pulling an empty FIFO, which loads a spent counter
+    // rather than the last period - one ~34 s interval, and the output was gone for half a minute.
+    let pps_high = output_high_cycles(clk_sys_freq(), PPS_OUT_PULSE_NS);
+    let pps_initial = output_period_cycles(clk_sys_freq(), pps_high);
+    let pps_out = PpsOutput::new(&mut common, sm1, p.PIN_6, pps_high, pps_initial);
+    let pps_schedule = PpsSchedule::at_enable(
+        clk_sys_freq(),
+        pps_high,
+        PpsScheduleConfig::default(),
+        now_ns() as i64,
+        pps_initial,
+    );
+
     spawner.spawn(pps_task(capture).unwrap());
     spawner.spawn(nmea_task(uart_rx).unwrap());
     spawner.spawn(ntp_task(tx).unwrap());
+    spawner.spawn(pps_out_task(pps_out, pps_schedule).unwrap());
     // Debug only: a unicast exchange carried over the probe, so a real client can be measured
     // against a link that cannot receive. See `swd_rx`.
     #[cfg(feature = "swd-rx")]

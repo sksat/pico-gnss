@@ -1,0 +1,302 @@
+//! The other board in the pair: take the time off the link and put it on a pin.
+//!
+//! ```text
+//!   Pico1 GP16 (TX-) ──► GP18  PIO0 SM0 + DMA ──► frame ──► NTP ──┐
+//!   Pico1 GP17 (TX+) ──► GP19                                     │
+//!                                                                 ▼
+//!                                                          NtpDiscipline
+//!                                                                 │
+//!                                          PIO1 SM0 ──► GP6 (1PPS out)
+//! ```
+//!
+//! There is no receiver here and no crystal worth the name. Everything this board knows about the
+//! time arrives over two wires, and the 1PPS on GP6 is the whole of what it has to say back — it is
+//! the only output an oscilloscope can compare against the server's own, and against the GPS
+//! receiver that both of them ultimately come from.
+//!
+//! **The output edge is computed, not measured.** See [`rp_pps::PpsSchedule`]: the edges follow from
+//! the period words, so nothing on this board watches GP6. That leaves one constant unknown, the
+//! local timestamp of the moment the state machine was enabled, and no way to see it from in here.
+//! It is a fixed offset on the output, and the scope is what it is for.
+
+#![no_std]
+#![no_main]
+
+use core::cell::RefCell;
+
+use defmt::{info, warn};
+use embassy_executor::Spawner;
+use embassy_rp::bind_interrupts;
+use embassy_rp::clocks::clk_sys_freq;
+use embassy_rp::peripherals::{PIO0, PIO1};
+use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_time::{Duration, Instant, Timer};
+
+use pico_10base_t::embassy::Rx10BaseT;
+use pico_10base_t::frame::parse_udp_frame;
+use pico_10base_t::rx::decode_frame;
+use rp_pps::embassy::PpsOutput;
+use rp_pps::{PpsSchedule, PpsScheduleConfig, output_high_cycles, output_period_cycles};
+use tiny_ntp::client::accept_broadcast;
+use tiny_ntp::discipline::{DisciplineConfig, NtpDiscipline};
+use tiny_ntp::packet::NtpPacket;
+
+use defmt_rtt as _;
+use panic_probe as _;
+
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
+    PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>;
+});
+
+/// Words per capture. A 94-byte frame is 1638 symbols with its preamble and TP_IDL, and at two
+/// samples each that is 205 words; the rest is idle and the decoder ignores it.
+const CAPTURE_WORDS: usize = 256;
+
+/// How long one capture covers. The state machine starts on the first bit of the frame and takes a
+/// fixed number of samples, so the DMA finishes exactly this long after that bit arrived — which is
+/// how a receive timestamp is recovered from a completion that happens well after the fact.
+const CAPTURE_NS: i64 = (CAPTURE_WORDS as i64) * 16 * 25;
+
+/// Room for the largest frame this link carries.
+const MAX_FRAME: usize = 256;
+
+/// The port the server announces on. It has a build-time override for the same reason the server
+/// does — a high port can be listened to without root — and the two have to agree, so they are set
+/// the same way.
+///
+/// ```sh
+/// NTP_DST_PORT=10123 cargo build --release --bin ntp_client
+/// ```
+const NTP_PORT: u16 = match option_env!("NTP_DST_PORT") {
+    Some(s) => parse_port(s),
+    None => 123,
+};
+
+/// Decimal `&str` to `u16` at compile time, so a typo fails the build rather than shipping a
+/// firmware that listens somewhere unintended.
+const fn parse_port(s: &str) -> u16 {
+    let bytes = s.as_bytes();
+    assert!(!bytes.is_empty(), "NTP_DST_PORT is empty");
+    let mut value: u32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let digit = bytes[i];
+        assert!(
+            digit >= b'0' && digit <= b'9',
+            "NTP_DST_PORT must be decimal"
+        );
+        value = value * 10 + (digit - b'0') as u32;
+        assert!(value <= u16::MAX as u32, "NTP_DST_PORT is out of range");
+        i += 1;
+    }
+    value as u16
+}
+
+/// Width of the 1PPS on GP6. The same 100 ms a GPS module emits, so the two traces on the scope are
+/// the same shape and the rising edges are what differ.
+const PPS_PULSE_NS: u32 = 100_000_000;
+
+/// How early the word for the *next* edge is pushed, measured against the edge before it.
+///
+/// The deadline is a second earlier than it looks. The state machine pulls a period three cycles
+/// before an edge, and what it pulls there is the length of the interval that *follows* — so the
+/// word positioning edge n+1 has to be in the FIFO before edge n, not before edge n+1. Pushing on
+/// the later deadline leaves the FIFO empty at every pull, and an empty `pull noblock` loads a spent
+/// counter rather than holding the last period: one ~34-second interval and the output is gone.
+const PUSH_LEAD_NS: i64 = 200_000_000;
+
+/// The estimate. The link task writes it, the 1PPS task reads it.
+static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<NtpDiscipline>> =
+    BlockingMutex::new(RefCell::new(NtpDiscipline::new(DisciplineConfig::DEFAULT)));
+
+/// `Instant` as nanoseconds. The resolution is a microsecond, which is the timer's, and at this
+/// stage it is also the floor on everything this board can know about when a packet arrived.
+fn now_ns() -> i64 {
+    Instant::now().as_micros() as i64 * 1000
+}
+
+/// Signed distance from `utc_ns` to the nearest second boundary: positive when it is past one.
+fn lateness_ns(utc_ns: i64) -> i64 {
+    let into = utc_ns.rem_euclid(1_000_000_000);
+    if into > 500_000_000 {
+        into - 1_000_000_000
+    } else {
+        into
+    }
+}
+
+/// Count a capture that went nowhere, and say so from time to time.
+///
+/// Every second brings another, so reporting each one would bury everything else; the count is what
+/// matters, and the reason is worth seeing occasionally.
+fn note(dropped: &mut u32, why: &str, seen: u32) {
+    *dropped = dropped.wrapping_add(1);
+    if *dropped <= 3 || *dropped % 64 == 0 {
+        warn!("capture {} dropped ({}), {} so far", seen, why, dropped);
+    }
+}
+
+/// Read the link, and hand every NTP packet on it to the estimate.
+#[embassy_executor::task]
+async fn link_task(mut rx: Rx10BaseT<'static, PIO0, 0>) {
+    let mut words = [0u32; CAPTURE_WORDS];
+    let mut frame = [0u8; MAX_FRAME];
+    let mut seen: u32 = 0;
+    let mut used: u32 = 0;
+    let mut dropped: u32 = 0;
+
+    loop {
+        rx.capture(&mut words).await;
+        // The capture began on the frame's first bit and ran for a fixed span, so that bit is one
+        // capture behind the completion. This is the receive timestamp, and on a link two boards
+        // long the propagation from the far pad to this one is nanoseconds.
+        let arrived_ns = now_ns() - CAPTURE_NS;
+        seen = seen.wrapping_add(1);
+
+        let Some(len) = decode_frame(&words, &mut frame) else {
+            note(&mut dropped, "no frame", seen);
+            continue;
+        };
+        let Some(datagram) = parse_udp_frame(&frame[..len]) else {
+            note(&mut dropped, "not a UDP datagram", seen);
+            continue;
+        };
+        if datagram.dst_port != NTP_PORT {
+            note(&mut dropped, "wrong port", seen);
+            continue;
+        }
+        let Some(packet) = NtpPacket::decode(datagram.payload) else {
+            warn!("port {} but not an NTP packet", datagram.dst_port);
+            continue;
+        };
+
+        // The hint is only there to place the NTP era, which wraps in 2036; before the first
+        // measurement there is nothing to hint with, and zero puts it in the era that covers now.
+        let hint = CLOCK.lock(|c| c.borrow().utc_at(arrived_ns)).unwrap_or(0);
+        // Zero delay, and meant literally. The server timestamps the first bit as it goes on the
+        // wire and this board timestamps the same bit arriving, so there is no path left to halve.
+        let measurement = match accept_broadcast(&packet, hint, 0) {
+            Ok(m) => m,
+            Err(reason) => {
+                warn!("broadcast refused: {}", defmt::Debug2Format(&reason));
+                continue;
+            }
+        };
+
+        // `accept_broadcast` measured against the hint; what the estimate wants is against local.
+        let offset_ns = measurement.offset_ns + (hint - arrived_ns);
+        let update = CLOCK.lock(|c| c.borrow_mut().observe(arrived_ns, offset_ns));
+        used = used.wrapping_add(1);
+
+        if update.stepped || used % 16 == 0 {
+            info!(
+                "NTPRX seen={} used={} stratum={} step={} resid_ns={} offset_ns={} drift_ppb={}",
+                seen,
+                used,
+                measurement.stratum,
+                update.stepped,
+                update.residual_ns,
+                update.offset_ns,
+                update.drift_ppb
+            );
+        }
+    }
+}
+
+/// Keep GP6 on the second.
+#[embassy_executor::task]
+async fn pps_task(mut out: PpsOutput<'static, PIO1, 0>, mut schedule: PpsSchedule) {
+    let mut edges: u32 = 0;
+
+    loop {
+        // Wake in time to have the next word in the FIFO before the state machine reaches for it,
+        // which is one edge before the edge that word positions.
+        let push_at = schedule.edge_ns() - PUSH_LEAD_NS;
+        let now = now_ns();
+        if push_at > now {
+            Timer::after(Duration::from_micros(((push_at - now) / 1000) as u64)).await;
+        }
+
+        let predicted = schedule.predicted_edge_ns();
+        let state = CLOCK.lock(|c| {
+            let c = c.borrow();
+            c.utc_at(predicted)
+                .map(|utc| (lateness_ns(utc), c.drift_ppb() * 1000, c.locked()))
+        });
+
+        let step = match state {
+            // Nothing has arrived yet: free-run at the nominal second so the FIFO stays fed.
+            None => schedule.step(0, 0),
+            // Something has, but not enough of it to steer by.
+            Some((_, freq_mppb, false)) => schedule.step(freq_mppb, 0),
+            Some((late, freq_mppb, true)) => schedule.advance(freq_mppb, late),
+        };
+        if step.acquired {
+            info!("PPS placed, corr_ns={}", step.correction_ns);
+        }
+
+        if !out.set_period(step.period_word) {
+            // The output program does not hold the last period on an empty pull, so a dropped push
+            // is a dropped pulse rather than a glitch. Say so: it means this task ran late.
+            warn!("PPS push dropped, FIFO full");
+        }
+        edges = edges.wrapping_add(1);
+
+        if edges % 16 == 0 {
+            let late = CLOCK.lock(|c| c.borrow().utc_at(step.edge_ns).map(lateness_ns));
+            info!(
+                "PPS edges={} word={} corr_ns={} late_ns={}",
+                edges,
+                step.period_word,
+                step.correction_ns,
+                late.unwrap_or(0)
+            );
+        }
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
+    let clk = clk_sys_freq();
+    info!("ntp_client: link on GP18/GP19, 1PPS on GP6, clk {} Hz", clk);
+
+    // PIO0: the link. Nothing else goes on this block, so the capture is never held up.
+    let Pio {
+        mut common, sm0, ..
+    } = Pio::new(p.PIO0, Irqs);
+    let dma = embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs);
+    let rx = Rx10BaseT::new(&mut common, sm0, p.PIN_18, p.PIN_19, dma, clk);
+
+    // PIO1: the 1PPS. The enable is the schedule's one tie to local time, so it is timestamped as
+    // close to the call as this can be written.
+    let Pio {
+        common: mut pps_common,
+        sm0: pps_sm,
+        ..
+    } = Pio::new(p.PIO1, Irqs);
+    let high_cycles = output_high_cycles(clk, PPS_PULSE_NS);
+    let initial_period = output_period_cycles(clk, high_cycles);
+    let out = PpsOutput::new(
+        &mut pps_common,
+        pps_sm,
+        p.PIN_6,
+        high_cycles,
+        initial_period,
+    );
+    let enabled_ns = now_ns();
+    let schedule = PpsSchedule::at_enable(
+        clk,
+        high_cycles,
+        PpsScheduleConfig::default(),
+        enabled_ns,
+        initial_period,
+    );
+
+    spawner.spawn(link_task(rx).unwrap());
+    spawner.spawn(pps_task(out, schedule).unwrap());
+}

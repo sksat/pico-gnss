@@ -20,6 +20,11 @@ path = "src/main.rs"
 name = "link_rx"
 path = "src/bin/link_rx.rs"
 
+# The client side of the pair: takes the time off the link and puts it on GP6.
+[[bin]]
+name = "ntp_client"
+path = "src/bin/ntp_client.rs"
+
 # On-target transmit benchmark; not built by a normal build.
 # On hardware: cd pico-ntp && cargo run --release --features bench --bin bench_tx
 [[bin]]
