@@ -27,18 +27,23 @@ pub struct DisciplineConfig {
     pub lock_after: u32,
 }
 
+impl DisciplineConfig {
+    /// The default, as a constant, so an estimate can live in a `static`.
+    pub const DEFAULT: Self = Self {
+        step_threshold_ns: 10_000_000,
+        phase_gain_inv: 8,
+        freq_gain_inv: 64,
+        lock_after: 16,
+    };
+}
+
 impl Default for DisciplineConfig {
     /// Gains for a measurement every second or so, from a source whose noise is microseconds.
     ///
     /// The phase gain settles a step in about a minute; the frequency gain is eight times weaker,
     /// which keeps a single noisy measurement from being read as a rate change.
     fn default() -> Self {
-        Self {
-            step_threshold_ns: 10_000_000,
-            phase_gain_inv: 8,
-            freq_gain_inv: 64,
-            lock_after: 16,
-        }
+        Self::DEFAULT
     }
 }
 
@@ -68,7 +73,7 @@ pub struct NtpDiscipline {
 }
 
 impl NtpDiscipline {
-    pub fn new(cfg: DisciplineConfig) -> Self {
+    pub const fn new(cfg: DisciplineConfig) -> Self {
         Self {
             cfg,
             started: false,
