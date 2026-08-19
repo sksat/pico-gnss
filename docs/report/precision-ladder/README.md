@@ -1,7 +1,15 @@
 Raspberry Pi Pico に秋月の GNSS 受信モジュール [AE-GNSS-EXTANT](https://akizukidenshi.com/catalog/g/g113849/)(MediaTek MT3333、以下 GPS-R)を接続し、時刻同期の精度を詰めていく。GPS-R が 1 秒ごとに出す 1PPS に合わせて、Pico 側からも同期した 1PPS を出す GPSDO (GPS disciplined oscillator) を作っていく。
 
-1PPS は、立ち上がりエッジが UTC の秒境界を指す基準になる。ただしその精度は GPS-R ごとに違い、MT3333 のデータシートでは PPS の時刻精度は typical ±10 ns とされている。Pico 側をどれだけ詰めても、最後はこの ±10 ns が天井になる。この記録では、GPS-R の 1PPS に対して 100 ns 以内で合い続ける出力を目標にする。
+1PPS は 1 秒に 1 回パルスを出し、そのパルスの始まりが UTC の秒境界を指す。
 GPS-R からはこの 1PPS のほかに、時刻と測位を載せた NMEA 文字列も UART から出力される。
+
+パルスが high と low のどちらなのかは受信機と基板で決まる。この GPS-R は active low で、idle の high から 100 ms だけ low に落ちる。モジュールの出す 1PPS が基板の 74HC04 を 1 段通って反転するためで、取扱説明書にも「1PPS 出力 : C-MOS ロジック (3.3V) レベル, パルス幅 :100mS (アクティブ Low)」とある。秒境界を指すのはパルスの始まり、つまり**立ち下がり**で、立ち上がりはその 100 ms 後に来るパルスの終わりでしかない。
+
+![active high と active low で、秒境界を指すエッジが入れ替わる](../pps-nmea-pairing/fig-polarity.svg)
+
+当初この記録は立ち上がりを秒境界として書いていた。それが誤りだと分かったのは、外部の NTP client にこの時計を読ませたら 100 ms 遅れていたときで、パルス幅を `PMTK285` で 200 ms に変えると遅れも 196 ms へ追随した。以下の位相の測定はすべて 2 つの立ち上がりエッジどうしの相対量なので、数値そのものは変わらない。変わるのは基準の位置で、ここでエッジと呼ぶものは秒境界より 100 ms 遅い。
+
+精度は GPS-R ごとに違い、MT3333 のデータシートでは PPS の時刻精度は typical ±10 ns とされている。Pico 側をどれだけ詰めても、最後はこの ±10 ns が天井になる。この記録では、GPS-R の 1PPS に対して 100 ns 以内で合い続ける出力を目標にする。
 
 今回の構成は以下の通り。GPS-R の PPS と UART を Pico の GPIO で受け、別の GPIO から GPSDO PPS を出力する。
 

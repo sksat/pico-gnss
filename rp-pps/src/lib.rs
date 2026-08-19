@@ -70,6 +70,83 @@ pub const CAPTURE_CYCLES_PER_TICK: u32 = 2;
 /// a change can't silently desync it.
 pub const OUTPUT_OVERHEAD_CYCLES: u32 = 7;
 
+/// Which level a receiver's 1PPS asserts, and therefore which edge marks the second.
+///
+/// [`pps_capture_program`] watches for a **rising** edge, so a receiver that idles high and pulses
+/// low has to have its pin inverted on the way into PIO. Without that the capture lands on the
+/// *end* of the pulse — one pulse width past the second, typically 100 ms — and nothing downstream
+/// can tell, because every interval is still exactly one second and the output still locks to the
+/// input within nanoseconds. Only a comparison against an outside clock shows it.
+///
+/// Do not assume it. The AE-GNSS-EXTANT board this project is built around documents
+/// `1PPS 出力 : C-MOS ロジック (3.3V) レベル, パルス幅 :100mS (アクティブ Low)`, while the MediaTek
+/// software specifications underneath it describe the pulse against its *rising* edge and state no
+/// polarity anywhere. Either document alone leads to the wrong answer; the pin settles it, and
+/// [`PolarityProbe`] is how to ask.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PpsPolarity {
+    /// Idle low, pulses high. The rising edge marks the second, which is what the capture program
+    /// already looks for.
+    #[default]
+    ActiveHigh,
+    /// Idle high, pulses low. The falling edge marks the second, so the input has to be inverted.
+    ActiveLow,
+}
+
+/// Decide a [`PpsPolarity`] by counting how much of a second the pin spends high.
+///
+/// A 1PPS is one short excursion per second, so the level held for most of the second is the idle
+/// level and the short one is the pulse. Feed samples taken at a steady rate over more than a full
+/// second — both levels have to appear or there is nothing to compare.
+///
+/// Measured rather than configured because the pulse width is often settable at runtime (MediaTek's
+/// `PMTK285`, for one) and such settings can outlive a power cycle. A build-time constant would be
+/// a claim about a device's current configuration, which is not a thing a build can know.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct PolarityProbe {
+    high: u32,
+    total: u32,
+}
+
+impl PolarityProbe {
+    pub const fn new() -> Self {
+        Self { high: 0, total: 0 }
+    }
+
+    /// Record one reading of the pin.
+    pub fn sample(&mut self, pin_high: bool) {
+        self.total = self.total.saturating_add(1);
+        if pin_high {
+            self.high = self.high.saturating_add(1);
+        }
+    }
+
+    /// How many samples have been taken.
+    pub fn samples(&self) -> u32 {
+        self.total
+    }
+
+    /// Fraction of samples that were high, in percent. `None` before any sample.
+    pub fn duty_percent(&self) -> Option<u32> {
+        (self.total != 0).then(|| self.high * 100 / self.total)
+    }
+
+    /// The polarity these samples imply, or `None` before any sample.
+    ///
+    /// Majority high means the pulse is the low excursion. A pin sitting at one level for the whole
+    /// window — a receiver with no fix, or no receiver at all — reports that level's polarity, so
+    /// the caller has to know the pulse is present before believing this.
+    pub fn polarity(&self) -> Option<PpsPolarity> {
+        self.duty_percent().map(|pct| {
+            if pct > 50 {
+                PpsPolarity::ActiveLow
+            } else {
+                PpsPolarity::ActiveHigh
+            }
+        })
+    }
+}
+
 /// PPS **input-capture** program for one state machine.
 ///
 /// A free-running down-counter lives in scratch `X`. On the configured `jmp pin`'s rising edge the
@@ -535,6 +612,91 @@ pub trait PpsSteer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One second of samples at `step_ms`, high for `high_ms` of it.
+    fn probe_pulse(high_ms: u32, step_ms: u32) -> PolarityProbe {
+        let mut probe = PolarityProbe::new();
+        for t in (0..1000).step_by(step_ms as usize) {
+            probe.sample(t < high_ms);
+        }
+        probe
+    }
+
+    #[test]
+    fn a_short_high_pulse_is_active_high() {
+        // The shape the capture program already expects: idle low, 100 ms high.
+        let probe = probe_pulse(100, 1);
+        assert_eq!(probe.polarity(), Some(PpsPolarity::ActiveHigh));
+        assert_eq!(probe.duty_percent(), Some(10));
+    }
+
+    #[test]
+    fn a_short_low_pulse_is_active_low() {
+        // The AE-GNSS-EXTANT board: idle high, 100 ms low. Reading this as active-high puts the
+        // capture on the end of the pulse, 100 ms past the second.
+        let probe = probe_pulse(900, 1);
+        assert_eq!(probe.polarity(), Some(PpsPolarity::ActiveLow));
+        assert_eq!(probe.duty_percent(), Some(90));
+    }
+
+    #[test]
+    fn a_wide_pulse_is_still_decided_by_which_excursion_is_shorter() {
+        // PMTK285 can widen the pulse. 400 ms high is still the short excursion, so still the mark.
+        assert_eq!(
+            probe_pulse(400, 1).polarity(),
+            Some(PpsPolarity::ActiveHigh)
+        );
+        // ...and 600 ms high means the 400 ms low is the pulse.
+        assert_eq!(probe_pulse(600, 1).polarity(), Some(PpsPolarity::ActiveLow));
+    }
+
+    #[test]
+    fn a_coarse_sampler_still_gets_the_answer() {
+        // The probe runs on whatever the caller can afford. At 20 ms steps a 100 ms pulse is only
+        // five samples, and the decision still has to come out right.
+        assert_eq!(
+            probe_pulse(100, 20).polarity(),
+            Some(PpsPolarity::ActiveHigh)
+        );
+        assert_eq!(
+            probe_pulse(900, 20).polarity(),
+            Some(PpsPolarity::ActiveLow)
+        );
+    }
+
+    #[test]
+    fn a_pin_that_never_moves_reports_its_level() {
+        // No fix, no receiver, or a disconnected pin. There is no pulse to find, so the answer
+        // describes the level rather than a 1PPS — the caller has to know a pulse is present.
+        let mut stuck_high = PolarityProbe::new();
+        let mut stuck_low = PolarityProbe::new();
+        for _ in 0..100 {
+            stuck_high.sample(true);
+            stuck_low.sample(false);
+        }
+        assert_eq!(stuck_high.polarity(), Some(PpsPolarity::ActiveLow));
+        assert_eq!(stuck_low.polarity(), Some(PpsPolarity::ActiveHigh));
+    }
+
+    #[test]
+    fn nothing_is_claimed_before_the_first_sample() {
+        let probe = PolarityProbe::new();
+        assert_eq!(probe.polarity(), None);
+        assert_eq!(probe.duty_percent(), None);
+        assert_eq!(probe.samples(), 0);
+    }
+
+    #[test]
+    fn a_long_run_does_not_overflow_the_counters() {
+        // Sampling for hours must not wrap into a wrong answer.
+        let mut probe = PolarityProbe::new();
+        probe.high = u32::MAX - 1;
+        probe.total = u32::MAX - 1;
+        for _ in 0..8 {
+            probe.sample(true);
+        }
+        assert_eq!(probe.samples(), u32::MAX);
+    }
 
     // Guard the program shapes: CAPTURE_CYCLES_PER_TICK / OUTPUT_OVERHEAD_CYCLES are tied to these
     // exact instruction sequences, so a change must update both the program and the constant.
