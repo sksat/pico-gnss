@@ -29,11 +29,19 @@ jobs:
       # sudo resets the environment, so DEBIAN_FRONTEND set on the command line does not reach
       # debconf, and the install sits waiting for input until the job's six-hour limit.
       - name: Install tshark
+        env:
+          # sudo は環境を捨てるので、`sudo VAR=v` ではなく step の env + `sudo -E` で渡す。
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
+          # wireshark-common の postinst は「非 root にキャプチャを許すか」を聞く。先に答えておく。
           echo 'wireshark-common wireshark-common/install-setuid boolean false' \
             | sudo debconf-set-selections
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark
+          # 待たされるところは全部上限を切る。ロック待ちも apt 自身に諦めさせる。
+          # 一度これで 16 分無言のまま止まり、job の上限で落ちるまで何も分からなかった。
+          sudo -E timeout 300 apt-get -o DPkg::Lock::Timeout=120 update
+          sudo -E timeout 420 apt-get -o DPkg::Lock::Timeout=120 install -y \
+            --no-install-recommends tshark
+          # 入ったことを確かめる。tshark が無いとテストは自分を skip するので、失敗が pass に見える。
           tshark --version | head -1
           command -v text2pcap
       - run: cargo fmt -p gnssdo --check
