@@ -21,6 +21,7 @@
 pub mod embassy;
 pub mod frame;
 pub mod phy;
+pub mod rx;
 
 pub use frame::{Ipv4Addr, MacAddr, UdpFrameSpec, build_udp_frame};
 pub use phy::{NLP_WORD, TP_IDL_WORD, encode_frame, encoded_words, manchester_word};
