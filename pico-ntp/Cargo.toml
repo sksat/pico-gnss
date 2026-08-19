@@ -15,6 +15,11 @@ default-run = "pico-ntp"
 name = "pico-ntp"
 path = "src/main.rs"
 
+# The other board in the pair: reads the link and reports what arrived.
+[[bin]]
+name = "link_rx"
+path = "src/bin/link_rx.rs"
+
 # On-target transmit benchmark; not built by a normal build.
 # On hardware: cd pico-ntp && cargo run --release --features bench --bin bench_tx
 [[bin]]

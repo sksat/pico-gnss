@@ -71,26 +71,33 @@ pub const fn pio_clock_divider_bits(clk_hz: u32) -> u32 {
     (((clk_hz as u64) << 8) / PIO_CLOCK_HZ as u64) as u32
 }
 
-/// PIO clock for the deserialiser: **two** instructions per 50 ns half-bit.
+/// PIO clock for the deserialiser: **four** instructions per 50 ns symbol.
 ///
 /// The serialiser gets away with one instruction per symbol because `.wrap` costs nothing. A
 /// receiver has to count, and a counter in the sampling loop would stretch every sixteenth symbol
-/// by a cycle — a 6% rate error, which drifts a whole symbol inside one frame. Running at twice the
-/// symbol rate buys the second instruction for free: `in` and `jmp x--` together take exactly one
-/// symbol period.
-pub const RX_PIO_CLOCK_HZ: u32 = 2 * PIO_CLOCK_HZ;
+/// by a cycle — a 6% rate error, which drifts a whole symbol inside one frame. So the sampling loop
+/// is two instructions, `in` and `jmp x--`.
+///
+/// Two of those loops per symbol, not one. One sample per symbol has to land inside the symbol, and
+/// nothing puts it there: the two crystals are unrelated, so the `wait` that starts the capture
+/// resolves at an arbitrary point on the sampling grid, and the sample lands anywhere in the second
+/// half of the symbol including exactly on the boundary. Sampling twice as often does not need the
+/// phase to be right — the two sample points are half a symbol apart, so their distances to the
+/// nearest boundary sum to half a symbol, and at least one of them is 12.5 ns clear of it.
+/// [`crate::rx::decode_frame`] picks that one by which decodes.
+pub const RX_PIO_CLOCK_HZ: u32 = 4 * PIO_CLOCK_HZ;
 
 /// System clock to deserialiser PIO clock divider, in the hardware's 8-fractional-bit form.
 ///
-/// At the usual 125 MHz this is exactly 3.125, so the sampling period is exactly 25 ns.
+/// At the usual 125 MHz this is exactly 1.5625, so the sampling period is exactly 12.5 ns.
 pub const fn rx_pio_clock_divider_bits(clk_hz: u32) -> u32 {
     (((clk_hz as u64) << 8) / RX_PIO_CLOCK_HZ as u64) as u32
 }
 
 /// The 10BASE-T deserialiser, as a HAL-agnostic [`pio::Program`].
 ///
-/// Waits for the line to leave idle, then samples the pair once per symbol for as many symbols as
-/// the caller asked for, and starts waiting again.
+/// Waits for the line to leave idle, then samples the pair [`crate::rx::OVERSAMPLE`] times per
+/// symbol for as many samples as the caller asked for, and starts waiting again.
 ///
 /// # Backend setup contract
 ///
@@ -98,9 +105,9 @@ pub const fn rx_pio_clock_divider_bits(clk_hz: u32) -> u32 {
 ///   side-set wrote. `wait 1 pin 0` therefore triggers on TX-, which is the half the preamble's
 ///   first bit raises.
 /// - Clock: [`RX_PIO_CLOCK_HZ`].
-/// - ISR: shift **right**, autopush at 32 bits, so the first symbol sampled ends up in the low two
+/// - ISR: shift **right**, autopush at 32 bits, so the first sample taken ends up in the low two
 ///   bits, which is where [`crate::rx::symbols_of`] looks for it.
-/// - The caller pushes one word before each capture: the number of symbols to take, minus one.
+/// - The caller pushes one word before each capture: the number of samples to take, minus one.
 pub fn des_10base_t_program() -> pio::Program<32> {
     pio::pio_asm!(
         ".wrap_target",
@@ -374,11 +381,11 @@ mod tests {
     }
 
     #[test]
-    fn the_deserialiser_samples_at_twice_the_symbol_rate() {
-        // One symbol is 50 ns. Two instructions have to fit inside it, so the clock is 40 MHz and
-        // at 125 MHz the divider is exactly 3.125 - no fractional residue to drift on.
-        assert_eq!(RX_PIO_CLOCK_HZ, 40_000_000);
-        assert_eq!(rx_pio_clock_divider_bits(125_000_000), 3 * 256 + 32);
+    fn the_deserialiser_takes_two_samples_per_symbol() {
+        // One symbol is 50 ns and holds two two-instruction sampling loops, so the clock is 80 MHz
+        // and at 125 MHz the divider is exactly 1.5625 - no fractional residue to drift on.
+        assert_eq!(RX_PIO_CLOCK_HZ, 80_000_000);
+        assert_eq!(rx_pio_clock_divider_bits(125_000_000), 256 + 144);
     }
 
     #[test]

@@ -157,8 +157,10 @@ impl<'d, PIO: Instance, const SM: usize> Rx10BaseT<'d, PIO, SM> {
             direction: ShiftDirection::Right,
             auto_fill: true,
         };
-        // Nothing is ever transmitted on this state machine, so give the TX FIFO's depth to RX.
-        cfg.fifo_join = FifoJoin::RxOnly;
+        // Both FIFOs stay. Giving the TX depth to RX looks free — this state machine transmits
+        // nothing — but the program takes its symbol count through `pull`, and joining leaves no
+        // TX FIFO for that to come from. It blocks there forever, and the capture never starts.
+        cfg.fifo_join = FifoJoin::Duplex;
         cfg.clock_divider = FixedU32::<U8>::from_bits(rx_pio_clock_divider_bits(clk_hz));
         sm.set_config(&cfg);
         sm.set_enable(true);
@@ -180,12 +182,13 @@ impl<'d, PIO: Instance, const SM: usize> Rx10BaseT<'d, PIO, SM> {
     /// Returns once the DMA has the whole buffer. There is no timeout: a link with nothing on it
     /// never leaves idle, so a caller that needs one has to impose it.
     pub async fn capture(&mut self, words: &mut [u32]) {
-        // The program takes a symbol count, minus one, before each capture.
-        let symbols = (words.len() * SYMBOLS_PER_WORD) as u32;
-        self.sm.tx().push(symbols - 1);
+        // The program takes a sample count, minus one, before each capture.
+        let samples = (words.len() * SAMPLES_PER_WORD) as u32;
+        self.sm.tx().push(samples - 1);
         self.sm.rx().dma_pull(&mut self.dma, words, false).await;
     }
 }
 
-/// Symbols in one 32-bit word: 2 bits each.
-const SYMBOLS_PER_WORD: usize = 16;
+/// Line samples in one 32-bit word: 2 bits each. At [`crate::rx::OVERSAMPLE`] samples per symbol
+/// this is eight symbols' worth.
+const SAMPLES_PER_WORD: usize = 16;

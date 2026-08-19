@@ -11,6 +11,7 @@
 //! is a few nanoseconds against a 50 ns symbol — far from enough to slip. Alignment comes from the
 //! frame itself: the first non-idle symbol after silence is the first half of the first bit.
 
+use crate::frame::crc32;
 use crate::phy::{SYMBOL_HIGH, SYMBOL_IDLE, SYMBOL_LOW};
 
 /// Start of Frame Delimiter. The preamble alternates; this is where it stops.
@@ -158,10 +159,72 @@ pub fn symbols_of(word: u32) -> [u32; 16] {
     out
 }
 
+/// Samples the deserialiser takes per symbol on the line.
+pub const OVERSAMPLE: usize = 2;
+
+/// Decode one capture into `out`, and say how many bytes the frame carried.
+///
+/// A capture holds two samples per symbol and does not say which of them is the one inside the
+/// symbol — see [`crate::phy::RX_PIO_CLOCK_HZ`] for why nothing can. Both are tried, and the FCS
+/// decides: a frame read at the wrong phase does not survive its own checksum. The returned length
+/// covers the frame without the four FCS bytes, which have already been checked.
+pub fn decode_frame(words: &[u32], out: &mut [u8]) -> Option<usize> {
+    let mut phase = 0;
+    while phase < OVERSAMPLE {
+        if let Some(len) = decode_at_phase(words, phase, out) {
+            return Some(len);
+        }
+        phase += 1;
+    }
+    None
+}
+
+/// Read the capture taking every [`OVERSAMPLE`]th sample from `phase`, and return the frame if the
+/// bytes that came out check against the FCS they carry.
+fn decode_at_phase(words: &[u32], phase: usize, out: &mut [u8]) -> Option<usize> {
+    let mut decoder = FrameDecoder::new();
+    let mut len = 0usize;
+    let mut ended = false;
+    let mut index = 0usize;
+    'capture: for word in words {
+        for symbol in symbols_of(*word) {
+            let mine = index % OVERSAMPLE == phase;
+            index += 1;
+            if !mine {
+                continue;
+            }
+            match decoder.push(symbol) {
+                RxEvent::Byte(byte) => {
+                    if len == out.len() {
+                        return None;
+                    }
+                    out[len] = byte;
+                    len += 1;
+                }
+                RxEvent::End => {
+                    ended = true;
+                    break 'capture;
+                }
+                RxEvent::Start | RxEvent::Nothing => {}
+            }
+        }
+    }
+    // Four bytes of FCS and something for it to cover.
+    if !ended || len < 5 {
+        return None;
+    }
+    let split = len - 4;
+    let carried = u32::from_le_bytes([out[split], out[split + 1], out[split + 2], out[split + 3]]);
+    if crc32(&out[..split]) != carried {
+        return None;
+    }
+    Some(split)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{MacAddr, UdpFrameSpec, build_udp_frame, crc32};
+    use crate::frame::{MacAddr, UdpFrameSpec, build_udp_frame};
     use crate::phy::{encode_frame, encoded_words};
 
     /// The largest frame these tests build, and the symbols it turns into.
@@ -209,6 +272,80 @@ mod tests {
         let len = build_udp_frame(&spec, frame).expect("frame fits");
         let words = encode_frame(&frame[..len], symbols).expect("encodes");
         (len, words)
+    }
+
+    /// Expand an encoded stream into what the deserialiser captures: two samples per symbol,
+    /// with the first `offset` of them already gone.
+    ///
+    /// `offset` is the sampling phase the hardware happened to land on. It is not a choice, and the
+    /// receiver cannot see which one it got.
+    fn oversample(words: &[u32], offset: usize, out: &mut [u32]) -> usize {
+        let mut count = 0;
+        let mut word = 0u32;
+        let mut held = 0;
+        let mut index = 0;
+        for w in words {
+            for symbol in symbols_of(*w) {
+                for _ in 0..OVERSAMPLE {
+                    if index >= offset {
+                        word |= symbol << (2 * held);
+                        held += 1;
+                        if held == 16 {
+                            out[count] = word;
+                            count += 1;
+                            word = 0;
+                            held = 0;
+                        }
+                    }
+                    index += 1;
+                }
+            }
+        }
+        if held > 0 {
+            out[count] = word;
+            count += 1;
+        }
+        count
+    }
+
+    #[test]
+    fn a_frame_decodes_whichever_sampling_phase_the_capture_landed_on() {
+        let mut frame = [0u8; MAX_FRAME];
+        let mut symbols = [0u32; MAX_WORDS];
+        let (len, words) = ntp_sized(&mut frame, &mut symbols);
+
+        for offset in 0..OVERSAMPLE {
+            let mut capture = [0u32; MAX_WORDS * OVERSAMPLE + 2];
+            let taken = oversample(&symbols[..words], offset, &mut capture);
+            let mut out = [0u8; MAX_FRAME];
+            let got = decode_frame(&capture[..taken], &mut out)
+                .unwrap_or_else(|| panic!("phase {offset} did not decode"));
+            // The FCS is checked and dropped, so what comes back is the frame that was built.
+            assert_eq!(got, len - 4, "phase {offset} length");
+            assert_eq!(&out[..got], &frame[..len - 4], "phase {offset} bytes");
+        }
+    }
+
+    #[test]
+    fn a_capture_of_nothing_but_idle_decodes_to_nothing() {
+        let capture = [0u32; 32];
+        let mut out = [0u8; MAX_FRAME];
+        assert_eq!(decode_frame(&capture, &mut out), None);
+    }
+
+    #[test]
+    fn a_capture_with_a_flipped_bit_is_refused() {
+        let mut frame = [0u8; MAX_FRAME];
+        let mut symbols = [0u32; MAX_WORDS];
+        let (_, words) = ntp_sized(&mut frame, &mut symbols);
+        let mut capture = [0u32; MAX_WORDS * OVERSAMPLE + 2];
+        let taken = oversample(&symbols[..words], 0, &mut capture);
+        // Swap one symbol pair in the middle of the frame: the length still works out, and only
+        // the FCS says the bits did not survive.
+        capture[60] ^= 0b11 << 8;
+        capture[60] ^= 0b11 << 10;
+        let mut out = [0u8; MAX_FRAME];
+        assert_eq!(decode_frame(&capture[..taken], &mut out), None);
     }
 
     #[test]
