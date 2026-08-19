@@ -36,6 +36,7 @@
 #![no_std]
 
 pub mod client;
+pub mod discipline;
 pub mod packet;
 pub mod server;
 pub mod timestamp;
