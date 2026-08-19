@@ -27,6 +27,50 @@ fn have(tool: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Reduce an absolute-time field to one spelling.
+///
+/// Wireshark renders these differently across releases: 4.2 prints
+/// `Aug 18, 2026 02:42:47.000000000 UTC`, 4.7 prints ISO 8601. The assertions below are about the
+/// instant Wireshark resolved, not about which release the runner installed.
+fn canonical_utc(field: &str) -> String {
+    let Some(rest) = field.strip_suffix(" UTC") else {
+        return field.to_string();
+    };
+    // "Aug 18, 2026 02:42:47.000000000" — the day is space-padded when it is a single digit.
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    assert_eq!(f.len(), 4, "unexpected time layout from tshark: {field}");
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS
+        .iter()
+        .position(|m| *m == f[0])
+        .unwrap_or_else(|| panic!("unknown month in {field}"))
+        + 1;
+    let day: u32 = f[1]
+        .trim_end_matches(',')
+        .parse()
+        .unwrap_or_else(|_| panic!("unparsable day in {field}"));
+    format!("{}-{month:02}-{day:02}T{}Z", f[2], f[3])
+}
+
+#[test]
+fn both_wireshark_spellings_reduce_to_the_same_instant() {
+    assert_eq!(
+        canonical_utc("Aug 18, 2026 02:42:47.000000000 UTC"),
+        "2026-08-18T02:42:47.000000000Z"
+    );
+    // The single-digit day is padded, so splitting on a single space would mis-parse it.
+    assert_eq!(
+        canonical_utc("Jan  1, 2040 00:00:00.000000000 UTC"),
+        "2040-01-01T00:00:00.000000000Z"
+    );
+    assert_eq!(
+        canonical_utc("2040-01-01T00:00:00.000000000Z"),
+        "2040-01-01T00:00:00.000000000Z"
+    );
+}
+
 /// Format the 48 bytes the way `text2pcap` wants: an offset column, then hex octets.
 fn hexdump(bytes: &[u8]) -> String {
     let mut s = String::new();
@@ -139,11 +183,13 @@ fn wireshark_reads_back_every_field_we_wrote() {
     assert_eq!(got[7], "47505300", "refid is ASCII \"GPS\\0\"");
     // The one that catches a wrong prime-epoch offset or byte order.
     assert_eq!(
-        got[8], "2026-08-18T02:42:47.000000000Z",
+        canonical_utc(&got[8]),
+        "2026-08-18T02:42:47.000000000Z",
         "reference timestamp"
     );
     assert_eq!(
-        got[9], "2026-08-18T02:42:47.500000000Z",
+        canonical_utc(&got[9]),
+        "2026-08-18T02:42:47.500000000Z",
         "transmit timestamp"
     );
 }
@@ -167,5 +213,5 @@ fn wireshark_agrees_on_a_post_2036_timestamp() {
 
     let packet = stratum1_broadcast(UNIX_2040, UNIX_2040);
     let got = dissect(&packet, &["ntp.xmt"], "era1");
-    assert_eq!(got[0], "2040-01-01T00:00:00.000000000Z");
+    assert_eq!(canonical_utc(&got[0]), "2040-01-01T00:00:00.000000000Z");
 }
