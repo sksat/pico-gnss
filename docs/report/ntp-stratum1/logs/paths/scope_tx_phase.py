@@ -4,7 +4,7 @@
 # ///
 """GPS-R の 1PPS から、NTP フレームが線に出るまでを測る (Rigol DHO800, SCPI over LAN)。
 
-    RIGOL_HOST=<ip> uv run docs/report/ntp-broadcast/logs/paths/scope_tx_phase.py [N] [out.log]
+    RIGOL_HOST=<ip> uv run docs/report/ntp-stratum1/logs/paths/scope_tx_phase.py [N] [out.log]
 
     CH1 = GPS-R の 1PPS。この基板はアクティブ Low なので、秒境界は**立ち下がり**である。
     CH2 = Pico の GP17 (10BASE-T の TX+)。アイドルは 0 V で、16 ms ごとのリンクパルスと、

@@ -41,6 +41,7 @@ use embassy_time::Timer;
 
 use tiny_ntp::packet::{NtpPacket, PACKET_LEN};
 use tiny_ntp::server::{ServeDecision, respond};
+use tiny_ntp::timestamp::NtpTimestamp;
 
 /// How often to look at the doorbell. A client polls every few seconds at the fastest, so this only
 /// has to be short against the round trip the host is willing to see.
@@ -112,9 +113,11 @@ pub async fn swd_rx_task() {
                 (None, u32::MAX)
             }
             Some(request) => {
-                let xmit = crate::clock_state().0.unwrap_or(recv_unix_ns);
-                match respond(&crate::CFG, &state, &request, recv_unix_ns, xmit) {
-                    ServeDecision::Serve(p) => (Some((p, xmit)), 0),
+                // Provisional: the packet is built now, but what it will say about its own
+                // transmit time is written below, after the building is done.
+                let provisional = crate::clock_state().0.unwrap_or(recv_unix_ns);
+                match respond(&crate::CFG, &state, &request, recv_unix_ns, provisional) {
+                    ServeDecision::Serve(p) => (Some(p), 0),
                     ServeDecision::Silent(reason) => {
                         warn!("SWD RX: silent — {}", defmt::Debug2Format(&reason));
                         (None, reason as u32 + 1)
@@ -124,8 +127,15 @@ pub async fn swd_rx_task() {
         };
 
         let xmit_unix_ns = match reply {
-            Some((packet, xmit)) => {
-                let bytes = packet.encode();
+            Some(packet) => {
+                let mut bytes = packet.encode();
+                // T3 is what the client subtracts to take our own work out of the round trip, so
+                // it has to be read after that work rather than before it. Reading it up front put
+                // `respond`, the encode and 48 volatile writes inside the delay the client
+                // measures, which inflates that delay and drags its offset with it.
+                let xmit = crate::clock_state().0.unwrap_or(recv_unix_ns);
+                bytes[40..48]
+                    .copy_from_slice(&NtpTimestamp::from_unix_ns(xmit).to_bits().to_be_bytes());
                 for (i, b) in bytes.iter().enumerate() {
                     unsafe { addr_of_mut!(NTP_SWD_MAILBOX.reply[i]).write_volatile(*b) };
                 }

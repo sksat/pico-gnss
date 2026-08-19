@@ -2,12 +2,12 @@
 # requires-python = ">=3.11"
 # dependencies = ["matplotlib"]
 # ///
-"""レポート `docs/report/ntp-swd-unicast/` の図を作る。
+"""レポート `docs/report/ntp-stratum1/` の図を作る。
 
-    uv run docs/report/ntp-swd-unicast/logs/unicast/plot_unicast.py
+    uv run docs/report/ntp-stratum1/logs/unicast/plot_unicast.py
 
 生データは repo top の `logs/20260819-ntp-unicast/` から読む (コミットしない)。
-出力は `docs/report/ntp-swd-unicast/` 直下の PNG。
+出力は `docs/report/ntp-stratum1/` 直下の PNG。
 
 図中のラベルは英語にしてある。日本語フォントが入っていない環境で豆腐になるのを避けるため。
 """

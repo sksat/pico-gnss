@@ -103,8 +103,15 @@ def main() -> int:
                         iface = socket.if_indextoname(index)
                     except OSError:
                         iface = f"if{index}"
-            if recv_ns is None:  # kernel timestamp unavailable; say so rather than fake it
-                recv_ns = time.time_ns()
+            if recv_ns is None:
+                # userspace の時刻で埋めない。この docstring が書いているとおり、そこで乗る遅れは
+                # 測りたい量より大きい。埋めると統計は同じ形で出てくるので、汚染に気付けない。
+                print(
+                    "SO_TIMESTAMPNS の ancillary data が返らない。"
+                    "userspace の時刻で代用すると測定にならないので中止する。",
+                    file=sys.stderr,
+                )
+                return 1
 
             if len(data) < 48:
                 continue

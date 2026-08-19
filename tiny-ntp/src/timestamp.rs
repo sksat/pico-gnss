@@ -79,13 +79,20 @@ impl NtpTimestamp {
     /// Wire timestamp → Unix ns, given the era it belongs to. Saturates rather than overflowing for
     /// eras far beyond what `i64` nanoseconds can express (year ≈2262).
     pub const fn to_unix_ns_in_era(self, era: i64) -> i64 {
-        let ntp_full = era * ERA_SECS + self.secs as i64;
-        let unix_secs = ntp_full - NTP_UNIX_OFFSET_SECS as i64;
+        // In i128 throughout. `era` is whatever the caller passes, and `era * ERA_SECS` leaves i64
+        // above about 2.1e9 — before any of the saturating steps below get a chance to run.
+        let ntp_full = era as i128 * ERA_SECS as i128 + self.secs as i128;
+        let unix_secs = ntp_full - NTP_UNIX_OFFSET_SECS as i128;
         // Round to nearest ns. `frac * 1e9` stays inside u64 for any u32 fraction.
         let nanos = ((self.frac as u64) * NANOS_PER_SEC as u64 + (1 << 31)) >> 32;
-        unix_secs
-            .saturating_mul(NANOS_PER_SEC)
-            .saturating_add(nanos as i64)
+        let total = unix_secs * NANOS_PER_SEC as i128 + nanos as i128;
+        if total > i64::MAX as i128 {
+            i64::MAX
+        } else if total < i64::MIN as i128 {
+            i64::MIN
+        } else {
+            total as i64
+        }
     }
 
     /// Wire timestamp → Unix ns, resolving the era to whichever one puts the result closest to
@@ -163,6 +170,16 @@ mod tests {
     use super::*;
 
     // --- NtpTimestamp: 32.32 seconds since 1900-01-01T00:00:00Z ---
+
+    #[test]
+    fn a_far_future_era_saturates_instead_of_overflowing() {
+        // `era` is a caller-supplied i64 and the doc promises saturation. The seconds arithmetic
+        // that comes first has to hold that promise too: `era * ERA_SECS` leaves i64 above about
+        // 2.1e9, which panics in debug and wraps in release.
+        let t = NtpTimestamp::from_bits(0x0000_0001_0000_0000);
+        assert_eq!(t.to_unix_ns_in_era(i64::MAX), i64::MAX);
+        assert_eq!(t.to_unix_ns_in_era(i64::MIN), i64::MIN);
+    }
 
     #[test]
     fn unix_epoch_is_the_ntp_prime_epoch_offset() {

@@ -208,6 +208,14 @@ fn duty(pin: u32, seconds: f64) -> Result<()> {
         }
         last = Some(is_high);
     }
+    // The run still open when sampling stopped never went through the branch above. If it is the
+    // longest one — or if the pin never changed at all — leaving it out reports a shorter
+    // excursion than was seen, which is the number used to tell the pulse from the idle level.
+    match last {
+        Some(true) => run_high = run_high.max(run),
+        Some(false) => run_low = run_low.max(run),
+        None => {}
+    }
 
     let elapsed = started.elapsed().as_secs_f64();
     let per_sample_ms = elapsed / total as f64 * 1000.0;

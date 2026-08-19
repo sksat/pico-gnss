@@ -4,7 +4,7 @@
 # ///
 """受信側ホストの時計が、外の基準からどれだけ離れているかを測る。
 
-    uv run docs/report/ntp-broadcast/logs/paths/check_host_clock.py [--server ntp.nict.jp] [--count 20]
+    uv run docs/report/ntp-stratum1/logs/paths/check_host_clock.py [--server ntp.nict.jp] [--count 20]
 
 このレポートの `−3816 µs` は、動かないスキューと片道の経路遅延とホスト時計の誤差の合計である。
 3 つのうちホスト時計だけは、外の基準と往復すれば分けられる。unicast の往復なので RFC 5905 §8 の

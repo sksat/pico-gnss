@@ -63,6 +63,9 @@ jobs:
       - run: cargo test -p rp-pps --features gnssdo
       - run: cargo test -p tiny-ntp
       - run: cargo test -p pico-10base-t
+      # The host-side bridge is not a default member either. It is debug-only, but it is what the
+      # unicast measurements went through, so a break in it is a break in the evidence.
+      - run: cargo clippy -p swd-ntp-bridge --all-targets -- -D warnings
 
   embedded:
     name: embedded (thumbv6m-none-eabi)
@@ -93,6 +96,15 @@ jobs:
       - run: cargo clippy -p rp-pps --features rp2040-hal --target thumbv6m-none-eabi -- -D warnings
       # pico-10base-t's embassy-rp backend needs both a target and a chip feature.
       - run: cargo clippy -p pico-10base-t --features embassy-rp,embassy-rp/rp2040 --target thumbv6m-none-eabi -- -D warnings
+      # pico-ntp is not a default member and carries its own target config, so it needs a check of
+      # its own. Without one, the firmware this repo serves NTP from never compiles in CI.
+      # `--bins --all-features` also covers the bench binary and the swd-rx debug path, which are
+      # exactly the parts nothing else builds. Not `--all-targets`: that asks for test harnesses,
+      # and a no_std binary has no `test` crate to link against.
+      - run: cargo check
+        working-directory: pico-ntp
+      - run: cargo check --bins --all-features
+        working-directory: pico-ntp
 
   publish-dry-run:
     name: publish --dry-run

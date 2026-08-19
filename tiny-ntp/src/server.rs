@@ -107,6 +107,10 @@ pub enum SilentReason {
     NotARequest,
     /// A client asked in a version this crate does not speak.
     UnsupportedVersion,
+    /// The upstream we follow reports stratum 0, which RFC 5905 §7.3 gives as "unspecified or
+    /// invalid" and which a kiss-o'-death carries. One more than that is 1, so following it would
+    /// announce us as a primary server while our reference identifier names an address.
+    UpstreamUnsynchronised,
 }
 
 /// Whether to transmit, and what.
@@ -160,6 +164,9 @@ fn gate(cfg: &ServerConfig, state: &ClockState) -> Result<i64, SilentReason> {
     if state.holdover_ns > cfg.max_holdover_ns {
         return Err(SilentReason::HoldoverExceeded);
     }
+    if let Source::Upstream { stratum: 0, .. } = cfg.source {
+        return Err(SilentReason::UpstreamUnsynchronised);
+    }
     if stratum(&cfg.source) >= MAX_STRATUM {
         return Err(SilentReason::TooDeep);
     }
@@ -205,12 +212,18 @@ fn base_packet(cfg: &ServerConfig, state: &ClockState, last_update: i64) -> NtpP
             ..
         } => (
             address,
+            // Only a delay that is actually a delay adds distance. `client::measure` can report a
+            // negative one when asymmetry dominates the four timestamps, and a distance cannot be
+            // negative.
+            NtpShort::from_nanos(root_delay.to_nanos().saturating_add(delay_ns.max(0) as u64)),
+            // That negative magnitude is not nothing — it says the hop is measured badly. RFC 5905
+            // §11.2 keeps what is not known in dispersion, so it goes here instead.
             NtpShort::from_nanos(
-                root_delay
+                root_dispersion
                     .to_nanos()
-                    .saturating_add(delay_ns.unsigned_abs()),
+                    .saturating_add(own_dispersion)
+                    .saturating_add(delay_ns.min(0).unsigned_abs()),
             ),
-            NtpShort::from_nanos(root_dispersion.to_nanos().saturating_add(own_dispersion)),
         ),
     };
     NtpPacket {
@@ -604,6 +617,50 @@ mod tests {
             },
             ..cfg()
         }
+    }
+
+    #[test]
+    fn a_negative_hop_delay_becomes_uncertainty_not_distance() {
+        // `client::measure` can report a negative round-trip delay when asymmetry dominates the
+        // four timestamps. A distance cannot be negative, and taking its magnitude would claim we
+        // are that much further from the root than we are. It is uncertainty, so it belongs in
+        // dispersion, which is where RFC 5905 §11.2 keeps what is not known.
+        let with_hop = served(broadcast(
+            &secondary(2, -4_000_000, 1_000_000, 2_000_000),
+            &disciplined(),
+            REF_UNIX_NS,
+        ));
+        let without = served(broadcast(
+            &secondary(2, 0, 1_000_000, 2_000_000),
+            &disciplined(),
+            REF_UNIX_NS,
+        ));
+        assert_eq!(
+            with_hop.root_delay, without.root_delay,
+            "a negative hop must not add distance"
+        );
+        // 16.16 quantises at 1/65536 s, so allow one step either way.
+        let grew = with_hop.root_dispersion.to_nanos() - without.root_dispersion.to_nanos();
+        assert!(
+            grew.abs_diff(4_000_000) <= 15_259,
+            "its magnitude has to show up as dispersion instead, grew by {grew} ns"
+        );
+    }
+
+    #[test]
+    fn an_upstream_that_is_itself_unsynchronised_is_not_followed() {
+        // RFC 5905 §7.3: stratum 0 is "unspecified or invalid", and it is what a kiss-o'-death
+        // carries. Adding one to it would make us claim stratum 1 — a primary server — while
+        // naming an IPv4 address as our reference. Refuse instead.
+        let cfg = secondary(0, 0, 0, 0);
+        assert_eq!(
+            silent_reason(&cfg, &disciplined()),
+            Some(SilentReason::UpstreamUnsynchronised)
+        );
+        assert!(matches!(
+            broadcast(&cfg, &disciplined(), REF_UNIX_NS),
+            ServeDecision::Silent(SilentReason::UpstreamUnsynchronised)
+        ));
     }
 
     #[test]

@@ -115,14 +115,19 @@ async fn main(_spawner: Spawner) {
         let t1 = Instant::now();
         for _ in 0..ITERS {
             tx.send(&symbols[..words]).await;
+            // IEEE 802.3 wants 96 bit times between frames. `send` returns once the DMA is queued
+            // and the only separator the symbol stream carries is the 800 ns TP_IDL word, so
+            // without this the loop puts frames on the pair closer together than the standard
+            // allows — and then reports a rate no compliant transmitter could reach.
+            Timer::after_nanos(IFG_LEN as u64 * 8 * 100).await;
         }
         let send_ns = t1.elapsed().as_micros() * 1000 / ITERS as u64;
 
         // Wire occupancy of the frame itself: 100 ns per bit at 10 Mbit/s.
         let wire_ns = (frame_len_n + PREAMBLE_LEN) as u64 * 8 * 100;
-        // What a caller gets back-to-back: payload bits over the whole cycle, and the interframe
-        // gap is unavoidable even if the CPU were infinitely fast.
-        let cycle_ns = prepare_ns + send_ns + (IFG_LEN as u64 * 8 * 100);
+        // What a caller gets back-to-back: payload bits over the whole cycle. The interframe gap
+        // is already inside `send_ns`, since the loop above waits it out.
+        let cycle_ns = prepare_ns + send_ns;
         let eff_kbps = (n as u64 * 8 * 1_000_000) / cycle_ns.max(1);
 
         info!(

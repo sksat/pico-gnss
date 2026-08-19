@@ -2,16 +2,16 @@
 # requires-python = ">=3.11"
 # dependencies = ["matplotlib"]
 # ///
-"""レポート `docs/report/ntp-broadcast/` の図と数値を作る。
+"""レポート `docs/report/ntp-stratum1/` の図と数値を作る。
 
-    uv run docs/report/ntp-broadcast/logs/paths/plot_paths.py
+    uv run docs/report/ntp-stratum1/logs/paths/plot_paths.py
 
 生データは repo top の `logs/20260819-ntp-wired/` から読む (コミットしない)。
 
     paths.log      受信側。scripts/ntp_broadcast_listen.py の 1 行ずつの出力
     rtt-10123.log  送信側。probe 経由の firmware ログ
 
-出力は `docs/report/ntp-broadcast/` 直下の PNG。図中のラベルは英語にしてある。日本語フォントが
+出力は `docs/report/ntp-stratum1/` 直下の PNG。図中のラベルは英語にしてある。日本語フォントが
 入っていない環境で豆腐になるのを避けるため。
 
 本文の数値はここが出したものだけを使う。図の注釈も同じ計算から取るので、片方だけ古くならない。
