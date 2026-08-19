@@ -241,6 +241,62 @@ pub fn zero_x_instruction() -> u16 {
     pio::pio_asm!("mov x, null").program.code[0]
 }
 
+/// Cycles a capture costs [`event_capture_program`], as a whole number of ticks.
+///
+/// The counter cannot decrement while it is pushing, so every capture loses time. This program is
+/// padded so that what it loses is exactly two ticks, which is a number the caller can add back —
+/// see [`crate::TickTimeline::with_toll`].
+pub const EVENT_CAPTURE_TOLL_TICKS: u64 = 2;
+
+/// Blanking counts for a line that stays busy for `ns` after its first edge.
+///
+/// The blanking counter runs at the same rate as the timestamp counter, one count per
+/// [`CAPTURE_CYCLES_PER_TICK`] cycles.
+pub fn event_blank_counts(ns: u32, clk_hz: u32) -> u32 {
+    (ns as u64 * clk_hz as u64 / (CAPTURE_CYCLES_PER_TICK as u64 * 1_000_000_000)) as u32
+}
+
+/// **Event timestamp** program: a free-running counter that captures the first edge of a burst.
+///
+/// [`pps_capture_program`] captures every rising edge, which is right for a 1PPS and wrong for a
+/// wire. Its capture path does not decrement the counter, so a pin that rises once a second costs
+/// it 16 ns a second and a pin carrying 10 Mbit/s costs it hundreds of edges per frame — measured
+/// at 32 µs a second on a link with two frames on it, which is not a timebase at all.
+///
+/// This captures once and then stops looking for as long as the caller says, while still counting.
+/// A frame's first bit is timestamped; the eight hundred edges behind it are not. What a capture
+/// still costs is fixed and known: [`EVENT_CAPTURE_TOLL_TICKS`], the same for every capture, which
+/// is what makes it something the caller can add back rather than something that accumulates.
+///
+/// **Backend setup contract**: configure the watched pin as the SM's `jmp` pin. Push the blanking
+/// length ([`event_blank_counts`]) once before enabling; the program keeps it in the OSR and
+/// reloads `Y` from there at every capture, so nothing has to be pushed again.
+///
+/// **FIFO contract**: one 32-bit counter value per burst. The value counts *down*; feed consecutive
+/// values to [`crate::TickTimeline`].
+pub fn event_capture_program() -> Program<32> {
+    pio::pio_asm!(
+        "    pull block", // OSR = blanking length; kept, never re-pulled
+        ".wrap_target",
+        "low:",
+        "    jmp pin capture", // pin high → first edge of a burst
+        "    jmp x-- low",     // X--; two cycles per tick
+        "    jmp low",         // X wrapped: keep going, and pay the same toll as the blank loop
+        "capture:",
+        "    in x, 32",
+        "    push noblock",
+        "    mov y, osr", // Y = blanking length
+        "    nop",        // pads the capture to exactly EVENT_CAPTURE_TOLL_TICKS
+        "blank:",
+        "    jmp x-- blank1", // X keeps counting through the blanking
+        "    jmp blank1",     // X wrapped: same toll as the low loop
+        "blank1:",
+        "    jmp y-- blank", // Y-- ; falls through when the line has had long enough
+        ".wrap",
+    )
+    .program
+}
+
 /// Steerable **1PPS output** program for one state machine, with a configurable high-pulse width.
 ///
 /// Once at start it pulls a *high-width word* and stashes it in `ISR` (the high pulse length in PIO
@@ -668,6 +724,37 @@ mod tests {
             probe.sample(t < high_ms);
         }
         probe
+    }
+
+
+    #[test]
+    fn the_event_program_pays_a_whole_number_of_ticks_per_capture() {
+        // The capture path is `in`, `push`, `mov` and a `nop`: four cycles in which the counter
+        // does not decrement. At two cycles to the tick that is exactly two ticks, which is a
+        // number the caller can add back. Three would not be.
+        let p = event_capture_program();
+        assert_eq!(
+            EVENT_CAPTURE_TOLL_TICKS * CAPTURE_CYCLES_PER_TICK as u64,
+            4,
+            "the capture path is four cycles"
+        );
+        assert_eq!(p.code.len(), 11, "pull, three for the low loop, four for the capture, three for the blank");
+    }
+
+    #[test]
+    fn the_event_program_starts_counting_after_the_pull() {
+        // The blanking length is pulled once. Wrapping back to it would block forever on the
+        // second burst, so the wrap target has to be past it.
+        let p = event_capture_program();
+        assert_eq!(p.wrap.target, 1, "wrap past the pull");
+        assert_eq!(p.wrap.source as usize, p.code.len() - 1);
+    }
+
+    #[test]
+    fn blanking_is_counted_at_the_tick_rate() {
+        // 90 us covers a 94-byte frame and the gap after it.
+        assert_eq!(event_blank_counts(90_000, 125_000_000), 5_625);
+        assert_eq!(event_blank_counts(16, 125_000_000), 1);
     }
 
     #[test]

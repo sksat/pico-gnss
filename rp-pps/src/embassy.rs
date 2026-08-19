@@ -135,6 +135,15 @@ impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
         1 << SM
     }
 
+    /// Hand [`crate::event_capture_program`] its blanking length, before starting.
+    ///
+    /// That program's first instruction is a blocking `pull`, so a state machine that is started
+    /// without this never reaches its counting loop — and a counter that is not counting is not
+    /// silent, it is wrong. Returns whether the word was taken.
+    pub fn arm(&mut self, blank_counts: u32) -> bool {
+        self.sm.tx().try_push(blank_counts)
+    }
+
     /// The oldest counter value waiting, if any.
     pub fn try_read(&mut self) -> Option<u32> {
         self.sm.rx().try_pull()
@@ -190,27 +199,6 @@ impl<'d, PIO: Instance, const SM: usize> PpsCapture<'d, PIO, SM> {
         let mut capture = Self::new_stopped(common, sm, pps_pin, program);
         capture.sm.set_enable(true);
         capture
-    }
-
-    /// Like [`PpsCapture::new_with_program`], but leaves the state machine stopped.
-    ///
-    /// For a set of counters that will be compared: configure them all, then bring them up with
-    /// one [`start_in_sync`]. A capture enabled on its own is a capture whose counter has no fixed
-    /// relationship to any other.
-    pub fn new_stopped(
-        common: &mut Common<'d, PIO>,
-        mut sm: StateMachine<'d, PIO, SM>,
-        pps_pin: Peri<'d, impl PioPin>,
-        program: &pio::Program<32>,
-    ) -> Self {
-        let prog = common.load_program(program);
-        let pin = common.make_pio_pin(pps_pin);
-        sm.set_pin_dirs(Direction::In, &[&pin]);
-        let mut cfg = Config::default();
-        cfg.use_program(&prog, &[]);
-        cfg.set_jmp_pin(&pin);
-        sm.set_config(&cfg);
-        Self { sm, prog, pin }
     }
 
     /// This capture's bit in its PIO's `CTRL` register, for [`start_in_sync`].

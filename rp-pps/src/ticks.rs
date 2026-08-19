@@ -27,14 +27,27 @@ pub struct TickTimeline {
     last_raw: u32,
     /// Ticks since the first observation.
     ticks: u64,
+    /// Ticks the counter loses each time it captures, added back on every observation.
+    ///
+    /// A counter cannot decrement while it is pushing. For a 1PPS that is one capture a second and
+    /// the loss is beneath notice; for a program that captures a burst it is still one per burst,
+    /// but there is no reason to leave it in when it is a known constant.
+    toll: u64,
 }
 
 impl TickTimeline {
     pub const fn new() -> Self {
+        Self::with_toll(0)
+    }
+
+    /// A timeline whose counter loses `toll` ticks at every capture — see
+    /// [`crate::EVENT_CAPTURE_TOLL_TICKS`].
+    pub const fn with_toll(toll: u64) -> Self {
         Self {
             started: false,
             last_raw: 0,
             ticks: 0,
+            toll,
         }
     }
 
@@ -52,7 +65,7 @@ impl TickTimeline {
         // The counter runs down, so time elapsed is how far it fell. Wrapping subtraction is what
         // carries that across the 2³² boundary, and it is why the caller has to come back inside
         // half a wrap: past that, falling a long way and rising a short way look the same.
-        self.ticks += self.last_raw.wrapping_sub(raw) as u64;
+        self.ticks += self.last_raw.wrapping_sub(raw) as u64 + self.toll;
         self.last_raw = raw;
         self.ticks
     }
@@ -103,6 +116,25 @@ mod tests {
         t.observe(1_000_000);
         assert_eq!(t.observe(999_000), 1_000);
         assert_eq!(t.observe(998_500), 1_500);
+    }
+
+
+    #[test]
+    fn a_counter_that_stops_to_capture_has_the_difference_added_back() {
+        // Two ticks per capture, and one capture between each pair of observations.
+        let mut t = TickTimeline::with_toll(2);
+        t.observe(1_000_000);
+        assert_eq!(t.observe(999_000), 1_002);
+        assert_eq!(t.observe(998_000), 2_004);
+    }
+
+    #[test]
+    fn a_toll_of_zero_is_the_plain_timeline() {
+        let mut a = TickTimeline::new();
+        let mut b = TickTimeline::with_toll(0);
+        a.observe(500);
+        b.observe(500);
+        assert_eq!(a.observe(400), b.observe(400));
     }
 
     #[test]

@@ -45,8 +45,11 @@ use pico_10base_t::frame::{
 };
 use pico_10base_t::phy::{encode_frame, encoded_words};
 use pico_10base_t::rx::{decode_frame, symbols_of};
-use rp_pps::embassy::PpsOutput;
-use rp_pps::{PpsSchedule, PpsScheduleConfig, output_high_cycles, output_period_cycles};
+use rp_pps::embassy::{EventCapture, PpsOutput, start_in_sync};
+use rp_pps::{
+    EVENT_CAPTURE_TOLL_TICKS, PpsSchedule, PpsScheduleConfig, TickTimeline, event_blank_counts,
+    event_capture_program, output_high_cycles, output_period_cycles, ticks_to_ns,
+};
 use tiny_ntp::client::{accept_broadcast, measure, request};
 use tiny_ntp::discipline::{DisciplineConfig, NtpDiscipline};
 use tiny_ntp::packet::{Mode, NtpPacket, PACKET_LEN};
@@ -175,6 +178,26 @@ const REQ_SYMBOL_WORDS: usize = encoded_words(REQ_FRAME_LEN);
 static OUTSTANDING: BlockingMutex<CriticalSectionRawMutex, RefCell<Option<NtpPacket>>> =
     BlockingMutex::new(RefCell::new(None));
 
+/// The pins the two monitors watch: what we send on, and what arrives.
+const EGRESS_GPIO: u8 = 16;
+const ARRIVAL_GPIO: u8 = 18;
+
+/// A frame's first bit, timestamped by the state machine that watches the pin.
+///
+/// Not by software. The counter is running before the bit arrives and is read out afterwards, so
+/// nothing between the pad and here is on the path — no DMA completion, no interrupt, no executor.
+/// What it costs is that it is a *tick* count with no origin, so it is only ever useful as a
+/// difference, and it has to be fed often enough to stay ahead of the counter's wrap.
+static ARRIVAL: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
+    BlockingMutex::new(RefCell::new(TickTimeline::with_toll(EVENT_CAPTURE_TOLL_TICKS)));
+
+/// How long the line stays busy after a frame's first bit.
+///
+/// A 94-byte frame is 81.6 µs on the wire and the gap after it is another 9.6 µs. The monitor
+/// stops looking for this long, so it timestamps the frame's first bit and not the eight hundred
+/// edges behind it.
+const FRAME_BLANK_NS: u32 = 95_000;
+
 /// The estimate. The link task writes it, the 1PPS task reads it.
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<NtpDiscipline>> =
     BlockingMutex::new(RefCell::new(NtpDiscipline::new(DisciplineConfig::DEFAULT)));
@@ -232,21 +255,31 @@ fn note(dropped: &mut u32, why: &str, seen: u32) {
 
 /// Read the link, and hand every NTP packet on it to the estimate.
 #[embassy_executor::task]
-async fn link_task(mut rx: Rx10BaseT<'static, PIO0, 0>) {
+async fn link_task(
+    mut rx: Rx10BaseT<'static, PIO0, 0>,
+    mut arrival: EventCapture<'static, PIO0, 2>,
+) {
     let mut words = [0u32; CAPTURE_WORDS];
     let mut frame = [0u8; MAX_FRAME];
     let mut seen: u32 = 0;
     let mut used: u32 = 0;
     let mut dropped: u32 = 0;
     let mut broadcasts: u32 = 0;
+    // The counter has no origin, so the first difference between the two clocks is
+    // whatever it is. What matters is what it does after that.
+    let mut hw_gap_base: Option<i64> = None;
 
     loop {
         rx.capture(&mut words).await;
-        // The capture began on the frame's first bit and ran for a fixed span, so that bit is one
-        // capture behind the completion - less what it took to get from the completion to here.
-        // On a link two boards long the propagation from the far pad to this one is nanoseconds,
-        // and the software between the two is not.
+        // Two arrival times for the same frame. The software one works backwards from the DMA
+        // completion through two constants; the hardware one is a counter value taken at the pad by
+        // a state machine that was already running. The first value the monitor queued is the first
+        // rising edge of the preamble - the frame's first bit - and everything after it is the rest
+        // of the frame, which is why the rest is thrown away.
         let arrived_ns = now_ns() - CAPTURE_NS - RX_LAG_NS;
+        let hw_raw = arrival.try_read();
+        let surplus = arrival.drain();
+        let hw_ticks = hw_raw.map(|raw| ARRIVAL.lock(|a| a.borrow_mut().observe(raw)));
         seen = seen.wrapping_add(1);
 
         // How much of the capture the frame actually took. A 94-byte frame is 1638 symbols with
@@ -339,6 +372,26 @@ async fn link_task(mut rx: Rx10BaseT<'static, PIO0, 0>) {
         let update = CLOCK.lock(|c| c.borrow_mut().observe(arrived_ns, offset_ns));
         used = used.wrapping_add(1);
 
+        if let Some(ticks) = hw_ticks {
+            // Two clocks for the same event. The counter has no origin, so their difference has an
+            // arbitrary constant in it - but only a constant, and what it *does* over time is the
+            // software receive path moving. That is the thing `RX_LAG_NS` stands in for as though
+            // it did not move.
+            let gap_ns = arrived_ns - ticks_to_ns(ticks, 125_000_000) as i64;
+            let base = *hw_gap_base.get_or_insert(gap_ns);
+            if used.is_multiple_of(16) {
+                info!(
+                    "HWRX ticks={=u64} sw-hw={} ns (drift {} ns) surplus={}",
+                    ticks,
+                    gap_ns,
+                    gap_ns - base,
+                    surplus
+                );
+            }
+        } else if used.is_multiple_of(16) {
+            warn!("HWRX no hardware timestamp for this frame");
+        }
+
         if update.stepped || used.is_multiple_of(16) {
             info!(
                 "NTPRX seen={} used={} beacons={} stratum={} step={} delay_ns={} resid_ns={} offset_ns={} drift_ppb={}",
@@ -361,7 +414,10 @@ async fn link_task(mut rx: Rx10BaseT<'static, PIO0, 0>) {
 /// The transmit timestamp is the whole of the client's state for an exchange: the server echoes it
 /// back untouched and [`measure`] matches on it, so nothing else has to be remembered.
 #[embassy_executor::task]
-async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>) {
+async fn ask_task(
+    mut tx: Tx10BaseT<'static, PIO0, 1>,
+    mut egress: EventCapture<'static, PIO0, 3>,
+) {
     // A broadcast client listens and nothing else (RFC 5905 §9.1). With the questions still going
     // out, the clock would be disciplined from both sources and neither could be told apart.
     if cfg!(feature = "broadcast-client") {
@@ -414,13 +470,23 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>) {
             Timer::after(Duration::from_micros((slack_ns / 1000) as u64)).await;
         }
         OUTSTANDING.lock(|o| *o.borrow_mut() = Some(packet));
+        // Clear anything the monitor picked up while the line was otherwise busy, so the first
+        // value after the send is this frame's first bit and not something older.
+        egress.drain();
         tx.send(&symbols[..words]).await;
+        let sent_raw = egress.try_read();
+        egress.drain();
         asked = asked.wrapping_add(1);
 
         if asked <= 3 || asked.is_multiple_of(16) {
             info!(
-                "NTPREQ n={} departure_ns={} handover_ns={} slack_ns={} bytes={}",
-                asked, departure, handover_ns, slack_ns, len
+                "NTPREQ n={} departure_ns={} handover_ns={} slack_ns={} bytes={} hw_egress={}",
+                asked,
+                departure,
+                handover_ns,
+                slack_ns,
+                len,
+                sent_raw.is_some()
             );
         }
         if slack_ns <= 0 {
@@ -496,6 +562,8 @@ async fn main(spawner: Spawner) {
         mut common,
         sm0,
         sm1,
+        sm2,
+        sm3,
         ..
     } = Pio::new(p.PIO0, Irqs);
     let tx_dma = embassy_rp::dma::Channel::new(p.DMA_CH1, Irqs);
@@ -509,6 +577,36 @@ async fn main(spawner: Spawner) {
     );
     let dma = embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs);
     let rx = Rx10BaseT::new(&mut common, sm0, p.PIN_18, p.PIN_19, dma, clk);
+
+    // Two counters on the same block, watching the pins the link already uses. They claim nothing:
+    // the serialiser drives GP16 and the deserialiser reads GP18, and both stay theirs.
+    let counter = event_capture_program();
+    let mut arrival = EventCapture::<PIO0, 2>::new_stopped(
+        &mut common,
+        sm2,
+        embassy_rp::pac::PIO0,
+        ARRIVAL_GPIO,
+        &counter,
+    );
+    let mut egress = EventCapture::<PIO0, 3>::new_stopped(
+        &mut common,
+        sm3,
+        embassy_rp::pac::PIO0,
+        EGRESS_GPIO,
+        &counter,
+    );
+    // The program blocks on its first instruction until it has this, so arm before starting.
+    let blank = event_blank_counts(FRAME_BLANK_NS, clk);
+    arrival.arm(blank);
+    egress.arm(blank);
+    // One write, so the two counters are one timebase. Verified on the board: three of these
+    // watching the same edge report the same value for minutes across the counter's wrap.
+    start_in_sync(
+        embassy_rp::pac::PIO0,
+        EventCapture::<PIO0, 2>::sm_mask() | EventCapture::<PIO0, 3>::sm_mask(),
+    );
+    arrival.drain();
+    egress.drain();
 
     // PIO1: the 1PPS. The enable is the schedule's one tie to local time, so it is timestamped as
     // close to the call as this can be written.
@@ -546,8 +644,8 @@ async fn main(spawner: Spawner) {
     core::mem::forget(common);
     core::mem::forget(pps_common);
 
-    spawner.spawn(link_task(rx).unwrap());
-    spawner.spawn(ask_task(tx).unwrap());
+    spawner.spawn(link_task(rx, arrival).unwrap());
+    spawner.spawn(ask_task(tx, egress).unwrap());
     spawner.spawn(pps_task(out, schedule).unwrap());
     spawner.spawn(pin_watch_task().unwrap());
 }
