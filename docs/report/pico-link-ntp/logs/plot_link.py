@@ -54,16 +54,29 @@ def fig_broadcast_series():
     ax.axhline(0, color="0.6", lw=0.8)
     ax.plot(shots, server, ".-", ms=3, lw=0.8, label="Pico server GP6 (GNSS 直結)")
     ax.plot(shots, client, ".-", ms=3, lw=0.8, label="Pico client GP6 (リンク越しの NTP のみ)")
+    # 受信機を基準にした 2 本と、Pico client が Pico server をどれだけ再現したか。後者は同じ
+    # 取り込みから両方を読んだ差なので、Pico server 側の較正定数が乗っていない。
+    ax.plot(
+        shots,
+        client - server,
+        ".-",
+        ms=3,
+        lw=0.8,
+        color="0.35",
+        label="client − server (NTP が渡せた精度)",
+    )
     ax.set_xlabel("shot (約 1 shot / 5 秒)")
-    ax.set_ylabel("GPS-R の秒からのずれ (µs)")
+    ax.set_ylabel("ずれ (µs)")
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(alpha=0.3)
 
-    bins = np.linspace(
-        min(server.min(), client.min()), max(server.max(), client.max()), 24
-    )
+    diff = client - server
+    lo = min(server.min(), client.min(), diff.min())
+    hi = max(server.max(), client.max(), diff.max())
+    bins = np.linspace(lo, hi, 24)
     hx.hist(server, bins=bins, orientation="horizontal", alpha=0.6)
     hx.hist(client, bins=bins, orientation="horizontal", alpha=0.6)
+    hx.hist(diff, bins=bins, orientation="horizontal", alpha=0.6, color="0.35")
     hx.axhline(0, color="0.6", lw=0.8)
     hx.set_xlabel("count")
     hx.tick_params(labelleft=False)
@@ -72,7 +85,9 @@ def fig_broadcast_series():
     fig.suptitle(
         f"1PPS の位置 (n={len(server)})   "
         f"Pico server {server.mean():+.2f} µs (sd {server.std():.2f})   "
-        f"Pico client {client.mean():+.2f} µs (sd {client.std():.2f})",
+        f"Pico client {client.mean():+.2f} µs (sd {client.std():.2f})   "
+        f"client − server {(client - server).mean():+.2f} µs "
+        f"(sd {(client - server).std():.2f})",
         fontsize=10,
     )
     fig.tight_layout()
