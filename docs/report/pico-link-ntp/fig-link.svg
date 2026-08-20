@@ -3,7 +3,7 @@
 
   <!-- GNSS 受信機 -->
   <rect x="20" y="136" width="118" height="86" rx="5" fill="#f4f4f4" stroke="#333"/>
-  <text x="79" y="162" font-size="12.5" fill="#333" text-anchor="middle">GNSS 受信機</text>
+  <text x="79" y="162" font-size="15" font-weight="bold" fill="#222" text-anchor="middle">GNSS 受信機</text>
   <text x="130" y="186" font-size="10.5" fill="#333" text-anchor="end">NMEA</text>
   <text x="130" y="206" font-size="10.5" fill="#333" text-anchor="end">1PPS</text>
   <text x="79" y="242" font-size="10" fill="#666" text-anchor="middle">Pico server にだけ繋がる</text>
@@ -15,7 +15,7 @@
 
   <!-- Pico server -->
   <rect x="170" y="70" width="160" height="294" rx="5" fill="#f4f4f4" stroke="#333"/>
-  <text x="250" y="98" font-size="13" fill="#333" text-anchor="middle">Pico server</text>
+  <text x="250" y="98" font-size="15" font-weight="bold" fill="#222" text-anchor="middle">Pico server</text>
   <text x="250" y="116" font-size="10.5" fill="#666" text-anchor="middle">RP2040</text>
   <text x="250" y="134" font-size="10.5" fill="#666" text-anchor="middle">GPSDO + NTP server</text>
   <line x1="178" y1="150" x2="322" y2="150" stroke="#ccc" stroke-width="1"/>
@@ -30,7 +30,7 @@
 
   <!-- Pico client -->
   <rect x="590" y="70" width="180" height="294" rx="5" fill="#f4f4f4" stroke="#333"/>
-  <text x="680" y="98" font-size="13" fill="#333" text-anchor="middle">Pico client</text>
+  <text x="680" y="98" font-size="15" font-weight="bold" fill="#222" text-anchor="middle">Pico client</text>
   <text x="680" y="116" font-size="10.5" fill="#666" text-anchor="middle">RP2040</text>
   <text x="680" y="134" font-size="10.5" fill="#666" text-anchor="middle">NTP client (GNSS なし)</text>
   <line x1="598" y1="150" x2="762" y2="150" stroke="#ccc" stroke-width="1"/>
@@ -59,7 +59,7 @@
 
   <!-- オシロ -->
   <rect x="310" y="440" width="320" height="82" rx="5" fill="#fbfbfb" stroke="#333"/>
-  <text x="470" y="466" font-size="12.5" fill="#333" text-anchor="middle">オシロスコープ</text>
+  <text x="470" y="466" font-size="15" font-weight="bold" fill="#222" text-anchor="middle">オシロスコープ</text>
   <text x="470" y="486" font-size="10" fill="#666" text-anchor="middle">3 本を同じトリガで取り込む</text>
   <text x="470" y="502" font-size="10" fill="#666" text-anchor="middle">CH1 を基準にした差が、その板の時刻のずれ</text>
 
