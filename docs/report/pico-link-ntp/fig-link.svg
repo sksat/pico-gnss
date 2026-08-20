@@ -1,14 +1,17 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 545" width="800" height="545" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="RP2040 を 2 枚、各方向 2 本ずつの GPIO で直結する。Pico server の GP16 が Pico client の GP18 へ、GP17 が GP19 へ、Pico client の GP16 が Pico server の GP18 へ、GP17 が GP19 へ繋がる。GNSS 受信機は Pico server にだけ繋がり、受信機の 1PPS と両方の GP6 をオシロの 3 チャネルで見る">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 545" width="800" height="545" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="GNSS 受信機の NMEA が Pico server の GP1 へ、1PPS が GP2 へ入る。Pico server と Pico client は各方向 2 本ずつの GPIO で直結し、Pico server の GP16 が Pico client の GP18 へ、GP17 が GP19 へ、Pico client の GP16 が Pico server の GP18 へ、GP17 が GP19 へ繋がる。受信機の 1PPS と両方の GP6 をオシロの 3 チャネルで見る">
   <rect width="800" height="545" fill="#ffffff"/>
 
   <!-- GNSS 受信機 -->
-  <rect x="20" y="140" width="120" height="84" rx="5" fill="#f4f4f4" stroke="#333"/>
-  <text x="80" y="170" font-size="12.5" fill="#333" text-anchor="middle">GNSS 受信機</text>
-  <text x="80" y="190" font-size="10.5" fill="#666" text-anchor="middle">1PPS</text>
-  <text x="80" y="206" font-size="10.5" fill="#666" text-anchor="middle">NMEA</text>
-  <line x1="140" y1="182" x2="166" y2="182" stroke="#333" stroke-width="1.6"/>
+  <rect x="20" y="136" width="118" height="86" rx="5" fill="#f4f4f4" stroke="#333"/>
+  <text x="79" y="162" font-size="12.5" fill="#333" text-anchor="middle">GNSS 受信機</text>
+  <text x="130" y="186" font-size="10.5" fill="#333" text-anchor="end">NMEA</text>
+  <text x="130" y="206" font-size="10.5" fill="#333" text-anchor="end">1PPS</text>
+  <text x="79" y="242" font-size="10" fill="#666" text-anchor="middle">Pico server にだけ繋がる</text>
+
+  <line x1="138" y1="182" x2="166" y2="182" stroke="#333" stroke-width="1.6"/>
   <polygon points="170,182 162,178 162,186" fill="#333"/>
-  <text x="80" y="244" font-size="10" fill="#666" text-anchor="middle">Pico server にだけ繋がる</text>
+  <line x1="138" y1="202" x2="166" y2="202" stroke="#333" stroke-width="1.6"/>
+  <polygon points="170,202 162,198 162,206" fill="#333"/>
 
   <!-- Pico server -->
   <rect x="170" y="70" width="160" height="294" rx="5" fill="#f4f4f4" stroke="#333"/>
@@ -16,14 +19,14 @@
   <text x="250" y="116" font-size="10.5" fill="#666" text-anchor="middle">RP2040</text>
   <text x="250" y="134" font-size="10.5" fill="#666" text-anchor="middle">GPSDO + NTP server</text>
   <line x1="178" y1="150" x2="322" y2="150" stroke="#ccc" stroke-width="1"/>
-  <text x="322" y="176" font-size="10.5" fill="#333" text-anchor="end">1PPS → GP2</text>
-  <text x="322" y="196" font-size="10.5" fill="#333" text-anchor="end">NMEA → GP1</text>
-  <text x="322" y="228" font-size="10.5" fill="#333" text-anchor="end">GP16 (TX−)</text>
-  <text x="322" y="250" font-size="10.5" fill="#333" text-anchor="end">GP17 (TX+)</text>
-  <text x="322" y="282" font-size="10.5" fill="#333" text-anchor="end">GP18 (RX−)</text>
-  <text x="322" y="304" font-size="10.5" fill="#333" text-anchor="end">GP19 (RX+)</text>
-  <text x="322" y="334" font-size="10.5" fill="#333" text-anchor="end">GP6 → 1PPS</text>
-  <text x="322" y="350" font-size="9.5" fill="#999" text-anchor="end">GPS で規律した秒</text>
+  <text x="178" y="186" font-size="10.5" fill="#333" text-anchor="start">GP1 (UART RX)</text>
+  <text x="178" y="206" font-size="10.5" fill="#333" text-anchor="start">GP2</text>
+  <text x="322" y="232" font-size="10.5" fill="#333" text-anchor="end">GP16 (TX−)</text>
+  <text x="322" y="254" font-size="10.5" fill="#333" text-anchor="end">GP17 (TX+)</text>
+  <text x="322" y="286" font-size="10.5" fill="#333" text-anchor="end">GP18 (RX−)</text>
+  <text x="322" y="308" font-size="10.5" fill="#333" text-anchor="end">GP19 (RX+)</text>
+  <text x="322" y="338" font-size="10.5" fill="#333" text-anchor="end">GP6 → 1PPS</text>
+  <text x="322" y="354" font-size="9.5" fill="#999" text-anchor="end">GPS で規律した秒</text>
 
   <!-- Pico client -->
   <rect x="590" y="70" width="180" height="294" rx="5" fill="#f4f4f4" stroke="#333"/>
@@ -31,28 +34,28 @@
   <text x="680" y="116" font-size="10.5" fill="#666" text-anchor="middle">RP2040</text>
   <text x="680" y="134" font-size="10.5" fill="#666" text-anchor="middle">NTP client (GNSS なし)</text>
   <line x1="598" y1="150" x2="762" y2="150" stroke="#ccc" stroke-width="1"/>
-  <text x="598" y="228" font-size="10.5" fill="#333" text-anchor="start">GP18 (RX−)</text>
-  <text x="598" y="250" font-size="10.5" fill="#333" text-anchor="start">GP19 (RX+)</text>
-  <text x="598" y="282" font-size="10.5" fill="#333" text-anchor="start">GP16 (TX−)</text>
-  <text x="598" y="304" font-size="10.5" fill="#333" text-anchor="start">GP17 (TX+)</text>
-  <text x="598" y="334" font-size="10.5" fill="#333" text-anchor="start">GP6 → 1PPS</text>
-  <text x="598" y="350" font-size="9.5" fill="#999" text-anchor="start">NTP だけで作った秒</text>
+  <text x="598" y="232" font-size="10.5" fill="#333" text-anchor="start">GP18 (RX−)</text>
+  <text x="598" y="254" font-size="10.5" fill="#333" text-anchor="start">GP19 (RX+)</text>
+  <text x="598" y="286" font-size="10.5" fill="#333" text-anchor="start">GP16 (TX−)</text>
+  <text x="598" y="308" font-size="10.5" fill="#333" text-anchor="start">GP17 (TX+)</text>
+  <text x="598" y="338" font-size="10.5" fill="#333" text-anchor="start">GP6 → 1PPS</text>
+  <text x="598" y="354" font-size="9.5" fill="#999" text-anchor="start">NTP だけで作った秒</text>
 
   <!-- Pico server -> Pico client -->
-  <text x="460" y="214" font-size="10.5" fill="#1f77b4" text-anchor="middle">NTP の応答と broadcast</text>
-  <line x1="334" y1="224" x2="582" y2="224" stroke="#1f77b4" stroke-width="1.8"/>
-  <polygon points="586,224 578,220 578,228" fill="#1f77b4"/>
-  <line x1="334" y1="246" x2="582" y2="246" stroke="#1f77b4" stroke-width="1.8"/>
-  <polygon points="586,246 578,242 578,250" fill="#1f77b4"/>
+  <text x="460" y="218" font-size="10.5" fill="#1f77b4" text-anchor="middle">NTP の応答と broadcast</text>
+  <line x1="334" y1="228" x2="582" y2="228" stroke="#1f77b4" stroke-width="1.8"/>
+  <polygon points="586,228 578,224 578,232" fill="#1f77b4"/>
+  <line x1="334" y1="250" x2="582" y2="250" stroke="#1f77b4" stroke-width="1.8"/>
+  <polygon points="586,250 578,246 578,254" fill="#1f77b4"/>
 
-  <text x="460" y="266" font-size="10" fill="#666" text-anchor="middle">GND どうしも繋ぐ</text>
+  <text x="460" y="271" font-size="10" fill="#666" text-anchor="middle">GND どうしも繋ぐ</text>
 
   <!-- Pico client -> Pico server -->
-  <line x1="338" y1="278" x2="586" y2="278" stroke="#d62728" stroke-width="1.8"/>
-  <polygon points="334,278 342,274 342,282" fill="#d62728"/>
-  <line x1="338" y1="300" x2="586" y2="300" stroke="#d62728" stroke-width="1.8"/>
-  <polygon points="334,300 342,296 342,304" fill="#d62728"/>
-  <text x="460" y="320" font-size="10.5" fill="#d62728" text-anchor="middle">NTP の要求</text>
+  <line x1="338" y1="282" x2="586" y2="282" stroke="#d62728" stroke-width="1.8"/>
+  <polygon points="334,282 342,278 342,286" fill="#d62728"/>
+  <line x1="338" y1="304" x2="586" y2="304" stroke="#d62728" stroke-width="1.8"/>
+  <polygon points="334,304 342,300 342,308" fill="#d62728"/>
+  <text x="460" y="324" font-size="10.5" fill="#d62728" text-anchor="middle">NTP の要求</text>
 
   <!-- オシロ -->
   <rect x="310" y="440" width="320" height="82" rx="5" fill="#fbfbfb" stroke="#333"/>
@@ -60,9 +63,10 @@
   <text x="470" y="486" font-size="10" fill="#666" text-anchor="middle">3 本を同じトリガで取り込む</text>
   <text x="470" y="502" font-size="10" fill="#666" text-anchor="middle">CH1 を基準にした差が、その板の時刻のずれ</text>
 
-  <!-- CH1 -->
-  <path d="M80 224 L80 428 L360 428 L360 440" fill="none" stroke="#888" stroke-width="1.4" stroke-dasharray="4 3"/>
-  <text x="150" y="422" font-size="10" fill="#666" text-anchor="start">CH1: 受信機の 1PPS (基準)</text>
+  <!-- CH1: 受信機の 1PPS そのものを分岐させて見る -->
+  <circle cx="152" cy="202" r="2.6" fill="#333"/>
+  <path d="M152 202 L152 428 L360 428 L360 440" fill="none" stroke="#888" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text x="170" y="422" font-size="10" fill="#666" text-anchor="start">CH1: 受信機の 1PPS (基準)</text>
 
   <!-- CH3 -->
   <path d="M250 364 L250 390 L465 390 L465 440" fill="none" stroke="#888" stroke-width="1.4" stroke-dasharray="4 3"/>
