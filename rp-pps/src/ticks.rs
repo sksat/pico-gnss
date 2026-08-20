@@ -142,7 +142,6 @@ mod tests {
         assert_eq!(t.observe(998_500), 1_500);
     }
 
-
     #[test]
     fn a_counter_that_stops_to_capture_has_the_difference_added_back() {
         // Two ticks per capture, and one capture between each pair of observations.
@@ -182,7 +181,6 @@ mod tests {
             assert_eq!(ns, second * 1_000_000_000, "second {second}");
         }
     }
-
 
     #[test]
     fn two_counters_that_have_captured_equally_need_no_correction() {

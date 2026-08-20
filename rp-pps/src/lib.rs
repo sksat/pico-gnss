@@ -764,7 +764,6 @@ mod tests {
         probe
     }
 
-
     #[test]
     fn the_event_program_pays_a_whole_number_of_ticks_per_capture() {
         // The capture path is `in`, `push`, `mov` and a `nop`: four cycles in which the counter
@@ -776,7 +775,11 @@ mod tests {
             4,
             "the capture path is four cycles"
         );
-        assert_eq!(p.code.len(), 11, "pull, three for the low loop, four for the capture, three for the blank");
+        assert_eq!(
+            p.code.len(),
+            11,
+            "pull, three for the low loop, four for the capture, three for the blank"
+        );
     }
 
     #[test]

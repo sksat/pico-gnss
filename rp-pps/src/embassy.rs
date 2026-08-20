@@ -441,7 +441,6 @@ impl<'d, PIO: Instance, const SM: usize> TimedPpsCapture<'d, PIO, SM> {
     pub const fn sm_mask() -> u8 {
         1 << SM
     }
-
 }
 
 /// Steerable 1PPS output on one state machine (see [`crate::pps_output_program`]).
