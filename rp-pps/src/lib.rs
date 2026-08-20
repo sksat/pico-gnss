@@ -1050,7 +1050,10 @@ mod tests {
         let mut t = PpsEdgeTimeline::from_counter_start(125_000_000);
         // 0.4 s of counting before the first edge: 25M ticks at 62.5M ticks/s.
         let first = t.observe(0u32.wrapping_sub(25_000_000));
-        assert_eq!(first.edge_ns, 400_000_000, "first edge, measured from the start");
+        assert_eq!(
+            first.edge_ns, 400_000_000,
+            "first edge, measured from the start"
+        );
         let second = t.observe(0u32.wrapping_sub(25_000_000 + 62_500_000));
         assert_eq!(second.interval_ns, 1_000_000_000);
         assert_eq!(second.edge_ns, 1_400_000_000);

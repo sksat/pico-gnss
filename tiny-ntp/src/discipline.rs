@@ -290,7 +290,10 @@ mod tests {
         let update = d.observe(clock.local_ns(100), jumped);
         assert!(update.stepped);
         assert!(!d.locked(), "a step is not a settled estimate");
-        assert_eq!(d.utc_at(clock.local_ns(100)), Some(clock.local_ns(100) + jumped));
+        assert_eq!(
+            d.utc_at(clock.local_ns(100)),
+            Some(clock.local_ns(100) + jumped)
+        );
     }
 
     #[test]

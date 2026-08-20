@@ -165,7 +165,10 @@ impl PpsSchedule {
 
     /// Where an edge lands one period word later.
     pub fn edge_after(&self, edge_ns: i64, period_word: u32) -> i64 {
-        edge_ns + self.cycles_to_ns(period_word as u64 + self.high_cycles as u64 + OUTPUT_OVERHEAD_CYCLES as u64)
+        edge_ns
+            + self.cycles_to_ns(
+                period_word as u64 + self.high_cycles as u64 + OUTPUT_OVERHEAD_CYCLES as u64,
+            )
     }
 
     /// Hand out the next period word.
@@ -224,7 +227,10 @@ mod tests {
     #[test]
     fn a_nominal_word_advances_the_edge_by_one_second() {
         let s = schedule(0);
-        assert_eq!(s.edge_after(0, output_period_cycles(CLK, HIGH)), 1_000_000_000);
+        assert_eq!(
+            s.edge_after(0, output_period_cycles(CLK, HIGH)),
+            1_000_000_000
+        );
     }
 
     #[test]
@@ -267,7 +273,10 @@ mod tests {
         let mut s = schedule(0);
         assert!(s.advance(0, cfg.reacquire_ns + 1).acquired, "just outside");
         let mut s = schedule(0);
-        assert!(s.advance(0, -cfg.reacquire_ns - 1).acquired, "and the other way");
+        assert!(
+            s.advance(0, -cfg.reacquire_ns - 1).acquired,
+            "and the other way"
+        );
     }
 
     #[test]
@@ -290,7 +299,10 @@ mod tests {
         // Half a second of error would be half a second of period if it went in whole.
         let mut s = schedule(0);
         let step = s.step(0, 500_000_000);
-        assert_eq!(step.correction_ns, PpsScheduleConfig::default().max_correction_ns);
+        assert_eq!(
+            step.correction_ns,
+            PpsScheduleConfig::default().max_correction_ns
+        );
     }
 
     #[test]
@@ -340,9 +352,10 @@ mod tests {
             // second, i.e. still on the boundary.
             let landed = step.edge_ns - 1_000_000_000 + lateness;
             assert!(
-                landed.rem_euclid(1_000_000_000).min(
-                    1_000_000_000 - landed.rem_euclid(1_000_000_000)
-                ) <= 1_000_000_000 / CLK as i64,
+                landed
+                    .rem_euclid(1_000_000_000)
+                    .min(1_000_000_000 - landed.rem_euclid(1_000_000_000))
+                    <= 1_000_000_000 / CLK as i64,
                 "lateness {lateness} landed at {landed}"
             );
         }
