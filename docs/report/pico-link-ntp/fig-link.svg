@@ -1,71 +1,75 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 420" width="820" height="420" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="RP2040 を 2 枚、各方向 2 本ずつの GPIO で直結する。server は GNSS 受信機から 1PPS と NMEA を受け、client は何も持たない。両方の GP6 に出る 1PPS と受信機の 1PPS を、オシロの 3 チャネルで見る">
-  <rect width="820" height="420" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 470" width="900" height="470" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="RP2040 を 2 枚、各方向 2 本ずつの GPIO で直結する。server の GP16 が client の GP18 へ、GP17 が GP19 へ、client の GP16 が server の GP18 へ、GP17 が GP19 へ繋がる。GNSS 受信機は server にだけ繋がり、受信機の 1PPS と両方の GP6 をオシロの 3 チャネルで見る">
+  <rect width="900" height="470" fill="#ffffff"/>
 
   <!-- GNSS 受信機 -->
-  <rect x="24" y="60" width="112" height="86" rx="5" fill="#f4f4f4" stroke="#333"/>
-  <text x="80" y="92" font-size="12.5" fill="#333" text-anchor="middle">GNSS 受信機</text>
-  <text x="80" y="112" font-size="10.5" fill="#666" text-anchor="middle">1PPS</text>
-  <text x="80" y="128" font-size="10.5" fill="#666" text-anchor="middle">NMEA</text>
+  <rect x="20" y="76" width="112" height="84" rx="5" fill="#f4f4f4" stroke="#333"/>
+  <text x="76" y="106" font-size="12.5" fill="#333" text-anchor="middle">GNSS 受信機</text>
+  <text x="76" y="126" font-size="10.5" fill="#666" text-anchor="middle">1PPS</text>
+  <text x="76" y="142" font-size="10.5" fill="#666" text-anchor="middle">NMEA</text>
+  <line x1="132" y1="118" x2="172" y2="118" stroke="#333" stroke-width="1.6"/>
+  <polygon points="176,118 168,114 168,122" fill="#333"/>
+  <text x="76" y="180" font-size="10" fill="#666" text-anchor="middle">server にだけ繋がる</text>
 
-  <line x1="136" y1="103" x2="196" y2="103" stroke="#333" stroke-width="1.6"/>
-  <polygon points="196,103 189,99.5 189,106.5" fill="#333"/>
+  <!-- server -->
+  <rect x="176" y="64" width="140" height="180" rx="5" fill="#f4f4f4" stroke="#333"/>
+  <text x="246" y="92" font-size="13" fill="#333" text-anchor="middle">server</text>
+  <text x="246" y="110" font-size="10.5" fill="#666" text-anchor="middle">RP2040</text>
+  <text x="246" y="126" font-size="10.5" fill="#666" text-anchor="middle">GPSDO</text>
+  <text x="246" y="142" font-size="10.5" fill="#666" text-anchor="middle">+ NTP server</text>
+  <text x="310" y="228" font-size="10.5" fill="#333" text-anchor="end">GP6</text>
 
-  <!-- server 側 -->
-  <rect x="196" y="48" width="150" height="150" rx="5" fill="#f4f4f4" stroke="#333"/>
-  <text x="271" y="74" font-size="13" fill="#333" text-anchor="middle">server</text>
-  <text x="271" y="92" font-size="10.5" fill="#666" text-anchor="middle">RP2040</text>
-  <text x="271" y="108" font-size="10.5" fill="#666" text-anchor="middle">GPSDO + NTP</text>
-  <text x="340" y="136" font-size="10.5" fill="#333" text-anchor="end">GP16 / GP17</text>
-  <text x="340" y="154" font-size="10.5" fill="#333" text-anchor="end">GP18 / GP19</text>
-  <text x="340" y="186" font-size="10.5" fill="#333" text-anchor="end">GP6</text>
-
-  <!-- client 側 -->
-  <rect x="516" y="48" width="150" height="150" rx="5" fill="#f4f4f4" stroke="#333"/>
-  <text x="591" y="74" font-size="13" fill="#333" text-anchor="middle">client</text>
-  <text x="591" y="92" font-size="10.5" fill="#666" text-anchor="middle">RP2040</text>
-  <text x="591" y="108" font-size="10.5" fill="#666" text-anchor="middle">GNSS なし</text>
-  <text x="522" y="136" font-size="10.5" fill="#333" text-anchor="start">GP18 / GP19</text>
-  <text x="522" y="154" font-size="10.5" fill="#333" text-anchor="start">GP16 / GP17</text>
-  <text x="522" y="186" font-size="10.5" fill="#333" text-anchor="start">GP6</text>
+  <!-- client -->
+  <rect x="624" y="64" width="140" height="180" rx="5" fill="#f4f4f4" stroke="#333"/>
+  <text x="694" y="92" font-size="13" fill="#333" text-anchor="middle">client</text>
+  <text x="694" y="110" font-size="10.5" fill="#666" text-anchor="middle">RP2040</text>
+  <text x="694" y="126" font-size="10.5" fill="#666" text-anchor="middle">GNSS なし</text>
+  <text x="694" y="142" font-size="10.5" fill="#666" text-anchor="middle">NTP client</text>
+  <text x="630" y="228" font-size="10.5" fill="#333" text-anchor="start">GP6</text>
 
   <!-- server -> client -->
-  <line x1="346" y1="130" x2="516" y2="130" stroke="#1f77b4" stroke-width="1.8"/>
-  <polygon points="516,130 508,126 508,134" fill="#1f77b4"/>
-  <line x1="346" y1="140" x2="516" y2="140" stroke="#1f77b4" stroke-width="1.8"/>
-  <polygon points="516,140 508,136 508,144" fill="#1f77b4"/>
-  <text x="431" y="122" font-size="10.5" fill="#1f77b4" text-anchor="middle">NTP の応答と broadcast</text>
+  <text x="470" y="94" font-size="10.5" fill="#1f77b4" text-anchor="middle">NTP の応答と broadcast</text>
+
+  <text x="322" y="116" font-size="10.5" fill="#333" text-anchor="start">GP16 (TX−)</text>
+  <line x1="400" y1="112" x2="536" y2="112" stroke="#1f77b4" stroke-width="1.8"/>
+  <polygon points="540,112 532,108 532,116" fill="#1f77b4"/>
+  <text x="548" y="116" font-size="10.5" fill="#333" text-anchor="start">GP18</text>
+
+  <text x="322" y="138" font-size="10.5" fill="#333" text-anchor="start">GP17 (TX+)</text>
+  <line x1="400" y1="134" x2="536" y2="134" stroke="#1f77b4" stroke-width="1.8"/>
+  <polygon points="540,134 532,130 532,138" fill="#1f77b4"/>
+  <text x="548" y="138" font-size="10.5" fill="#333" text-anchor="start">GP19</text>
 
   <!-- client -> server -->
-  <line x1="516" y1="160" x2="346" y2="160" stroke="#d62728" stroke-width="1.8"/>
-  <polygon points="346,160 354,156 354,164" fill="#d62728"/>
-  <line x1="516" y1="170" x2="346" y2="170" stroke="#d62728" stroke-width="1.8"/>
-  <polygon points="346,170 354,166 354,174" fill="#d62728"/>
-  <text x="431" y="188" font-size="10.5" fill="#d62728" text-anchor="middle">NTP の要求</text>
+  <text x="322" y="180" font-size="10.5" fill="#333" text-anchor="start">GP18</text>
+  <line x1="404" y1="176" x2="540" y2="176" stroke="#d62728" stroke-width="1.8"/>
+  <polygon points="400,176 408,172 408,180" fill="#d62728"/>
+  <text x="548" y="180" font-size="10.5" fill="#333" text-anchor="start">GP16 (TX−)</text>
 
-  <text x="431" y="206" font-size="10" fill="#666" text-anchor="middle">各方向 2 本。GND も繋ぐ</text>
+  <text x="322" y="202" font-size="10.5" fill="#333" text-anchor="start">GP19</text>
+  <line x1="404" y1="198" x2="540" y2="198" stroke="#d62728" stroke-width="1.8"/>
+  <polygon points="400,198 408,194 408,202" fill="#d62728"/>
+  <text x="548" y="202" font-size="10.5" fill="#333" text-anchor="start">GP17 (TX+)</text>
+
+  <text x="470" y="220" font-size="10.5" fill="#d62728" text-anchor="middle">NTP の要求</text>
+  <text x="470" y="240" font-size="10" fill="#666" text-anchor="middle">GND どうしも繋ぐ</text>
 
   <!-- オシロ -->
-  <rect x="286" y="316" width="290" height="72" rx="5" fill="#fbfbfb" stroke="#333"/>
-  <text x="431" y="342" font-size="12.5" fill="#333" text-anchor="middle">オシロスコープ</text>
-  <text x="431" y="362" font-size="10" fill="#666" text-anchor="middle">3 本の立ち上がりを同じトリガで測る</text>
-  <text x="431" y="378" font-size="10" fill="#666" text-anchor="middle">CH1 を基準にした差が、そのまま時刻のずれ</text>
+  <rect x="300" y="360" width="300" height="82" rx="5" fill="#fbfbfb" stroke="#333"/>
+  <text x="450" y="386" font-size="12.5" fill="#333" text-anchor="middle">オシロスコープ</text>
+  <text x="450" y="406" font-size="10" fill="#666" text-anchor="middle">3 本を同じトリガで取り込む</text>
+  <text x="450" y="422" font-size="10" fill="#666" text-anchor="middle">CH1 を基準にした差が、その板の時刻のずれ</text>
 
-  <!-- 受信機の 1PPS -> CH1 -->
-  <path d="M80 146 L80 296 L332 296 L332 316" fill="none" stroke="#888" stroke-width="1.4" stroke-dasharray="4 3"/>
-  <text x="196" y="290" font-size="10" fill="#666" text-anchor="middle">CH1: 受信機の 1PPS (基準)</text>
+  <!-- CH1 -->
+  <path d="M76 160 L76 340 L340 340 L340 360" fill="none" stroke="#888" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text x="150" y="334" font-size="10" fill="#666" text-anchor="start">CH1: 受信機の 1PPS (基準)</text>
 
-  <!-- server GP6 -> CH3 -->
-  <path d="M271 198 L271 246 L410 246 L410 316" fill="none" stroke="#888" stroke-width="1.4" stroke-dasharray="4 3"/>
-  <text x="410" y="240" font-size="10" fill="#666" text-anchor="middle">CH3: server の 1PPS</text>
+  <!-- CH3 -->
+  <path d="M246 244 L246 300 L440 300 L440 360" fill="none" stroke="#888" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text x="252" y="278" font-size="10" fill="#666" text-anchor="start">CH3: server の 1PPS</text>
+  <text x="252" y="294" font-size="10" fill="#999" text-anchor="start">GPS で規律した時刻</text>
 
-  <!-- client GP6 -> CH4 -->
-  <path d="M591 198 L591 266 L520 266 L520 316" fill="none" stroke="#888" stroke-width="1.4" stroke-dasharray="4 3"/>
-  <text x="576" y="260" font-size="10" fill="#666" text-anchor="middle">CH4: client の 1PPS</text>
-
-  <!-- 注記 -->
-  <text x="24" y="176" font-size="10" fill="#666">受信機は server にだけ</text>
-  <text x="24" y="192" font-size="10" fill="#666">繋がっている</text>
-
-  <text x="700" y="136" font-size="10" fill="#666">client が知っている時刻は</text>
-  <text x="700" y="152" font-size="10" fill="#666">この 4 本から来たものだけ</text>
+  <!-- CH4 -->
+  <path d="M694 244 L694 318 L560 318 L560 360" fill="none" stroke="#888" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text x="688" y="278" font-size="10" fill="#666" text-anchor="end">CH4: client の 1PPS</text>
+  <text x="688" y="294" font-size="10" fill="#999" text-anchor="end">リンク越しの NTP だけで規律した時刻</text>
 </svg>
