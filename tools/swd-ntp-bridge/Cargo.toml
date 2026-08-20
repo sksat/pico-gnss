@@ -1,0 +1,13 @@
+[package]
+name = "swd-ntp-bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Debug-only: carries a real NTP client's unicast exchange to pico-ntp over the debug probe, because the 10BASE-T wiring transmits and nothing else."
+
+[dependencies]
+# Owns the probe for the whole run. The CLI's `read`/`write` re-attach per invocation, which costs
+# most of a second each way — that lands squarely in the client's own delay measurement and buries
+# the millisecond-scale offset the exercise is about.
+probe-rs = "0.31"
+anyhow = "1"

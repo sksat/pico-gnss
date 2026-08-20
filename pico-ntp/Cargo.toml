@@ -1,0 +1,77 @@
+[package]
+name = "pico-ntp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RP2040 Stratum-1 NTP server firmware: a GNSS-disciplined clock serving time over 10BASE-T Ethernet driven straight from two GPIO pins. Currently announces by broadcast, because the present wiring cannot receive."
+publish = false
+
+# `cargo run` picks this without --bin (bench_tx is also a bin, behind a feature).
+default-run = "pico-ntp"
+
+[[bin]]
+name = "pico-ntp"
+path = "src/main.rs"
+
+# On-target transmit benchmark; not built by a normal build.
+# On hardware: cd pico-ntp && cargo run --release --features bench --bin bench_tx
+[[bin]]
+name = "bench_tx"
+path = "src/bin/bench_tx.rs"
+required-features = ["bench"]
+
+[features]
+# Builds the on-target benchmark binary. It needs no extra dependencies — the flag exists so a
+# normal build does not produce a second firmware image that would be easy to flash by accident.
+bench = []
+
+# A receive path over the debug probe, for measuring what a real NTP client does with our time.
+#
+# The wiring is transmit-only, so the unicast exchange — the one that lets a client sound the path
+# instead of assuming it — cannot happen over the wire. This puts a mailbox in RAM that the probe
+# writes requests into and reads replies out of, so a host-side bridge can carry a real client's
+# unicast traffic to `tiny_ntp::server::respond` and back.
+#
+# **Off by default and never for production.** SWD is not a network: the request arrives by a path
+# with none of Ethernet's timing, so the client's own delay measurement describes the probe rather
+# than the link. It exists to answer "does a real client accept and converge on this time", not to
+# be a second way of serving it.
+swd-rx = []
+
+[dependencies]
+# The three layers this firmware wires together.
+gnssdo = { version = "0.1.0", path = "../gnssdo" }
+rp-pps = { version = "0.1.0", path = "../rp-pps", features = ["embassy-rp", "gnssdo"] }
+tiny-ntp = { version = "0.1.0", path = "../tiny-ntp" }
+pico-10base-t = { version = "0.1.0", path = "../pico-10base-t", features = ["embassy-rp"] }
+
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.3"
+defmt = "1.0"
+defmt-rtt = "1.0"
+embassy-executor = { version = "0.10.0", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "executor-interrupt",
+    "defmt",
+] }
+embassy-rp = { version = "0.10.0", features = [
+    "defmt",
+    "unstable-pac",
+    "time-driver",
+    "critical-section-impl",
+    "rp2040",
+] }
+embassy-time = { version = "0.5.1", features = [
+    "defmt",
+    "defmt-timestamp-uptime",
+] }
+embassy-sync = { version = "0.7.2", features = ["defmt"] }
+static_cell = "2.1.1"
+# Cortex-M0+ has no atomic compare-exchange; static_cell (via portable-atomic) needs this shim.
+portable-atomic = { version = "1.13.1", features = ["critical-section"] }
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+heapless = "0.9.3"
+embedded-io-async = "0.7.0"

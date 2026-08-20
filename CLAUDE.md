@@ -54,7 +54,7 @@ GPS-R PPS が基準で、出力位相は独立計器であるオシロで実測�
 
 ## ビルド、テスト、注意点
 
-- 素の `cargo test` と `cargo build` は host で動くコア (`default-members = gnssdo, rp-pps`) だけを対象にする。単一テストは `cargo test -p gnssdo <name>`。
+- 素の `cargo test` と `cargo build` は host で動くコア (`default-members = gnssdo, rp-pps, tiny-ntp, pico-10base-t`) だけを対象にする。単一テストは `cargo test -p gnssdo <name>`。
 - firmware は `cd pico-gnss && cargo build --release` で建てる (target `thumbv6m-none-eabi` と linker は `.cargo/config` に設定済み)。
 - 実機フラッシュは `cargo build --release && cargo run --release` とする。`;` でなく `&&` にするのは、ビルド失敗時に古いバイナリを焼かないため。runner は probe-rs。
 - **ログ・成果物は 1 試行 = 1 サブディレクトリにまとめる。** `logs/<YYYYMMDD>-<topic>/` を切り、その試行の RTT ログ・オシロのモニタ出力・スクショ・GIF・解析の中間生成物を全部そこに入れる (例: `logs/20260629-precision-scope/pps-boot1.log`, `.../conv.gif`)。`logs/` 配下は丸ごと gitignore (`/logs/*`、README だけ追跡) なので中で自由に散らかしてよい。**その試行専用の単発スクリプト**もそのサブディレクトリに置いてよい。**真に再利用可能なスクリプトだけ** repo top の `scripts/` に昇格させる (env で機器 IP を受け、引数で入出力パスを取る形に整える)。`docs/report/` に置くのはマスク済みの結論・図と、その図を生成するスクリプト (`docs/report/<report>/logs/<topic>/` にコミットする。スクリプトは repo top の `logs/<topic>/` の生データを読む設計にし、データ自体はコミットしない)。

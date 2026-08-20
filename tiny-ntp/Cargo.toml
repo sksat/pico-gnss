@@ -1,0 +1,26 @@
+[package]
+name = "tiny-ntp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "NTP (RFC 5905) for no_std targets: timestamp conversion with era handling, 48-byte packet encode/decode, a server — primary with a reference clock or secondary following an upstream, answering unicast and broadcast, gated on clock discipline with holdover-aware root dispersion — and a client for both service modes that turns a reply or a broadcast into an offset. Integer-only, zero-dependency."
+keywords = ["ntp", "stratum1", "refclock", "no_std", "gpsdo"]
+categories = ["embedded", "no-std", "network-programming"]
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+
+[lib]
+name = "tiny_ntp"
+
+# No runtime dependencies: pure integer logic, mirroring `gnssdo`. Ethernet/IPv4/UDP framing and the
+# PHY deliberately live in the sibling `pico-10base-t` crate, so NTP stays L2/L3/L4-agnostic.
+
+[dev-dependencies]
+# Property tests for the timestamp conversions (round-trip, monotonicity, era wrap).
+proptest = "1"
+# An independent RFC 5905 client, used to end-to-end the server policy: `tests/client_e2e.rs`
+# serves real replies over a loopback socket and checks that a third-party implementation reads the
+# time we meant to send. Dev-only, so the crate's zero-runtime-dependency property is untouched.
+# Async is off — this needs a blocking client, not tokio.
+rsntp = { version = "4.1", default-features = false, features = ["chrono"] }

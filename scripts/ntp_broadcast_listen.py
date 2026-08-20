@@ -1,0 +1,176 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""NTP broadcast (RFC 5905 mode 5) を受けて、ホスト時刻とのオフセットを測る。
+
+    sudo uv run --no-project scripts/ntp_broadcast_listen.py [--port 123] [--count 60]
+                                                             [--iface eth0]
+
+なぜ専用ツールか: broadcast client mode を実装しているのは本家 ntpd だけで、chrony も
+systemd-timesyncd も受けられない。ntpd を入れずに「実際に何 ns ずれているか」だけ知りたい
+場面がほとんどなので、その一点に絞る。
+
+計測の要点:
+
+* 受信時刻は **SO_TIMESTAMPNS** でカーネルから取る。userspace で time() を呼ぶと GIL や
+  スケジューリングで数百 µs 平気で乗り、測りたい量より大きくなる。
+* 出るオフセットは「サーバの送信時刻 − ホストの受信時刻」なので、**片道の経路遅延を含む**。
+  broadcast では受信側が経路を測れないので、これは原理的に分離できない (それが broadcast の
+  限界そのもの)。10BASE-T のフレーム送出だけで 81.6 µs かかることに注意。
+* したがって平均は「固定スキュー + 経路遅延」、標準偏差が「揺れ」。前者は較正で、後者は
+  設計で減らす量。
+
+* ホストが同じ LAN に有線と無線の両方で居ると、**同じ broadcast が両方から届く**。無線側は
+  AP のバッファリングで数十〜数百 ms 遅れるので、混ざったまま平均を取ると測定にならない。
+  受信インタフェースは `IP_PKTINFO` でカーネルから取り、インタフェースごとに集計する。
+  1 つに絞りたいときは `--iface`。
+
+root が要るのは UDP 123 が特権ポートだからで、それ以外の理由はない。
+"""
+
+import argparse
+import socket
+import struct
+import sys
+import time
+
+NTP_UNIX_OFFSET = 2_208_988_800
+
+# CPython does not re-export these on every platform, but they are stable Linux ABI numbers
+# (asm-generic/socket.h). SO_ and SCM_ share the value.
+SO_TIMESTAMPNS = getattr(socket, "SO_TIMESTAMPNS", 35)
+# 受信インタフェースを知るため。struct in_pktinfo の先頭が ifindex。
+IP_PKTINFO = getattr(socket, "IP_PKTINFO", 8)
+
+MODE_NAMES = {
+    0: "reserved",
+    1: "sym-active",
+    2: "sym-passive",
+    3: "client",
+    4: "server",
+    5: "broadcast",
+    6: "control",
+    7: "private",
+}
+
+
+def ntp_to_unix_ns(raw: int) -> int:
+    """NTP 64bit (32.32, 1900 epoch) -> unix ns."""
+    secs, frac = raw >> 32, raw & 0xFFFF_FFFF
+    return (secs - NTP_UNIX_OFFSET) * 1_000_000_000 + (frac * 1_000_000_000 + (1 << 31) >> 32)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--port", type=int, default=123)
+    ap.add_argument("--count", type=int, default=60, help="0 = 無制限")
+    ap.add_argument("--quiet", action="store_true", help="1 行ずつは出さず要約だけ")
+    ap.add_argument("--iface", help="このインタフェースで受けたものだけ数える (例: eth0)")
+    args = ap.parse_args()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # カーネル受信タイムスタンプ。これが無いと測っているのは自分のスケジューリング遅延。
+    sock.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
+    sock.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
+    try:
+        sock.bind(("", args.port))
+    except PermissionError:
+        print(
+            f"UDP {args.port} を bind できない (特権ポート)。sudo で実行するか --port を変える。",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"listening on UDP :{args.port} for NTP broadcasts (Ctrl-C to stop)")
+    offsets: dict[str, list[float]] = {}
+    try:
+        while args.count == 0 or sum(len(v) for v in offsets.values()) < args.count:
+            data, ancdata, _flags, addr = sock.recvmsg(
+                1024, socket.CMSG_SPACE(32) + socket.CMSG_SPACE(12)
+            )
+
+            recv_ns = None
+            iface = "?"
+            for level, typ, buf in ancdata:
+                if level == socket.SOL_SOCKET and typ == SO_TIMESTAMPNS:
+                    sec, nsec = struct.unpack("qq", buf[:16])
+                    recv_ns = sec * 1_000_000_000 + nsec
+                elif level == socket.IPPROTO_IP and typ == IP_PKTINFO:
+                    index = struct.unpack("i", buf[:4])[0]
+                    try:
+                        iface = socket.if_indextoname(index)
+                    except OSError:
+                        iface = f"if{index}"
+            if recv_ns is None:
+                # userspace の時刻で埋めない。この docstring が書いているとおり、そこで乗る遅れは
+                # 測りたい量より大きい。埋めると統計は同じ形で出てくるので、汚染に気付けない。
+                print(
+                    "SO_TIMESTAMPNS の ancillary data が返らない。"
+                    "userspace の時刻で代用すると測定にならないので中止する。",
+                    file=sys.stderr,
+                )
+                return 1
+
+            if len(data) < 48:
+                continue
+            li_vn_mode, stratum, poll, precision = struct.unpack("!BBbb", data[0:4])
+            mode = li_vn_mode & 0b111
+            leap = li_vn_mode >> 6
+            root_disp = struct.unpack("!I", data[8:12])[0]
+            refid = data[12:16]
+            xmt = ntp_to_unix_ns(struct.unpack("!Q", data[40:48])[0])
+
+            if args.iface and iface != args.iface:
+                continue
+
+            offset_ns = xmt - recv_ns
+            offsets.setdefault(iface, []).append(offset_ns / 1e9)
+            if not args.quiet:
+                # Both absolute times, not just their difference: a difference alone cannot say
+                # whether the server's clock is wrong or its scheduling is, and the two need
+                # opposite fixes.
+                def iso(ns: int) -> str:
+                    return time.strftime("%H:%M:%S", time.gmtime(ns // 1_000_000_000)) + (
+                        f".{ns % 1_000_000_000:09d}"
+                    )
+
+                print(
+                    f"{iface:<8} {addr[0]:<15} mode={MODE_NAMES.get(mode, mode):<9} stratum={stratum} "
+                    f"li={leap} prec=2^{precision} refid={refid.decode('ascii', 'replace').rstrip(chr(0))!r:<7} "
+                    f"rootdisp={root_disp / 65536 * 1e6:.0f}us  xmt={iso(xmt)} recv={iso(recv_ns)} "
+                    f"offset={offset_ns / 1000:+.1f}us"
+                )
+    except KeyboardInterrupt:
+        pass
+
+    if not offsets:
+        print("no NTP packets received", file=sys.stderr)
+        return 1
+
+    # インタフェースごとに出す。混ぜた平均は、遅い経路の重複を薄めた値でしかない。
+    for iface in sorted(offsets):
+        series = offsets[iface]
+        n = len(series)
+        mean = sum(series) / n
+        var = sum((o - mean) ** 2 for o in series) / n
+        sd = var**0.5
+        print()
+        print(f"[{iface}] n={n}")
+        print(f"  mean offset = {mean * 1e6:+.1f} us   (fixed skew + one-way path delay)")
+        print(f"  std  offset = {sd * 1e6:.1f} us      (jitter)")
+        print(f"  min/max     = {min(series) * 1e6:+.1f} / {max(series) * 1e6:+.1f} us")
+
+    if len(offsets) > 1:
+        print()
+        print(
+            "同じ broadcast が複数のインタフェースから届いている。"
+            "測りたい経路を --iface で選ぶこと。",
+            file=sys.stderr,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

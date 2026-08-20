@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 330" width="760" height="330" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="送信専用の配線では broadcast しか出せないので、要求だけを debug probe 経由で渡して unicast を成立させる構成">
+  <rect width="760" height="330" fill="#ffffff"/>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#555"/>
+    </marker>
+    <marker id="r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c1442e"/>
+    </marker>
+  </defs>
+
+  <g fill="#fafafa" stroke="#888">
+    <rect x="40" y="96" width="105" height="58" rx="4"/>
+    <rect x="210" y="96" width="150" height="58" rx="4"/>
+    <rect x="430" y="96" width="110" height="58" rx="4"/>
+    <rect x="600" y="96" width="120" height="58" rx="4"/>
+    <rect x="600" y="236" width="120" height="46" rx="4"/>
+  </g>
+  <g font-size="11.5" fill="#333" text-anchor="middle">
+    <text x="92" y="120">GPS-R</text>
+    <text x="92" y="138" font-size="10" fill="#777">1PPS + NMEA</text>
+    <text x="285" y="120">Raspberry Pi Pico</text>
+    <text x="285" y="138" font-size="10" fill="#777">pico-ntp (swd-rx)</text>
+    <text x="485" y="120">debug probe</text>
+    <text x="485" y="138" font-size="10" fill="#777">swd-ntp-bridge</text>
+    <text x="660" y="120">host</text>
+    <text x="660" y="138" font-size="10" fill="#777">NTP client</text>
+    <text x="660" y="264">公開 stratum 1</text>
+  </g>
+
+  <g stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#a)">
+    <line x1="145" y1="125" x2="205" y2="125"/>
+    <line x1="600" y1="236" x2="660" y2="160"/>
+  </g>
+  <text x="640" y="205" font-size="10" fill="#555">ホストの時計を検証</text>
+
+  <!-- 要求: probe を通って基板へ -->
+  <g stroke="#c1442e" stroke-width="1.8" fill="none" marker-end="url(#r)">
+    <path d="M596,108 L544,108"/>
+    <path d="M426,108 L364,108"/>
+  </g>
+  <text x="480" y="84" font-size="11" fill="#c1442e" text-anchor="middle">要求 (mode 3) を SWD で運ぶ</text>
+
+  <!-- 応答: 同じ経路を戻る -->
+  <g stroke="#c1442e" stroke-width="1.8" fill="none" marker-end="url(#r)">
+    <path d="M364,142 L426,142"/>
+    <path d="M544,142 L596,142"/>
+  </g>
+  <text x="480" y="172" font-size="11" fill="#c1442e" text-anchor="middle">応答 (mode 4) が戻る</text>
+
+  <!-- 本来の経路 -->
+  <line x1="285" y1="154" x2="285" y2="200" stroke="#bbb" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="295" y="196" font-size="11" fill="#999">10BASE-T は送信しかできない</text>
+
+  <text x="40" y="300" font-size="12.5" fill="#333">要求が通る経路は USB と probe なので、クライアントが測る往復時間はその経路のものである。</text>
+  <text x="40" y="322" font-size="12.5" fill="#333">測れるのはその上、つまりパケットとエポックと、実装が本当にこの時刻を受け入れるかである。</text>
+</svg>

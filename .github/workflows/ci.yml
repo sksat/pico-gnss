@@ -11,8 +11,9 @@ env:
 
 jobs:
   cores:
-    name: cores (host) — gnssdo + rp-pps
+    name: cores (host) — gnssdo + rp-pps + tiny-ntp
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # stable (SHA固定)
@@ -20,11 +21,39 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.9.1
+      # tiny-ntp cross-checks its wire encoding against Wireshark's dissector. Without these
+      # the test skips itself, which would leave the check silently unexercised in CI — the one
+      # place it most needs to run. `tshark` pulls in `text2pcap` via wireshark-common.
+      #
+      # wireshark-common's postinst asks whether non-root users may capture. Preseed the answer:
+      # sudo resets the environment, so DEBIAN_FRONTEND set on the command line does not reach
+      # debconf, and the install sits waiting for input until the job's six-hour limit.
+      - name: Install tshark
+        env:
+          # sudo は環境を捨てるので、`sudo VAR=v` ではなく step の env + `sudo -E` で渡す。
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # wireshark-common の postinst は「非 root にキャプチャを許すか」を聞く。先に答えておく。
+          echo 'wireshark-common wireshark-common/install-setuid boolean false' \
+            | sudo debconf-set-selections
+          # 待たされるところは全部上限を切る。ロック待ちも apt 自身に諦めさせる。
+          # 一度これで 16 分無言のまま止まり、job の上限で落ちるまで何も分からなかった。
+          sudo -E timeout 300 apt-get -o DPkg::Lock::Timeout=120 update
+          sudo -E timeout 420 apt-get -o DPkg::Lock::Timeout=120 install -y \
+            --no-install-recommends tshark
+          # 入ったことを確かめる。tshark が無いとテストは自分を skip するので、失敗が pass に見える。
+          tshark --version | head -1
+          command -v text2pcap
       - run: cargo fmt -p gnssdo --check
       - run: cargo fmt -p rp-pps --check
+      - run: cargo fmt -p tiny-ntp --check
+      - run: cargo fmt -p pico-10base-t --check
       - run: cargo clippy -p gnssdo --all-features -- -D warnings
       # rp-pps core only on the host; its HAL backends need a target + the downstream chip feature.
       - run: cargo clippy -p rp-pps -- -D warnings
+      - run: cargo clippy -p tiny-ntp --all-targets -- -D warnings
+      # pico-10base-t's framing core is HAL-free; its backend needs a target (see the embedded job).
+      - run: cargo clippy -p pico-10base-t --all-targets -- -D warnings
       - run: cargo test -p gnssdo
       - run: cargo test -p gnssdo --all-features
       - run: cargo test -p rp-pps
@@ -32,6 +61,11 @@ jobs:
       # sentence establishes the epoch. Without this they compile nowhere in CI and can rot.
       # (Not --all-features: the HAL backends need a target.)
       - run: cargo test -p rp-pps --features gnssdo
+      - run: cargo test -p tiny-ntp
+      - run: cargo test -p pico-10base-t
+      # The host-side bridge is not a default member either. It is debug-only, but it is what the
+      # unicast measurements went through, so a break in it is a break in the evidence.
+      - run: cargo clippy -p swd-ntp-bridge --all-targets -- -D warnings
 
   embedded:
     name: embedded (thumbv6m-none-eabi)
@@ -60,6 +94,17 @@ jobs:
         working-directory: pico-gnss
       # rp-pps's rp2040-hal backend (RP2040-specific, no chip feature → checkable standalone).
       - run: cargo clippy -p rp-pps --features rp2040-hal --target thumbv6m-none-eabi -- -D warnings
+      # pico-10base-t's embassy-rp backend needs both a target and a chip feature.
+      - run: cargo clippy -p pico-10base-t --features embassy-rp,embassy-rp/rp2040 --target thumbv6m-none-eabi -- -D warnings
+      # pico-ntp is not a default member and carries its own target config, so it needs a check of
+      # its own. Without one, the firmware this repo serves NTP from never compiles in CI.
+      # `--bins --all-features` also covers the bench binary and the swd-rx debug path, which are
+      # exactly the parts nothing else builds. Not `--all-targets`: that asks for test harnesses,
+      # and a no_std binary has no `test` crate to link against.
+      - run: cargo check
+        working-directory: pico-ntp
+      - run: cargo check --bins --all-features
+        working-directory: pico-ntp
 
   publish-dry-run:
     name: publish --dry-run
@@ -71,6 +116,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo publish --dry-run -p gnssdo
+      # tiny-ntp and pico-10base-t have no path dependencies, so their dry-runs stand alone.
+      - run: cargo publish --dry-run -p tiny-ntp
+      - run: cargo publish --dry-run -p pico-10base-t
       # rp-pps は gnssdo が crates.io に公開されるまで dry-run が原理的に通らない
       # ([patch.crates-io] は publish で無視される。root Cargo.toml のコメント参照)。
       # 公開後に自然に green になるよう continue-on-error で走らせておく。
@@ -92,3 +140,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo test -p gnssdo --all-features
       - run: cargo test -p rp-pps
+      # No tshark here on purpose: the Wireshark cross-check skips itself, and this job is about the
+      # compiler floor rather than re-running the interop check.
+      - run: cargo test -p tiny-ntp

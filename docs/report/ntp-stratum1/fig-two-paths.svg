@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 300" width="760" height="300" font-family="'Hiragino Sans','Noto Sans CJK JP','Noto Sans JP','Yu Gothic',Meiryo,sans-serif" role="img" aria-label="1 秒に 1 通の broadcast が、switch から有線でホストへ届くのと、AP を経由して無線でも同じホストへ届くのとで、二度受信される">
+  <rect width="760" height="300" fill="#ffffff"/>
+  <defs>
+    <marker id="aw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2e7d5b"/>
+    </marker>
+    <marker id="al" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c1442e"/>
+    </marker>
+  </defs>
+
+  <!-- 送信側 -->
+  <rect x="20" y="140" width="150" height="60" rx="5" fill="#f4f4f4" stroke="#333"/>
+  <text x="95" y="165" font-size="13" fill="#333" text-anchor="middle">pico-ntp</text>
+  <text x="95" y="184" font-size="11" fill="#666" text-anchor="middle">10BASE-T、送信のみ</text>
+  <text x="95" y="216" font-size="11.5" fill="#333" text-anchor="middle">1 秒に 1 通</text>
+
+  <!-- switch -->
+  <line x1="170" y1="170" x2="222" y2="170" stroke="#333" stroke-width="1.6"/>
+  <rect x="225" y="142" width="90" height="56" rx="5" fill="#f4f4f4" stroke="#333"/>
+  <text x="270" y="175" font-size="13" fill="#333" text-anchor="middle">switch</text>
+
+  <!-- 無線: switch から AP へ上がり、AP が溜めてからホストへ落とす -->
+  <path d="M315,155 C380,120 430,80 542,66" fill="none" stroke="#c1442e" stroke-width="1.8" marker-end="url(#al)"/>
+  <rect x="546" y="38" width="120" height="54" rx="5" fill="#fdf0ee" stroke="#c1442e"/>
+  <text x="606" y="70" font-size="12.5" fill="#333" text-anchor="middle">AP</text>
+  <path d="M606,92 L606,148" fill="none" stroke="#c1442e" stroke-width="1.8" marker-end="url(#al)"/>
+
+  <!-- 有線 -->
+  <path d="M315,182 C400,205 440,232 494,236" fill="none" stroke="#2e7d5b" stroke-width="1.8" marker-end="url(#aw)"/>
+  <text x="392" y="230" font-size="11.5" fill="#2e7d5b">有線</text>
+
+  <!-- 受信側 -->
+  <rect x="498" y="152" width="240" height="106" rx="5" fill="#ffffff" stroke="#333"/>
+  <rect x="516" y="160" width="180" height="34" rx="4" fill="#fdf0ee" stroke="#c1442e"/>
+  <text x="606" y="182" font-size="12" fill="#c1442e" text-anchor="middle">wlp1s0</text>
+  <rect x="516" y="218" width="180" height="34" rx="4" fill="#eef5f1" stroke="#2e7d5b"/>
+  <text x="606" y="240" font-size="12" fill="#2e7d5b" text-anchor="middle">eth0</text>
+  <text x="500" y="144" font-size="11.5" fill="#333">同じホスト</text>
+
+  <text x="380" y="286" font-size="12.5" fill="#333" text-anchor="middle">1 秒に 1 通しか出していないのに、同じホストが二度受け取る。</text>
+</svg>
