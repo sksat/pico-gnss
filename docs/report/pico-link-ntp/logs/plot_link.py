@@ -44,51 +44,71 @@ def read_pairs(name):
 
 
 def fig_broadcast_series():
-    """broadcast で同期している間の、両方の 1PPS の位置。"""
+    """broadcast で同期しているあいだの時刻差。
+
+    上段は GNSS 受信機の 1PPS を基準にした 2 枚それぞれの時刻差、下段は Pico client が Pico
+    server をどれだけ再現したかで、後者が NTP そのものの精度にあたる。分けてあるのは別の量だから
+    で、上段には Pico server 側の較正定数が乗り、下段では両方に等しく乗って落ちる。
+    """
     server, client = read_pairs("pair-series.csv")
     shots = np.arange(len(server))
+    diff = client - server
 
-    fig, (ax, hx) = plt.subplots(
-        1, 2, figsize=(11, 4), gridspec_kw={"width_ratios": [3, 1]}
+    fig, axes = plt.subplots(
+        2,
+        2,
+        figsize=(11, 6),
+        sharex="col",
+        gridspec_kw={"width_ratios": [3, 1], "height_ratios": [1, 1]},
     )
+    (ax, hx), (bx, gx) = axes
+
     ax.axhline(0, color="0.6", lw=0.8)
-    ax.plot(shots, server, ".-", ms=3, lw=0.8, label="Pico server GP6 (GNSS 直結)")
-    ax.plot(shots, client, ".-", ms=3, lw=0.8, label="Pico client GP6 (リンク越しの NTP のみ)")
-    # 受信機を基準にした 2 本と、Pico client が Pico server をどれだけ再現したか。後者は同じ
-    # 取り込みから両方を読んだ差なので、Pico server 側の較正定数が乗っていない。
     ax.plot(
-        shots,
-        client - server,
-        ".-",
-        ms=3,
-        lw=0.8,
-        color="0.35",
-        label="client − server (NTP が渡せた精度)",
+        shots, server, ".-", ms=3, lw=0.8, color="C0",
+        label=f"Pico server {server.mean():+.2f} ± {server.std():.2f} µs",
     )
-    ax.set_xlabel("shot (約 1 shot / 5 秒)")
-    ax.set_ylabel("ずれ (µs)")
+    ax.plot(
+        shots, client, ".-", ms=3, lw=0.8, color="C1",
+        label=f"Pico client {client.mean():+.2f} ± {client.std():.2f} µs",
+    )
+    ax.set_ylabel("受信機の 1PPS との\n時刻差 (µs)")
+    ax.set_title("2 枚それぞれと GNSS 受信機", fontsize=10, loc="left")
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(alpha=0.3)
 
-    diff = client - server
-    lo = min(server.min(), client.min(), diff.min())
-    hi = max(server.max(), client.max(), diff.max())
-    bins = np.linspace(lo, hi, 24)
-    hx.hist(server, bins=bins, orientation="horizontal", alpha=0.6)
-    hx.hist(client, bins=bins, orientation="horizontal", alpha=0.6)
-    hx.hist(diff, bins=bins, orientation="horizontal", alpha=0.6, color="0.35")
-    hx.axhline(0, color="0.6", lw=0.8)
-    hx.set_xlabel("count")
-    hx.tick_params(labelleft=False)
-    hx.grid(alpha=0.3)
+    bx.axhline(0, color="0.6", lw=0.8)
+    bx.plot(
+        shots, diff, ".-", ms=3, lw=0.8, color="C3",
+        label=f"{diff.mean():+.2f} ± {diff.std():.2f} µs",
+    )
+    bx.set_ylabel("Pico client −\nPico server (µs)")
+    bx.set_xlabel("取り込み (約 5 秒に 1 回)")
+    bx.set_title("NTP が渡せた精度", fontsize=10, loc="left")
+    bx.legend(loc="upper left", fontsize=8)
+    bx.grid(alpha=0.3)
+
+    top = np.linspace(
+        min(server.min(), client.min()), max(server.max(), client.max()), 22
+    )
+    hx.hist(server, bins=top, orientation="horizontal", alpha=0.65, color="C0")
+    hx.hist(client, bins=top, orientation="horizontal", alpha=0.65, color="C1")
+    gx.hist(
+        diff,
+        bins=np.linspace(diff.min(), diff.max(), 22),
+        orientation="horizontal",
+        alpha=0.75,
+        color="C3",
+    )
+    for h, share in ((hx, ax), (gx, bx)):
+        h.axhline(0, color="0.6", lw=0.8)
+        h.set_ylim(share.get_ylim())
+        h.tick_params(labelleft=False)
+        h.grid(alpha=0.3)
+    gx.set_xlabel("count")
 
     fig.suptitle(
-        f"1PPS の位置 (n={len(server)})   "
-        f"Pico server {server.mean():+.2f} µs (sd {server.std():.2f})   "
-        f"Pico client {client.mean():+.2f} µs (sd {client.std():.2f})   "
-        f"client − server {(client - server).mean():+.2f} µs "
-        f"(sd {(client - server).std():.2f})",
-        fontsize=10,
+        f"broadcast で同期しているあいだの時刻差 (n={len(server)}、約 8 分)", fontsize=11
     )
     fig.tight_layout()
     path = os.path.join(OUT, "fig-broadcast-series.png")
