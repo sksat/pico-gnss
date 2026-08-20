@@ -362,6 +362,11 @@ async fn link_task(mut rx: Rx10BaseT<'static, PIO0, 0>) {
 /// back untouched and [`measure`] matches on it, so nothing else has to be remembered.
 #[embassy_executor::task]
 async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>) {
+    // A broadcast client listens and nothing else. Leaving the questions running would measure
+    // both modes at once and report it as one, which is what this build exists to avoid.
+    if cfg!(feature = "broadcast-client") {
+        core::future::pending::<()>().await;
+    }
     let mut frame = [0u8; REQ_FRAME_LEN];
     let mut symbols = [0u32; REQ_SYMBOL_WORDS];
     let mut ip_id: u16 = 0;
