@@ -46,7 +46,7 @@
 #[cfg(feature = "swd-rx")]
 mod swd_rx;
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use defmt::{info, warn};
@@ -74,7 +74,10 @@ use pico_10base_t::frame::{
 };
 use pico_10base_t::phy::{NLP_INTERVAL_US, encode_frame, encoded_words};
 use pico_10base_t::rx::decode_frame;
-use rp_pps::embassy::{PpsOutput, TimedPpsCapture, run_capture, run_nmea, set_capture_polarity};
+use rp_pps::embassy::{
+    PpsCapture, PpsOutput, TimedPpsCapture, run_capture, run_nmea, set_capture_polarity,
+    start_in_sync,
+};
 use rp_pps::{
     PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, output_high_cycles,
     output_period_cycles,
@@ -290,6 +293,32 @@ fn now_ns() -> u64 {
     Instant::now().as_micros() * 1000
 }
 
+/// Software time of the instant the PIO counters were started, or `i64::MIN` before that.
+///
+/// The capture counter's zero is the write that enabled it, and that write is on the same line as
+/// the read below it: no await between them, no other task in the way, so the two are a few
+/// instructions apart rather than however long the executor takes to come round. Everything that
+/// has a software time and wants to ask the disciplined clock about it converts through this.
+///
+/// This is the one place a clock read still decides anything, and it is read once, at a moment the
+/// code chose rather than one it was handed.
+static COUNTER_ORIGIN_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
+    BlockingMutex::new(Cell::new(i64::MIN));
+
+/// A software time, on the capture counter's scale.
+fn capture_ns(software_ns: u64) -> Option<u64> {
+    let origin = COUNTER_ORIGIN_NS.lock(|o| o.get());
+    if origin == i64::MIN {
+        return None;
+    }
+    (software_ns as i64).checked_sub(origin).map(|d| d as u64)
+}
+
+/// Now, on the capture counter's scale.
+fn capture_now_ns() -> Option<u64> {
+    capture_ns(now_ns())
+}
+
 /// The polarity of the 1PPS this firmware is built for.
 ///
 /// [`rp_pps::pps_capture_program`] only ever watches for a rising edge, so an active-low receiver
@@ -422,24 +451,6 @@ async fn link_rx_task(mut rx: Rx10BaseT<'static, PIO1, 1>) {
 /// Width of the 1PPS on GP6, matching the receiver's own so the two traces have the same shape.
 const PPS_OUT_PULSE_NS: u32 = 100_000_000;
 
-/// How far this firmware's idea of the second sits behind the receiver's (ns).
-///
-/// Used by everything that puts a clock reading on a wire or a pin *without* going through the
-/// scheduled-second path. The beacon does go through it and must not have this applied twice:
-/// `TX_LAG_NS` was measured from the receiver's own edge, so it already carries this.
-///
-/// The disciplined clock is not the receiver's 1PPS; it is an estimate built from that pulse, the
-/// sentence that names it, and the capture path in between, and it comes out a constant behind.
-/// The transmit path never had to know: `WIRE_LAG_NS` was measured from the receiver's own edge to
-/// the first bit on the wire, so this offset was inside it from the start and the packets are
-/// right. A pin has no such calibration, and with nothing here the 1PPS on GP6 sat 53.16 us
-/// (sd 0.92, n=24) past the receiver's second while the client taking its time from those same
-/// packets sat within a microsecond of it.
-///
-/// So: measured on an oscilloscope, against the receiver's 1PPS, and subtracted here alone. It does
-/// not touch the clock, and so does not disturb the transmit lag that already accounts for it.
-const CLOCK_OFFSET_NS: i64 = 53_160;
-
 /// How early the word for the next edge is pushed, measured against the edge before it. See
 /// [`rp_pps::PpsSchedule`]: what the state machine pulls before an edge is the interval that
 /// follows, so the deadline is one edge earlier than the edge being positioned.
@@ -463,13 +474,11 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
         }
 
         let predicted = schedule.predicted_edge_ns();
-        let utc = CLOCK.lock(|g| g.borrow().now_from_query_ns(predicted as u64));
+        let utc = CLOCK.lock(|g| g.borrow().now_from_capture_ns(predicted as u64));
         let trusted = SOURCE_TRUSTED.load(Ordering::Relaxed);
 
         let step = match utc {
-            Some(utc) if trusted => {
-                schedule.advance(0, pps_lateness_ns(utc + CLOCK_OFFSET_NS))
-            }
+            Some(utc) if trusted => schedule.advance(0, pps_lateness_ns(utc)),
             // Nothing to steer by yet: free-run at the nominal second so the FIFO stays fed.
             _ => schedule.step(0, 0),
         };
@@ -483,15 +492,15 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
         edges = edges.wrapping_add(1);
         if edges <= 8 || edges.is_multiple_of(16) {
             let landed = CLOCK
-                .lock(|g| g.borrow().now_from_query_ns(step.edge_ns as u64))
-                .map(|utc| pps_lateness_ns(utc + CLOCK_OFFSET_NS))
+                .lock(|g| g.borrow().now_from_capture_ns(step.edge_ns as u64))
+                .map(pps_lateness_ns)
                 .unwrap_or(0);
             info!(
                 "PPSOUT edges={} word={} corr_ns={} asked_late_ns={} landed_late_ns={}",
                 edges,
                 step.period_word,
                 step.correction_ns,
-                utc.map(|u| pps_lateness_ns(u + CLOCK_OFFSET_NS)).unwrap_or(0),
+                utc.map(pps_lateness_ns).unwrap_or(0),
                 landed
             );
         }
@@ -516,9 +525,12 @@ async fn nmea_task(rx: BufferedUartRx) {
 /// Read everything the server policy needs, in one lock so the values are mutually consistent.
 fn clock_state() -> (Option<i64>, ClockState) {
     let q = now_ns();
+    let c = capture_now_ns();
     CLOCK.lock(|g| {
         let g = g.borrow();
-        let now = g.now_from_query_ns(q);
+        // Time in the capture timebase, ageing in the software one. The first is what must not
+        // carry a scheduling delay; the second only gates service and is a millisecond quantity.
+        let now = c.and_then(|c| g.now_from_capture_ns(c));
         let holdover_ns = g.holdover_ns(q);
         (
             now,
@@ -562,8 +574,8 @@ async fn answer(
         &CFG,
         &state,
         &request.packet,
-        request.receive_unix_ns + CLOCK_OFFSET_NS,
-        now + CLOCK_OFFSET_NS + REPLY_LAG_NS,
+        request.receive_unix_ns,
+        now + REPLY_LAG_NS,
     );
     let packet = match decision {
         ServeDecision::Silent(reason) => {
@@ -595,9 +607,9 @@ async fn answer(
     };
     // The frame is ready; the moment it claims is not yet. Hold it until the clock is one wire lag
     // short of the departure written inside it, so that what goes out is what was promised.
-    let departure = now + CLOCK_OFFSET_NS + REPLY_LAG_NS;
+    let departure = now + REPLY_LAG_NS;
     let handover_ns = now_ns() as i64 - started;
-    let slack_ns = departure - WIRE_LAG_NS - (now + CLOCK_OFFSET_NS + handover_ns);
+    let slack_ns = departure - WIRE_LAG_NS - (now + handover_ns);
     if slack_ns > 0 {
         Timer::after_micros((slack_ns / 1000) as u64).await;
     }
@@ -911,7 +923,15 @@ async fn main(spawner: Spawner) {
         sm1,
         ..
     } = Pio::new(p.PIO0, Irqs);
-    let capture = TimedPpsCapture::new(&mut common, sm0, p.PIN_2, clk_sys_freq());
+    // Stopped, and started later in the same write as the 1PPS output. The two counters are then
+    // one timebase, which is what lets the output be placed without reading a software clock.
+    let capture = TimedPpsCapture::new_stopped(
+        &mut common,
+        sm0,
+        p.PIN_2,
+        clk_sys_freq(),
+        &rp_pps::pps_capture_program(),
+    );
     // After the capture has claimed the pin, never before: assigning it to PIO rewrites the same
     // control register the inversion lives in, so an earlier setting is silently dropped. Found by
     // measuring — the offset came back at −98 ms with the log still saying it had inverted.
@@ -1015,14 +1035,24 @@ async fn main(spawner: Spawner) {
     // rather than the last period - one ~34 s interval, and the output was gone for half a minute.
     let pps_high = output_high_cycles(clk_sys_freq(), PPS_OUT_PULSE_NS);
     let pps_initial = output_period_cycles(clk_sys_freq(), pps_high);
-    let pps_out = PpsOutput::new(&mut common, sm1, p.PIN_6, pps_high, pps_initial);
+    let pps_out = PpsOutput::new_stopped(&mut common, sm1, p.PIN_6, pps_high, pps_initial);
+    // Zero, not a clock reading. Both state machines are enabled by the write below, so the moment
+    // this schedule counts from is the moment the capture counter started, and the schedule's edges
+    // and the captured edges are on one scale. Reading a clock here instead put whatever that read
+    // cost onto every edge afterwards, which is what `CLOCK_OFFSET_NS` used to subtract.
     let pps_schedule = PpsSchedule::at_enable(
         clk_sys_freq(),
         pps_high,
         PpsScheduleConfig::default(),
-        now_ns() as i64,
+        0,
         pps_initial,
     );
+    start_in_sync(
+        embassy_rp::pac::PIO0,
+        PpsCapture::<PIO0, 0>::sm_mask() | PpsOutput::<PIO0, 1>::sm_mask(),
+    );
+    // Next line, deliberately: see `COUNTER_ORIGIN_NS`.
+    COUNTER_ORIGIN_NS.lock(|o| o.set(now_ns() as i64));
 
     // Neither `Common` may be dropped. embassy-rp releases a PIO block's pins - resets their
     // FUNCSEL to NULL - once the `Common` and the state machines it handed out are all gone, and
