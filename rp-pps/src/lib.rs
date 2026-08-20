@@ -397,15 +397,30 @@ pub struct PpsEdgeTimeline {
     clk_hz: u32,
     last: Option<u32>,
     edge_ns: u64,
+    /// Ticks the counter loses each time it captures, added back to every interval.
+    ///
+    /// [`pps_capture_program`] cannot decrement while it is pushing, and neither can
+    /// [`event_capture_program`]. For a 1PPS that is one capture a second, so leaving it in reads
+    /// every second short by that much and biases the frequency estimate built on it — by 32 ppb
+    /// for the event program's two ticks at 125 MHz. Small, and a bias rather than noise: it does
+    /// not average away, and holdover extrapolates on it.
+    toll: u64,
 }
 
 impl PpsEdgeTimeline {
-    /// Create for a given system clock.
+    /// Create for a given system clock, for a capture program with no toll worth counting.
     pub const fn new(clk_hz: u32) -> Self {
+        Self::with_toll(clk_hz, 0)
+    }
+
+    /// Create for a capture program that loses `toll` ticks every time it captures — see
+    /// [`EVENT_CAPTURE_TOLL_TICKS`].
+    pub const fn with_toll(clk_hz: u32, toll: u64) -> Self {
         Self {
             clk_hz,
             last: None,
             edge_ns: 0,
+            toll,
         }
     }
 
@@ -419,20 +434,33 @@ impl PpsEdgeTimeline {
     /// because that is what makes the first captured value say how long the counting had been
     /// going: the counter runs down from zero, so `0 - raw` is the elapsed ticks.
     pub const fn from_counter_start(clk_hz: u32) -> Self {
+        Self::from_counter_start_with_toll(clk_hz, 0)
+    }
+
+    /// [`from_counter_start`](Self::from_counter_start) for a program that loses `toll` ticks every
+    /// time it captures — see [`EVENT_CAPTURE_TOLL_TICKS`].
+    ///
+    /// Both at once, because a counter shared with other state machines is exactly the one whose
+    /// program has a toll worth counting: the sharing is what forces every machine in the block
+    /// onto one program.
+    pub const fn from_counter_start_with_toll(clk_hz: u32, toll: u64) -> Self {
         Self {
             clk_hz,
             // Zero is not "no reading yet" here, it is the reading the counter had when it was
             // enabled. The first capture then measures an interval like any other.
             last: Some(0),
             edge_ns: 0,
+            toll,
         }
     }
 
     /// Record a raw capture-counter value (e.g. from `wait_edge()`); returns the interval since the
     /// previous edge and the running timeline. The first call returns `interval_ns = edge_ns = 0`.
     pub fn observe(&mut self, raw: u32) -> TimedEdge {
+        // Ticks first, then nanoseconds: the toll is a tick count, and adding it after the
+        // conversion would round it twice.
         let interval_ns = match self.last {
-            Some(prev) => interval_ns(prev, raw, self.clk_hz),
+            Some(prev) => ticks_to_ns(interval_ticks(prev, raw) as u64 + self.toll, self.clk_hz),
             None => 0,
         };
         self.last = Some(raw);
@@ -765,6 +793,21 @@ mod tests {
         // 90 us covers a 94-byte frame and the gap after it.
         assert_eq!(event_blank_counts(90_000, 125_000_000), 5_625);
         assert_eq!(event_blank_counts(16, 125_000_000), 1);
+    }
+
+    #[test]
+    fn a_timeline_adds_back_what_the_capture_cost() {
+        // One second of ticks at 125 MHz, less the two the capture stopped for. Without the toll
+        // this reads 32 ns short every second, which is a bias and not noise.
+        let per_second = 125_000_000 / CAPTURE_CYCLES_PER_TICK;
+        let mut plain = PpsEdgeTimeline::new(125_000_000);
+        let mut tolled = PpsEdgeTimeline::with_toll(125_000_000, EVENT_CAPTURE_TOLL_TICKS);
+        let raw: u32 = 0x8000_0000;
+        plain.observe(raw);
+        tolled.observe(raw);
+        let next = raw.wrapping_sub(per_second - EVENT_CAPTURE_TOLL_TICKS as u32);
+        assert_eq!(plain.observe(next).interval_ns, 1_000_000_000 - 32);
+        assert_eq!(tolled.observe(next).interval_ns, 1_000_000_000);
     }
 
     #[test]

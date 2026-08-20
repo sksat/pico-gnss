@@ -108,7 +108,24 @@ pub struct EventCapture<'d, PIO: Instance, const SM: usize> {
     /// firmware that keeps its state machines running must not let that happen anyway.
     #[allow(dead_code)]
     prog: Option<LoadedProgram<'d, PIO>>,
+    /// Captures accounted for, read or discarded.
+    ///
+    /// Kept here rather than by the caller because the caller cannot see them all. This counter
+    /// stops for [`crate::EVENT_CAPTURE_TOLL_TICKS`] every time it fires, and it fires on
+    /// everything that crosses its pin — not only the frames a task went looking for. A count
+    /// maintained beside the interesting ones drifts from the truth at the rate of the boring ones,
+    /// and [`crate::ticks_between`] then corrects by the wrong amount.
+    captures: u64,
+    /// Whether a read ever emptied a full FIFO, so a capture may have been dropped before it.
+    ///
+    /// The program pushes without blocking, which is what keeps the counter running — and what
+    /// makes a surplus silent. Four is the depth, so four in hand means there may have been a
+    /// fifth, and from then on the count is a lower bound.
+    may_have_missed: bool,
 }
+
+/// Depth of a state machine's RX FIFO when the FIFOs are not joined.
+const RX_FIFO_DEPTH: u32 = 4;
 
 impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
     /// Load `program` onto `sm` and point it at `gpio`, leaving it stopped.
@@ -132,6 +149,21 @@ impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
         me
     }
 
+    /// How many times this counter has stopped to capture, as far as it has been told.
+    ///
+    /// Read it *before* taking the value it is about to be asked about: what
+    /// [`crate::ticks_between`] wants is the tolls already paid when that value was pushed, and a
+    /// capture's own toll comes after its push.
+    pub fn captures(&self) -> u64 {
+        self.captures
+    }
+
+    /// Whether the count is a lower bound rather than exact — see [`EventCapture::may_have_missed`
+    /// documentation on the field]. Once true it stays true.
+    pub fn missed_captures(&self) -> bool {
+        self.may_have_missed
+    }
+
     /// Like [`EventCapture::new_stopped`], but onto a program already in the block.
     ///
     /// A PIO block holds 32 instructions and every counter in a set runs the same program, so
@@ -148,7 +180,12 @@ impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
         sm.set_config(&cfg);
         // After `set_config`, which writes the whole of `EXECCTRL`.
         set_jmp_pin_unclaimed(pio_regs, SM, gpio);
-        Self { sm, prog: None }
+        Self {
+            sm,
+            prog: None,
+            captures: 0,
+            may_have_missed: false,
+        }
     }
 
     /// This capture's bit in its PIO's `CTRL` register, for [`start_in_sync`].
@@ -167,7 +204,11 @@ impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
 
     /// The oldest counter value waiting, if any.
     pub fn try_read(&mut self) -> Option<u32> {
-        self.sm.rx().try_pull()
+        let value = self.sm.rx().try_pull();
+        if value.is_some() {
+            self.captures += 1;
+        }
+        value
     }
 
     /// Await the next edge.
@@ -184,6 +225,10 @@ impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
         let mut n = 0;
         while self.sm.rx().try_pull().is_some() {
             n += 1;
+        }
+        self.captures += n as u64;
+        if n >= RX_FIFO_DEPTH {
+            self.may_have_missed = true;
         }
         n
     }
@@ -342,16 +387,21 @@ impl<'d, PIO: Instance, const SM: usize> TimedPpsCapture<'d, PIO, SM> {
 
     /// Like [`TimedPpsCapture::new_with_program`] but leaves the state machine stopped, so it can
     /// be brought up together with the other counters it will be compared against.
+    /// `toll` is what one capture costs the counter, in ticks — zero for
+    /// [`crate::pps_capture_program`], [`crate::EVENT_CAPTURE_TOLL_TICKS`] for
+    /// [`crate::event_capture_program`]. Leaving it out reads every interval short by that much,
+    /// which is a bias in the frequency estimate and not noise that averages away.
     pub fn new_stopped(
         common: &mut Common<'d, PIO>,
         sm: StateMachine<'d, PIO, SM>,
         pps_pin: Peri<'d, impl PioPin>,
         clk_hz: u32,
+        toll: u64,
         program: &pio::Program<32>,
     ) -> Self {
         Self {
             capture: PpsCapture::new_stopped(common, sm, pps_pin, program),
-            timeline: crate::PpsEdgeTimeline::from_counter_start(clk_hz),
+            timeline: crate::PpsEdgeTimeline::from_counter_start_with_toll(clk_hz, toll),
         }
     }
 
@@ -361,11 +411,12 @@ impl<'d, PIO: Instance, const SM: usize> TimedPpsCapture<'d, PIO, SM> {
         sm: StateMachine<'d, PIO, SM>,
         pps_pin: Peri<'d, impl PioPin>,
         clk_hz: u32,
+        toll: u64,
         prog: &LoadedProgram<'d, PIO>,
     ) -> Self {
         Self {
             capture: PpsCapture::new_stopped_shared(common, sm, pps_pin, prog),
-            timeline: crate::PpsEdgeTimeline::from_counter_start(clk_hz),
+            timeline: crate::PpsEdgeTimeline::from_counter_start_with_toll(clk_hz, toll),
         }
     }
 

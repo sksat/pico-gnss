@@ -94,7 +94,7 @@ use rp_pps::embassy::{
 use rp_pps::{
     EVENT_CAPTURE_TOLL_TICKS, PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, TickTimeline,
     event_blank_counts, event_capture_program, output_high_cycles, output_period_cycles,
-    ticks_between, ticks_to_ns,
+    ticks_between,
 };
 use tiny_ntp::packet::{NtpPacket, PACKET_LEN};
 use tiny_ntp::server::{
@@ -444,8 +444,6 @@ async fn link_rx_task(
     let mut frame = [0u8; RX_MAX_FRAME];
     let mut seen: u32 = 0;
     let mut taken: u32 = 0;
-    // Captures by the arrival counter, for comparing its value against the egress counter's.
-    let mut arrival_captures: u64 = 0;
 
     loop {
         rx.capture(&mut words).await;
@@ -455,13 +453,12 @@ async fn link_rx_task(
         // watched first, because a timestamp that is right for the wrong reason is worse than one
         // that is visibly wrong.
         let arrived_local = now_ns() as i64 - RX_CAPTURE_NS - RX_LAG_NS;
+        // Before the read: what `ticks_between` wants is the tolls already paid when this value
+        // was pushed, and a capture's own toll comes after its push.
+        let arrived_captures = arrival.captures();
         let hw_raw = arrival.try_read();
         let hw_ticks = hw_raw.map(|raw| ARRIVAL_TICKS.lock(|a| a.borrow_mut().observe(raw)));
         let surplus = arrival.drain();
-        let arrived_captures = arrival_captures;
-        if hw_raw.is_some() {
-            arrival_captures += 1;
-        }
         seen = seen.wrapping_add(1);
         let Some(arrived_ns) = CLOCK.lock(|g| g.borrow().now_from_query_ns(arrived_local as u64))
         else {
@@ -499,12 +496,8 @@ async fn link_rx_task(
         if taken.is_multiple_of(16) {
             match hw_ticks {
                 Some(ticks) => info!(
-                    "NTPRX seen={} requests={} hw_ticks={=u64} sw-hw={} ns surplus={}",
-                    seen,
-                    taken,
-                    ticks,
-                    arrived_local - ticks_to_ns(ticks, clk_sys_freq()) as i64,
-                    surplus
+                    "NTPRX seen={} requests={} hw_ticks={=u64} sw_ns={} surplus={}",
+                    seen, taken, ticks, arrived_local, surplus
                 ),
                 None => info!("NTPRX seen={} requests={} (no hardware timestamp)", seen, taken),
             }
@@ -514,6 +507,29 @@ async fn link_rx_task(
 
 /// Width of the 1PPS on GP6, matching the receiver's own so the two traces have the same shape.
 const PPS_OUT_PULSE_NS: u32 = 100_000_000;
+
+/// How far this firmware's idea of the second sits behind the receiver's (ns).
+///
+/// Used by everything that puts a clock reading on a wire or a pin *without* going through the
+/// scheduled-second path. The beacon does go through it and must not have this applied twice:
+/// `TX_LAG_NS` was measured from the receiver's own edge, so it already carries this.
+///
+/// The disciplined clock is not the receiver's 1PPS; it is an estimate built from that pulse, the
+/// sentence that names it, and the capture path in between, and it comes out behind. With nothing
+/// here the 1PPS on GP6 sat 53.16 us (sd 0.92, n=24) past the receiver's second, so that is what
+/// went in.
+///
+/// **This is a number fitted to one run, and the thing it fits moves.** Measuring the output again
+/// after setting it and finding it near zero proves only that the subtraction works — the fit
+/// measuring itself. Later runs put the same underlying offset near 80 us, on builds whose clock
+/// path had not changed: not the capture program's toll (bisected), not the arithmetic sharing the
+/// executor with the 1PPS timestamp (moved off it, no change), and not the reply traffic (client
+/// stopped, no change). What moves it is not known.
+///
+/// It is left as measured rather than re-fitted, because re-fitting is what produced the false
+/// confidence the first time. Anything that rests on this constant rests on a number that has been
+/// seen to move by 74 us, and that is the case for timestamping the second at the pin instead.
+const CLOCK_OFFSET_NS: i64 = 53_160;
 
 /// How early the word for the next edge is pushed, measured against the edge before it. See
 /// [`rp_pps::PpsSchedule`]: what the state machine pulls before an edge is the interval that
@@ -621,7 +637,6 @@ fn clock_state() -> (Option<i64>, ClockState) {
 async fn answer(
     tx: &mut Tx10BaseT<'static, PIO1, 0>,
     egress: &mut EventCapture<'static, PIO0, 3>,
-    egress_captures: u64,
     request: &PendingRequest,
     ip_id: u16,
     frame: &mut [u8; FRAME_LEN],
@@ -681,34 +696,40 @@ async fn answer(
     }
     egress.drain();
     tx.send(&symbols[..words]).await;
+    // The count *after* draining and *before* reading: the drain accounted for the broadcasts and
+    // anything else that crossed this pin, which stop the counter exactly as a reply does. Keeping
+    // a tally of replies alone was wrong by one broadcast a second, and `ticks_between` corrected
+    // by 32 ns per second of it.
+    let egress_captures = egress.captures();
     let hw_egress = egress.try_read();
     egress.drain();
     // How long this board held the question, as its own pins saw it: the request's first bit
     // arriving to the reply's first bit leaving. The client measures the whole round trip the same
     // way; on a link two wires long, the difference between the two is the path, and the path is
     // nanoseconds. Anything else in it is a constant that should not be there.
-    let hw_turnaround_ns = match (request.arrived_raw, hw_egress) {
-        (Some(r2), Some(r3)) => Some(
-            ticks_between(
-                r2,
-                request.arrived_captures,
-                r3,
-                egress_captures,
-                EVENT_CAPTURE_TOLL_TICKS,
-            ) * 1_000_000_000
-                / (clk_sys_freq() as i64 / 2),
-        ),
+    // Ticks, not nanoseconds. The conversion is a 64-bit division on a core with no divider, and
+    // this runs on the executor that also timestamps the 1PPS — arithmetic here delays that read
+    // and moves the clock it feeds. Measured: adding this computation in nanoseconds moved the
+    // served second by 74 us against the receiver's. The host multiplies by 16 ns.
+    let hw_turnaround_ticks = match (request.arrived_raw, hw_egress) {
+        (Some(r2), Some(r3)) => Some(ticks_between(
+            r2,
+            request.arrived_captures,
+            r3,
+            egress_captures,
+            EVENT_CAPTURE_TOLL_TICKS,
+        )),
         _ => None,
     };
 
     info!(
-        "NTPREPLY rx_ns={} claimed_tx_ns={} handover_ns={} slack_ns={} bytes={} hw_turnaround_ns={}",
+        "NTPREPLY rx_ns={} claimed_tx_ns={} handover_ns={} slack_ns={} bytes={} hw_turnaround_ticks={}",
         request.receive_unix_ns,
         departure,
         handover_ns,
         slack_ns,
         len,
-        hw_turnaround_ns.unwrap_or(i64::MIN)
+        hw_turnaround_ticks.unwrap_or(i64::MIN)
     );
     if slack_ns <= 0 {
         // The build overran the departure it had promised. Every reply from here is late by
@@ -735,25 +756,13 @@ async fn ntp_task(
     // is otherwise reachable: after transmitting we can still be a few hundred microseconds *before*
     // the boundary we aimed at, and would then aim at it again.
     let mut last_target_ns: i64 = i64::MIN;
-    // Captures by the egress counter, for comparing its value against the arrival counter's.
-    let mut egress_captures: u64 = 0;
 
     loop {
         // A question outranks the beacon. Answering is the whole point of having a receive path:
         // it is what lets a client measure the round trip instead of assuming it.
         if let Ok(request) = REQUESTS.try_receive() {
             ip_id = ip_id.wrapping_add(1);
-            answer(
-                &mut tx,
-                &mut egress,
-                egress_captures,
-                &request,
-                ip_id,
-                &mut frame,
-                &mut symbols,
-            )
-            .await;
-            egress_captures += 1;
+            answer(&mut tx, &mut egress, &request, ip_id, &mut frame, &mut symbols).await;
             continue;
         }
 
@@ -1040,7 +1049,14 @@ async fn main(spawner: Spawner) {
     // are one timebase then, and the output can be placed without reading a software clock.
     let counter = common.load_program(&event_capture_program());
     let mut capture =
-        TimedPpsCapture::new_stopped_shared(&mut common, sm0, p.PIN_2, clk_sys_freq(), &counter);
+        TimedPpsCapture::new_stopped_shared(
+            &mut common,
+            sm0,
+            p.PIN_2,
+            clk_sys_freq(),
+            EVENT_CAPTURE_TOLL_TICKS,
+            &counter,
+        );
     // After the capture has claimed the pin, never before: assigning it to PIO rewrites the same
     // control register the inversion lives in, so an earlier setting is silently dropped. Found by
     // Without that ordering the inversion is silently dropped and the offset comes back at −98 ms

@@ -278,8 +278,6 @@ async fn link_task(
     // The counter has no origin, so the first difference between the two clocks is
     // whatever it is. What matters is what it does after that.
     let mut hw_gap_base: Option<i64> = None;
-    // Captures by the arrival counter, for comparing its value against the egress counter's.
-    let mut arrival_captures_seen: u64 = 0;
 
     loop {
         rx.capture(&mut words).await;
@@ -289,17 +287,12 @@ async fn link_task(
         // rising edge of the preamble - the frame's first bit - and everything after it is the rest
         // of the frame, which is why the rest is thrown away.
         let arrived_ns = now_ns() - CAPTURE_NS - RX_LAG_NS;
+        // Before the read, for the reason the counter's own documentation gives.
+        let arrival_captures = arrival.captures();
         let hw_raw = arrival.try_read();
         let surplus = arrival.drain();
         let hw_ticks = hw_raw.map(|raw| ARRIVAL.lock(|a| a.borrow_mut().observe(raw)));
-        let arrival_captures = {
-            let n = arrival_captures_seen;
-            if hw_raw.is_some() {
-                arrival_captures_seen += 1;
-            }
-            n
-        };
-        let mut hw_rtt_ns: Option<i64> = None;
+        let mut hw_rtt_ticks: Option<i64> = None;
         seen = seen.wrapping_add(1);
 
         // How much of the capture the frame actually took. A 94-byte frame is 1638 symbols with
@@ -355,14 +348,15 @@ async fn link_task(
                 // On this link the two wires are nanoseconds, so all of this is the far side's
                 // turnaround - and the far side reports that separately.
                 if let Some(raw4) = hw_raw {
-                    let ticks = ticks_between(
+                    // Ticks, and no conversion: a 64-bit division on a core without a divider,
+                    // done on the executor that also places the 1PPS. The host multiplies by 16 ns.
+                    hw_rtt_ticks = Some(ticks_between(
                         sent.departed_raw,
                         sent.departed_captures,
                         raw4,
                         arrival_captures,
                         EVENT_CAPTURE_TOLL_TICKS,
-                    );
-                    hw_rtt_ns = Some(ticks * 1_000_000_000 / (125_000_000 / 2));
+                    ));
                 }
                 match measure(&sent.packet, &packet, hint) {
                     Ok(m) => {
@@ -411,9 +405,9 @@ async fn link_task(
             // arbitrary constant in it - but only a constant, and what it *does* over time is the
             // software receive path moving. That is the thing `RX_LAG_NS` stands in for as though
             // it did not move.
-            let gap_ns = arrived_ns - ticks_to_ns(ticks, 125_000_000) as i64;
-            let base = *hw_gap_base.get_or_insert(gap_ns);
             if used.is_multiple_of(16) {
+                let gap_ns = arrived_ns - ticks_to_ns(ticks, clk_sys_freq()) as i64;
+                let base = *hw_gap_base.get_or_insert(gap_ns);
                 info!(
                     "HWRX ticks={=u64} sw-hw={} ns (drift {} ns) surplus={}",
                     ticks,
@@ -428,19 +422,19 @@ async fn link_task(
 
         // Every exchange, not every sixteenth: this is paired against the server's own measurement
         // of the same exchange, and the turnaround varies by milliseconds between them.
-        if let Some(rtt) = hw_rtt_ns {
-            info!("HWRTT n={} rtt_ns={}", used, rtt);
+        if let Some(rtt) = hw_rtt_ticks {
+            info!("HWRTT n={} rtt_ticks={}", used, rtt);
         }
         if update.stepped || used.is_multiple_of(16) {
             info!(
-                "NTPRX seen={} used={} beacons={} stratum={} step={} delay_ns={} hw_rtt_ns={} resid_ns={} offset_ns={} drift_ppb={}",
+                "NTPRX seen={} used={} beacons={} stratum={} step={} delay_ns={} hw_rtt_ticks={} resid_ns={} offset_ns={} drift_ppb={}",
                 seen,
                 used,
                 broadcasts,
                 measurement.stratum,
                 update.stepped,
                 measurement.delay_ns,
-                hw_rtt_ns.unwrap_or(i64::MIN),
+                hw_rtt_ticks.unwrap_or(i64::MIN),
                 update.residual_ns,
                 update.offset_ns,
                 update.drift_ppb
@@ -467,9 +461,6 @@ async fn ask_task(
     let mut symbols = [0u32; REQ_SYMBOL_WORDS];
     let mut ip_id: u16 = 0;
     let mut asked: u32 = 0;
-    // How many times this counter has stopped to capture. The correction when its value is
-    // compared against the other counter's is a count, not a constant.
-    let mut captures: u64 = 0;
 
     loop {
         Timer::after(Duration::from_secs(POLL_INTERVAL_S)).await;
@@ -516,6 +507,9 @@ async fn ask_task(
         // value after the send is this frame's first bit and not something older.
         egress.drain();
         tx.send(&symbols[..words]).await;
+        // After the drain, before the read: the drain accounted for everything else that crossed
+        // this pin and stopped the counter, which a tally kept beside the requests would not have.
+        let departed_captures = egress.captures();
         let sent_raw = egress.try_read();
         egress.drain();
         if let Some(raw) = sent_raw {
@@ -523,10 +517,9 @@ async fn ask_task(
                 *o.borrow_mut() = Some(Outstanding {
                     packet,
                     departed_raw: raw,
-                    departed_captures: captures,
+                    departed_captures,
                 })
             });
-            captures += 1;
         }
         asked = asked.wrapping_add(1);
 
