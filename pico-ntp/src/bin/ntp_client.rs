@@ -1,8 +1,8 @@
 //! The other board in the pair: take the time off the link and put it on a pin.
 //!
 //! ```text
-//!   Pico1 GP16 (TX-) ──► GP18  PIO0 SM0 + DMA ──► frame ──► NTP ──┐
-//!   Pico1 GP17 (TX+) ──► GP19                                     │
+//!   server GP16 (TX-) ──► GP18  PIO0 SM0 + DMA ──► frame ──► NTP ──┐
+//!   server GP17 (TX+) ──► GP19                                     │
 //!                                                                 ▼
 //!                                                          NtpDiscipline
 //!                                                                 │

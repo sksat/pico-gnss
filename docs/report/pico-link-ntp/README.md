@@ -8,15 +8,15 @@ Pico 2 台を GPIO で直結し、10BASE-T のロジックだけでフレーム�
 ## 配線
 
 ```
-Pico1 GP16 (TX-) ──► Pico2 GP18      Pico1 = server (GNSS 受信機つき)
-Pico1 GP17 (TX+) ──► Pico2 GP19      Pico2 = client (GNSS なし)
-Pico2 GP16 (TX-) ──► Pico1 GP18
-Pico2 GP17 (TX+) ──► Pico1 GP19
+server GP16 (TX-) ──► client GP18      server は GNSS 受信機つき
+server GP17 (TX+) ──► client GP19      client は GNSS なし
+client GP16 (TX-) ──► server GP18
+client GP17 (TX+) ──► server GP19
 GND ───────────────── GND
 
 オシロ  CH1 = GPS-R 1PPS (active low、秒境界は falling edge)
-        CH3 = Pico1 GP6
-        CH4 = Pico2 GP6
+        CH3 = server GP6
+        CH4 = client GP6
 ```
 
 ## 図

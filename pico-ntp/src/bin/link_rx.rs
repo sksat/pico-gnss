@@ -4,8 +4,8 @@
 //! captures what follows every departure from idle, decodes it, checks the FCS, and reports.
 //!
 //! ```text
-//!   Pico1 GP16 (TX−) ──► GP18   PIO0 SM0 + DMA ──► FrameDecoder ──► defmt
-//!   Pico1 GP17 (TX+) ──► GP19
+//!   server GP16 (TX−) ──► GP18   PIO0 SM0 + DMA ──► FrameDecoder ──► defmt
+//!   server GP17 (TX+) ──► GP19
 //! ```
 //!
 //! Two pins, not one. The line has three states — idle and the two differential polarities — and
