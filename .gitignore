@@ -40,3 +40,6 @@ report/wander-review-spectrum.png
 # Claude Code workflow worktrees (transient; never commit)
 /.claude/worktrees/
 .analysis-tmp/
+
+# 同じ client を別 feature で建てて比べるときの二つ目の target
+/target-broadcast/

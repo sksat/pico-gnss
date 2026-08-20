@@ -47,7 +47,7 @@ use pico_10base_t::phy::{encode_frame, encoded_words};
 use pico_10base_t::rx::{decode_frame, symbols_of};
 use rp_pps::embassy::PpsOutput;
 use rp_pps::{PpsSchedule, PpsScheduleConfig, output_high_cycles, output_period_cycles};
-use tiny_ntp::client::{measure, request};
+use tiny_ntp::client::{accept_broadcast, measure, request};
 use tiny_ntp::discipline::{DisciplineConfig, NtpDiscipline};
 use tiny_ntp::packet::{Mode, NtpPacket, PACKET_LEN};
 
@@ -309,10 +309,23 @@ async fn link_task(mut rx: Rx10BaseT<'static, PIO0, 0>) {
                 }
             }
             // The beacon still goes out, and it is still true; it just cannot say how long it took
-            // to arrive. Counted, not used - the exchange is what this client runs on.
+            // to arrive. Counted, not used - the exchange is what this client runs on, unless it
+            // was built the other way round to measure what the difference is worth.
             Mode::Broadcast => {
                 broadcasts = broadcasts.wrapping_add(1);
-                continue;
+                if !cfg!(feature = "broadcast-client") {
+                    continue;
+                }
+                // Nothing measured the path, so nothing is subtracted for it. On two jumper wires
+                // the one-way time is nanoseconds; on any longer link this is where a client would
+                // have to be told what to assume, and being told is the weakness of the mode.
+                match accept_broadcast(&packet, hint, 0) {
+                    Ok(m) => m,
+                    Err(reason) => {
+                        warn!("beacon refused: {}", defmt::Debug2Format(&reason));
+                        continue;
+                    }
+                }
             }
             _ => {
                 note(&mut dropped, "not an answer", seen);
