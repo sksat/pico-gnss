@@ -328,6 +328,25 @@ impl PpsEdgeTimeline {
         }
     }
 
+    /// Create a timeline whose zero is the moment the state machine started counting.
+    ///
+    /// [`new`](Self::new) puts zero at the *first edge*, which is all a frequency estimate needs.
+    /// Anything that has to be compared with another state machine needs a zero the two share, and
+    /// state machines enabled by one write share the instant they started.
+    ///
+    /// The caller must have left `X` at zero before enabling (inject `mov x, null` while stopped),
+    /// because that is what makes the first captured value say how long the counting had been
+    /// going: the counter runs down from zero, so `0 - raw` is the elapsed ticks.
+    pub const fn from_counter_start(clk_hz: u32) -> Self {
+        Self {
+            clk_hz,
+            // Zero is not "no reading yet" here, it is the reading the counter had when it was
+            // enabled. The first capture then measures an interval like any other.
+            last: Some(0),
+            edge_ns: 0,
+        }
+    }
+
     /// Record a raw capture-counter value (e.g. from `wait_edge()`); returns the interval since the
     /// previous edge and the running timeline. The first call returns `interval_ns = edge_ns = 0`.
     pub fn observe(&mut self, raw: u32) -> TimedEdge {
@@ -1002,6 +1021,20 @@ mod tests {
                 edge_ns: 0
             }
         );
+    }
+
+    #[test]
+    fn edge_timeline_can_start_where_the_counter_did() {
+        // X is left at zero before the state machine is enabled, so the counter runs down from
+        // zero and the first captured value is the elapsed ticks negated. A timeline that starts
+        // there can be lined up with any other state machine enabled by the same write.
+        let mut t = PpsEdgeTimeline::from_counter_start(125_000_000);
+        // 0.4 s of counting before the first edge: 25M ticks at 62.5M ticks/s.
+        let first = t.observe(0u32.wrapping_sub(25_000_000));
+        assert_eq!(first.edge_ns, 400_000_000, "first edge, measured from the start");
+        let second = t.observe(0u32.wrapping_sub(25_000_000 + 62_500_000));
+        assert_eq!(second.interval_ns, 1_000_000_000);
+        assert_eq!(second.edge_ns, 1_400_000_000);
     }
 
     #[test]
