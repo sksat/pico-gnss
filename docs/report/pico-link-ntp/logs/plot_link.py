@@ -48,7 +48,7 @@ def fig_broadcast_series():
 
     上段は GNSS 受信機の 1PPS を基準にした 2 枚それぞれの時刻差、下段は Pico client が Pico
     server をどれだけ再現したかで、後者が NTP そのものの精度にあたる。分けてあるのは別の量だから
-    で、上段には Pico server 側の較正定数が乗り、下段では両方に等しく乗って落ちる。
+    で、上段には Pico server 側の校正定数が乗り、下段では両方に等しく乗って落ちる。
     """
     server, client = read_pairs("pair-series.csv")
     shots = np.arange(len(server))
@@ -322,7 +322,7 @@ def fig_ntp_accuracy():
     """NTP が Pico server の秒をどれだけ忠実に Pico client へ渡せたか。
 
     見るのは client GP6 − server GP6 で、1 回の取り込みから両方読んだ差である。受信機を基準に
-    した絶対位置と違い、server 側の較正定数は両方に等しく乗るのでこの差からは落ちる。
+    した絶対位置と違い、server 側の校正定数は両方に等しく乗るのでこの差からは落ちる。
     """
     runs = []
     for name, label in RUNS:
