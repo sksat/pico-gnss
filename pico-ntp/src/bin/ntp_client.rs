@@ -288,12 +288,20 @@ async fn link_task(mut rx: Rx10BaseT<'static, PIO0, 0>) {
         // rather than believed.
         let measurement = match packet.mode {
             Mode::Server => {
-                let Some(sent) = OUTSTANDING.lock(|o| o.borrow_mut().take()) else {
+                // Read the question without consuming it. A mode-4 packet is not proof of being
+                // *our* answer - `measure` decides that, by the transmit timestamp the server
+                // echoes - and taking the question first means a duplicate or a stale reply
+                // throws away the state the real one needs. The question is only spent once
+                // something has matched it.
+                let Some(sent) = OUTSTANDING.lock(|o| *o.borrow()) else {
                     note(&mut dropped, "a reply to nothing", seen);
                     continue;
                 };
                 match measure(&sent, &packet, hint) {
-                    Ok(m) => m,
+                    Ok(m) => {
+                        OUTSTANDING.lock(|o| *o.borrow_mut() = None);
+                        m
+                    }
                     Err(reason) => {
                         warn!("reply refused: {}", defmt::Debug2Format(&reason));
                         continue;
