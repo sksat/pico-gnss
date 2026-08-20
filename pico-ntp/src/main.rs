@@ -508,29 +508,6 @@ async fn link_rx_task(
 /// Width of the 1PPS on GP6, matching the receiver's own so the two traces have the same shape.
 const PPS_OUT_PULSE_NS: u32 = 100_000_000;
 
-/// How far this firmware's idea of the second sits behind the receiver's (ns).
-///
-/// Used by everything that puts a clock reading on a wire or a pin *without* going through the
-/// scheduled-second path. The beacon does go through it and must not have this applied twice:
-/// `TX_LAG_NS` was measured from the receiver's own edge, so it already carries this.
-///
-/// The disciplined clock is not the receiver's 1PPS; it is an estimate built from that pulse, the
-/// sentence that names it, and the capture path in between, and it comes out behind. With nothing
-/// here the 1PPS on GP6 sat 53.16 us (sd 0.92, n=24) past the receiver's second, so that is what
-/// went in.
-///
-/// **This is a number fitted to one run, and the thing it fits moves.** Measuring the output again
-/// after setting it and finding it near zero proves only that the subtraction works — the fit
-/// measuring itself. Later runs put the same underlying offset near 80 us, on builds whose clock
-/// path had not changed: not the capture program's toll (bisected), not the arithmetic sharing the
-/// executor with the 1PPS timestamp (moved off it, no change), and not the reply traffic (client
-/// stopped, no change). What moves it is not known.
-///
-/// It is left as measured rather than re-fitted, because re-fitting is what produced the false
-/// confidence the first time. Anything that rests on this constant rests on a number that has been
-/// seen to move by 74 us, and that is the case for timestamping the second at the pin instead.
-const CLOCK_OFFSET_NS: i64 = 53_160;
-
 /// How early the word for the next edge is pushed, measured against the edge before it. See
 /// [`rp_pps::PpsSchedule`]: what the state machine pulls before an edge is the interval that
 /// follows, so the deadline is one edge earlier than the edge being positioned.
