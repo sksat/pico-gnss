@@ -84,13 +84,15 @@ RTT のほうが本筋だが、`rtt-target` の defmt 統合はまだ defmt 0.3 
 defmt を 2 つ入れると global logger が噛み合わない。
 RAM なら target 側に crate を足さずに済む。
 
-## 100 ms 遅れていた
+## server が 100 ms 遅れて見えた
 
-つないで最初に取れた数字がこれである。
+ブリッジができたので、手元の NTP client からこの server を問い合わせた。
+client が出すのは offset と往復時間の 2 つで、offset は server の時計が client の時計からどれだけ離れて見えるかである。
 
 ![捕捉するエッジを変える前と後](fig-edge.png)
 
 上段が当初の状態で、offset は **平均 −100.23 ms、標準偏差 0.55 ms** (n=299)。
+負なので、client から見て server の時計が 100 ms 遅れている。
 揺れが 0.55 ms しかないのに 100 ms ずれている。
 往復時間が 4.6 ms から 8.7 ms まで動いても offset は動かないので、経路の非対称でもない。
 holdover は 1.17 s、周波数オフセットは 578 ppb なので、外挿による誤差は 1 µs に満たない。
