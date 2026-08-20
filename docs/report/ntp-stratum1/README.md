@@ -63,8 +63,12 @@ NTP のパケットは先頭バイトに 3 bit の mode を持っており、mod
 
 ## 受信経路を SWD から借りる
 
-受信経路は SWD にある。
-debug probe は core を止めずに target の RAM を読み書きできるので、要求だけをそこから流し込めば、残りは本物の NTP になる。
+client の要求を firmware まで届ける道が要る。
+10BASE-T の上には無い。
+
+無いのはそこであって、基板に刺さっているケーブルが 10BASE-T だけだというわけではない。
+開発中はデバッグ用の SWD が常に繋がっていて、debug probe は core を止めずに target の RAM を読み書きできる。
+要求をそこから書き込めば、受け取ったあとの処理は本物の NTP のままになる。
 
 ![SWD を受信経路にした構成](fig-swd-path.svg)
 
