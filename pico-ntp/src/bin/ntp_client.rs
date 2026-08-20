@@ -184,7 +184,11 @@ struct Outstanding {
     packet: NtpPacket,
     /// The counter value at the request's first bit, and how many times that counter had already
     /// stopped to capture — both are needed to compare it against a value from the other counter.
-    departed_raw: u32,
+    ///
+    /// Optional, and the packet above is not: the round trip the pins saw is a diagnostic, while
+    /// the packet is what the clock is disciplined by. A monitor that missed its edge must not
+    /// cost this board the exchange.
+    departed_raw: Option<u32>,
     departed_captures: u64,
 }
 
@@ -347,11 +351,11 @@ async fn link_task(
                 // reply's first bit arriving, with no software on either end of the measurement.
                 // On this link the two wires are nanoseconds, so all of this is the far side's
                 // turnaround - and the far side reports that separately.
-                if let Some(raw4) = hw_raw {
+                if let (Some(departed), Some(raw4)) = (sent.departed_raw, hw_raw) {
                     // Ticks, and no conversion: a 64-bit division on a core without a divider,
                     // done on the executor that also places the 1PPS. The host multiplies by 16 ns.
                     hw_rtt_ticks = Some(ticks_between(
-                        sent.departed_raw,
+                        departed,
                         sent.departed_captures,
                         raw4,
                         arrival_captures,
@@ -512,15 +516,13 @@ async fn ask_task(
         let departed_captures = egress.captures();
         let sent_raw = egress.try_read();
         egress.drain();
-        if let Some(raw) = sent_raw {
-            OUTSTANDING.lock(|o| {
-                *o.borrow_mut() = Some(Outstanding {
-                    packet,
-                    departed_raw: raw,
-                    departed_captures,
-                })
-            });
-        }
+        OUTSTANDING.lock(|o| {
+            *o.borrow_mut() = Some(Outstanding {
+                packet,
+                departed_raw: sent_raw,
+                departed_captures,
+            })
+        });
         asked = asked.wrapping_add(1);
 
         if asked <= 3 || asked.is_multiple_of(16) {

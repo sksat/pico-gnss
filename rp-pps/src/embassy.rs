@@ -212,8 +212,15 @@ impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
     }
 
     /// Await the next edge.
+    ///
+    /// Counted like every other way of taking a value out: what [`EventCapture::captures`] is for
+    /// is the tolls the counter has paid, and it pays one whether the value was awaited, polled or
+    /// thrown away. Leaving this one out would under-correct by one capture per awaited edge, which
+    /// accumulates rather than cancels.
     pub async fn wait_edge(&mut self) -> u32 {
-        self.sm.rx().wait_pull().await
+        let value = self.sm.rx().wait_pull().await;
+        self.captures += 1;
+        value
     }
 
     /// Throw away everything waiting, and say how much there was.
