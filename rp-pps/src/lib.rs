@@ -226,6 +226,19 @@ pub fn pps_capture_program_wrap_balanced() -> Program<32> {
     .program
 }
 
+/// The instruction that puts a state machine's `X` at zero, for injecting before it is enabled.
+///
+/// [`pps_capture_program`] and its variants count `X` down and never load it, so where the count
+/// starts is whatever `X` happened to hold. That is fine for intervals and useless for anything
+/// that has to line up with another state machine, because there is then no shared origin — see
+/// [`PpsEdgeTimeline::from_counter_start`].
+///
+/// Written to `SMx_INSTR`, which executes immediately whether or not the machine is enabled, so
+/// this is the way to set a register a program never writes.
+pub fn zero_x_instruction() -> u16 {
+    pio::pio_asm!("mov x, null").program.code[0]
+}
+
 /// Steerable **1PPS output** program for one state machine, with a configurable high-pulse width.
 ///
 /// Once at start it pulls a *high-width word* and stashes it in `ISR` (the high pulse length in PIO
@@ -1021,6 +1034,12 @@ mod tests {
                 edge_ns: 0
             }
         );
+    }
+
+    #[test]
+    fn zeroing_x_is_the_instruction_the_datasheet_gives() {
+        // MOV: 101 | delay/side-set 00000 | destination X 001 | operation none 00 | source NULL 011
+        assert_eq!(zero_x_instruction(), 0xA023);
     }
 
     #[test]

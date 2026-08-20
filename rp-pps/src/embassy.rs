@@ -40,6 +40,32 @@ pub fn set_capture_polarity(pin: usize, polarity: PpsPolarity) {
         .modify(|w| w.set_inover(inover));
 }
 
+/// Start several state machines on one cycle, so the counters inside them agree.
+///
+/// Two free-running counters are only a shared timebase if they were started together, and
+/// `SM_ENABLE` alone does not do that. Each state machine has its own clock divider running free,
+/// so two enabled in the same write can still be counting on opposite phases of theirs — a
+/// sub-tick error, but a permanent one, and the kind that shows up later as a fixed offset nobody
+/// can account for. `CLKDIV_RESTART` in the same write is what the SDK's
+/// `pio_enable_sm_mask_in_sync` exists for.
+///
+/// `mask` is a bitmask of state machine indices within `pio`; combine the `sm_mask()` of each
+/// wrapper being started. Machines already running are left running, but their dividers *are*
+/// restarted, so this is for bringing a set up together rather than adding one to a set that is
+/// already timing something.
+///
+/// Counters compared against each other have to be in the same block. Nothing here can start a
+/// state machine in PIO0 and one in PIO1 on the same cycle.
+///
+/// `pio` is the block's register file, e.g. `embassy_rp::pac::PIO0`. It is handed in because
+/// embassy's `Instance` does not expose it.
+pub fn start_in_sync(pio: embassy_rp::pac::pio::Pio, mask: u8) {
+    pio.ctrl().modify(|w| {
+        w.set_clkdiv_restart(mask);
+        w.set_sm_enable(w.sm_enable() | mask);
+    });
+}
+
 /// PPS input capture on one state machine (see [`crate::pps_capture_program`]).
 pub struct PpsCapture<'d, PIO: Instance, const SM: usize> {
     sm: StateMachine<'d, PIO, SM>,
@@ -76,6 +102,37 @@ impl<'d, PIO: Instance, const SM: usize> PpsCapture<'d, PIO, SM> {
         cfg.set_jmp_pin(&pin);
         sm.set_config(&cfg);
         sm.set_enable(true);
+        Self { sm, prog, pin }
+    }
+
+    /// This capture's bit in its PIO's `CTRL` register, for [`start_in_sync`].
+    pub const fn sm_mask() -> u8 {
+        1 << SM
+    }
+
+    /// Like [`PpsCapture::new_with_program`], but left stopped with its counter at a known zero.
+    ///
+    /// Two things a running capture cannot give: a start instant shared with another state machine
+    /// (that needs one [`start_in_sync`] write), and a counter whose origin is known (the programs
+    /// count `X` down and never load it, so it starts wherever it was). Both are what
+    /// [`crate::PpsEdgeTimeline::from_counter_start`] needs, and together they are what lets the
+    /// 1PPS output be placed without reading a software clock.
+    pub fn new_stopped(
+        common: &mut Common<'d, PIO>,
+        mut sm: StateMachine<'d, PIO, SM>,
+        pps_pin: Peri<'d, impl PioPin>,
+        program: &pio::Program<32>,
+    ) -> Self {
+        let prog = common.load_program(program);
+        let pin = common.make_pio_pin(pps_pin);
+        sm.set_pin_dirs(Direction::In, &[&pin]);
+        let mut cfg = Config::default();
+        cfg.use_program(&prog, &[]);
+        cfg.set_jmp_pin(&pin);
+        sm.set_config(&cfg);
+        // `SMx_INSTR` executes whether or not the machine is enabled, which is the only way to set
+        // a register the program never writes.
+        unsafe { sm.exec_instr(crate::zero_x_instruction()) };
         Self { sm, prog, pin }
     }
 
@@ -158,6 +215,28 @@ impl<'d, PIO: Instance, const SM: usize> TimedPpsCapture<'d, PIO, SM> {
     pub fn capture_mut(&mut self) -> &mut PpsCapture<'d, PIO, SM> {
         &mut self.capture
     }
+
+    /// This capture's bit in its PIO's `CTRL` register, for [`start_in_sync`].
+    pub const fn sm_mask() -> u8 {
+        1 << SM
+    }
+
+    /// Like [`PpsCapture::new_stopped`], paired with a timeline that starts where the counter does.
+    ///
+    /// The pairing matters: a timeline whose zero is the first edge cannot be compared with a
+    /// state machine started by the same write, and a capture left running cannot share that write.
+    pub fn new_stopped(
+        common: &mut Common<'d, PIO>,
+        sm: StateMachine<'d, PIO, SM>,
+        pps_pin: Peri<'d, impl PioPin>,
+        clk_hz: u32,
+        program: &pio::Program<32>,
+    ) -> Self {
+        Self {
+            capture: PpsCapture::new_stopped(common, sm, pps_pin, program),
+            timeline: crate::PpsEdgeTimeline::from_counter_start(clk_hz),
+        }
+    }
 }
 
 /// Steerable 1PPS output on one state machine (see [`crate::pps_output_program`]).
@@ -200,6 +279,37 @@ impl<'d, PIO: Instance, const SM: usize> PpsOutput<'d, PIO, SM> {
     /// Compute it with [`crate::output_period_cycles_ppb`].
     pub fn set_period(&mut self, period_word: u32) -> bool {
         self.sm.tx().try_push(period_word)
+    }
+
+    /// This output's bit in its PIO's `CTRL` register, for [`start_in_sync`].
+    pub const fn sm_mask() -> u8 {
+        1 << SM
+    }
+
+    /// Like [`PpsOutput::new`], but left stopped so it can be enabled alongside a capture.
+    ///
+    /// The output's phase is fixed by when its state machine started: the program raises the pin
+    /// [`crate::OUTPUT_OVERHEAD_CYCLES`] cycles later and every edge after that is a period word
+    /// this side counted out. Started on its own, that instant can only be read from a software
+    /// clock, and whatever that read costs becomes the output's offset. Started by the same write
+    /// as the capture, it is the capture counter's zero, and no clock is read at all.
+    pub fn new_stopped(
+        common: &mut Common<'d, PIO>,
+        mut sm: StateMachine<'d, PIO, SM>,
+        out_pin: Peri<'d, impl PioPin>,
+        high_cycles: u32,
+        initial_period: u32,
+    ) -> Self {
+        let prog = common.load_program(&crate::pps_output_program());
+        let pin = common.make_pio_pin(out_pin);
+        sm.set_pin_dirs(Direction::Out, &[&pin]);
+        let mut cfg = Config::default();
+        cfg.use_program(&prog, &[]);
+        cfg.set_set_pins(&[&pin]);
+        sm.set_config(&cfg);
+        let _ = sm.tx().try_push(high_cycles); // init: program stashes this as the high width
+        let _ = sm.tx().try_push(initial_period);
+        Self { sm, prog, pin }
     }
 }
 

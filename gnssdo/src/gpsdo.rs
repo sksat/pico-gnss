@@ -853,6 +853,16 @@ impl Gnssdo {
         self.clock.now_from_query_ns(query_ns)
     }
 
+    /// Disciplined UTC (ns) from a **capture-timebase** local time.
+    ///
+    /// The counterpart of [`now_from_query_ns`](Self::now_from_query_ns), for a caller whose
+    /// moments are on the same counter the PPS edges were captured on rather than on a clock it
+    /// reads. A hardware schedule is such a caller: it knows its own edges by counting, and going
+    /// through a clock read to ask what UTC they are puts the cost of that read on the answer.
+    pub fn now_from_capture_ns(&self, capture_ns: u64) -> Option<i64> {
+        self.clock.now_from_capture_ns(capture_ns)
+    }
+
     /// Estimated crystal frequency offset (ppb).
     pub fn freq_ppb(&self) -> i64 {
         self.clock.freq_ppb()
