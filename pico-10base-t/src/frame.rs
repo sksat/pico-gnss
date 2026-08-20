@@ -265,7 +265,10 @@ pub fn parse_udp_frame(frame: &[u8]) -> Option<UdpDatagram<'_>> {
         return None;
     }
     let ip_total = u16::from_be_bytes([frame[IP + 2], frame[IP + 3]]) as usize;
-    if ip_total < ihl || IP + ip_total > frame.len() {
+    // Room for the UDP header, not merely for the IP one. `ihl` may be as much as 60 bytes, so a
+    // packet that stops at the end of its own header passes `ip_total >= ihl` and still leaves
+    // nothing to read — and the frame it came in may be no longer than the header either.
+    if ip_total < ihl + UDP_HEADER_LEN || IP + ip_total > frame.len() {
         return None;
     }
     if frame[IP + 9] != IP_PROTO_UDP {
@@ -644,6 +647,26 @@ mod tests {
             (IPV4_HEADER_LEN + UDP_HEADER_LEN + 1) as u16,
             "IP total length describes the datagram, not the padded Ethernet payload"
         );
+    }
+
+    /// A header long enough to satisfy every length check, and a total length that leaves nothing
+    /// after it. `ip_total >= ihl` holds and `IP + ip_total` is inside the frame, so the parser
+    /// used to reach the UDP header and index past the end of what it was given.
+    #[test]
+    fn an_ipv4_packet_with_no_room_for_a_udp_header_is_refused() {
+        const IHL_WORDS: u8 = 15; // 60 bytes: the largest an IPv4 header may be
+        const IHL: usize = IHL_WORDS as usize * 4;
+        let mut frame = [0u8; ETHERNET_HEADER_LEN + IHL];
+        frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+        let ip = ETHERNET_HEADER_LEN;
+        frame[ip] = 0x40 | IHL_WORDS;
+        // Total length stops at the end of the header: a legal encoding of an empty payload.
+        frame[ip + 2..ip + 4].copy_from_slice(&(IHL as u16).to_be_bytes());
+        frame[ip + 9] = IP_PROTO_UDP;
+        let checksum = ones_complement_checksum(&frame[ip..ip + IHL], 0);
+        frame[ip + 10..ip + 12].copy_from_slice(&checksum.to_be_bytes());
+
+        assert!(parse_udp_frame(&frame).is_none());
     }
 
     #[test]
