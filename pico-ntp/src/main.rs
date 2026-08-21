@@ -160,11 +160,11 @@ const fn parse_port(s: &str) -> u16 {
 /// Split in two because the two halves are measured by different instruments, and only one of them
 /// is visible from inside.
 ///
-/// Applied to the timestamp rather than by firing early. Firing early was tried and made things
-/// worse: the residual moved 118.4 µs → 73.5 µs instead of to zero, its spread grew from 5.4 µs to
-/// 26.5 µs, and 13% of seconds ran out of sleep and handed over immediately. The approach lands
-/// anywhere within a 16 ms link-pulse interval, so taking 118 µs off what is left of it sometimes
-/// takes all of it. Correcting the timestamp leaves the schedule alone.
+/// Applied to the timestamp, not by firing early. The approach to the boundary lands anywhere
+/// within a 16 ms link-pulse interval, so taking 118 µs off what is left of it sometimes takes all
+/// of it: the residual settles at 73.5 µs rather than zero, its spread grows from 5.4 µs to
+/// 26.5 µs, and 13% of seconds hand over with no sleep left. Correcting the timestamp leaves the
+/// schedule alone.
 const TX_LAG_NS: i64 = HANDOVER_LAG_NS + WIRE_LAG_NS;
 
 /// Second boundary to the handover, from `residual_ns` below over 389 seconds: median 118.4 µs,
@@ -235,22 +235,17 @@ const GNSS_FAST_BAUD: u32 = 115_200;
 /// off leaves the receiver at 9600, and [`SOURCE_TRUSTED`] then keeps the server silent rather than
 /// letting it announce a second it cannot vouch for.
 ///
-/// An earlier attempt at this did fail — sending `PMTK251,115200` and switching the UART left the
-/// link producing nothing but framing errors, because the module needs time after power-up before
-/// it will take configuration and because the setting survives a reflash. Both are handled by
-/// probing the port either side of the command rather than assuming; see `establish_gnss_link`.
-///
-/// `PMTK314` is the other route to the same margin, trimming the sentence set instead, and does not
-/// require both ends to change rate in step. Untried.
+/// Sending `PMTK251,115200` and switching the UART is not enough on its own: the module needs time
+/// after power-up before it will take configuration, and the rate it is left at survives a reflash,
+/// so the port's current speed cannot be assumed. `establish_gnss_link` probes either side of the
+/// command instead.
 const RAISE_BAUD: bool = true;
 
 /// How the disciplined clock is configured, pinned rather than inherited.
 ///
-/// Both values now match `rp-pps`'s own defaults, so `PpsGpsdo::new()` would do the same thing.
+/// Both values match `rp-pps`'s own defaults, so `PpsGpsdo::new()` would do the same thing.
 /// They are spelled out anyway: this is a time server, and the setting that decides *which UTC
 /// second* a pulse is labelled with should not change under it because a library default moved.
-///
-/// # These were verified, not assumed
 ///
 /// ZDA is the sentence the receiver defines against its pulse ("outputs the time associated with
 /// the current 1PPS pulse … tells the time of the pulse that just occurred" — MT3333 NMEA
@@ -269,9 +264,9 @@ const RAISE_BAUD: bool = true;
 /// in place these two constants are correct on their own, with no ±1 s correction anywhere.
 /// Without it, either association is a coin toss that a longer NMEA burst can flip at runtime.
 ///
-/// Verified against an NTP-synchronised host over the debug probe, so no network path could be
-/// mistaken for clock error: `host − firmware = +0.11 … +0.20 s`, which is the probe's RTT polling
-/// latency and not an offset. See `logs/20260818-ntp-bringup/`.
+/// Against an NTP-synchronised host over the debug probe, where no network path can be mistaken
+/// for clock error, `host − firmware` is `+0.11 … +0.20 s`. That is the probe's RTT polling
+/// latency, not an offset. See `logs/20260818-ntp-bringup/`.
 const PPS_NMEA: rp_pps::PpsNmeaAssociation = rp_pps::PpsNmeaAssociation::SameSecond;
 /// Pair on ZDA — see [`PPS_NMEA`].
 const TIME_SOURCE: rp_pps::NmeaTimeSource = rp_pps::NmeaTimeSource::Zda;
@@ -324,8 +319,9 @@ fn capture_now_ns() -> Option<u64> {
 /// [`rp_pps::pps_capture_program`] only ever watches for a rising edge, so an active-low receiver
 /// has to be inverted into PIO. Without that the capture lands on the *end* of the pulse — one
 /// pulse width past the second — and nothing on this board can tell: every interval is still
-/// exactly one second and the frequency estimate is unaffected. It took a client on the other side
-/// of the wire, which saw this server 100.23 ms slow (sd 0.55 ms, n=299).
+/// exactly one second and the frequency estimate is unaffected. Only a comparison against something
+/// outside the board shows it: a client on the other side of the wire sees this server 100.23 ms
+/// slow (sd 0.55 ms, n=299).
 ///
 /// The AE-GNSS-EXTANT carrier passes the module's 1PPS through one gate of its 74HC04, and its
 /// manual gives the result as `1PPS 出力 : C-MOS ロジック (3.3V) レベル,
@@ -353,10 +349,10 @@ async fn pps_task(capture: TimedPpsCapture<'static, PIO0, 0>) {
 /// It has to clear the worst build, not the typical one - a reply that misses its own departure is
 /// a reply that lies. Building was measured at 400-700 us on this board, so a millisecond.
 ///
-/// Setting this from a measured average instead, and handing the frame over as soon as it was
-/// ready, put the round-trip delay at -510 us on a link whose true delay is nanoseconds. The error
-/// was not the average being wrong; it was that the build time varies by hundreds of microseconds
-/// and no single number can stand for it.
+/// The worst build, not the average: building varies by hundreds of microseconds, so no single
+/// average can guarantee the frame reaches the wire after the departure it claims. Handing the
+/// frame over as soon as it is ready puts the round-trip delay at -510 us on a link whose true
+/// delay is nanoseconds.
 const REPLY_LAG_NS: i64 = 1_000_000;
 
 /// Words per capture on the receive side. See the client for the arithmetic; a request is smaller
@@ -679,7 +675,7 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
         // Sleep towards the boundary, but **never past it**: the sleep is capped at the link-pulse
         // interval rather than being a fixed tick. Polling on a fixed 16 ms period with a 16 ms
         // threshold means any jitter either steps over the boundary (dropping that second) or lands
-        // short of it twice (sending it twice) — both were observed on hardware before this.
+        // short of it twice (sending it twice).
         if wait_ns > (nlp_us * 1000) as i64 {
             tx.link_pulse();
             Timer::after_micros(nlp_us).await;
@@ -850,7 +846,7 @@ async fn await_nmea(uart: &mut BufferedUart, timeout: Duration) -> bool {
 /// 1. **The rate survives a firmware reflash.** `PMTK251` reverts only on a full cold start or
 ///    standby (MT3333 NMEA specification §2.3.14), so after re-flashing the RP2040 the module is
 ///    still at whatever it was last set to. Assuming the power-on rate means finding silence and
-///    concluding the receiver is dead — which is exactly what happened before this probed.
+///    concluding the receiver is dead.
 /// 2. **The change cannot be acknowledged.** `PMTK251` has no ACK and could not have one: the reply
 ///    would have to be sent at a rate one end has not adopted yet. Nothing in the specification says
 ///    how long the switch takes, either.
@@ -934,7 +930,8 @@ async fn main(spawner: Spawner) {
     );
     // After the capture has claimed the pin, never before: assigning it to PIO rewrites the same
     // control register the inversion lives in, so an earlier setting is silently dropped. Found by
-    // measuring — the offset came back at −98 ms with the log still saying it had inverted.
+    // Without that ordering the inversion is silently dropped and the offset comes back at −98 ms
+    // while the log still says it inverted.
     set_capture_polarity(PPS_PIN, PPS_POLARITY);
     info!("PPS on GP{}: configured active low", PPS_PIN);
 
@@ -1039,7 +1036,7 @@ async fn main(spawner: Spawner) {
     // Zero, not a clock reading. Both state machines are enabled by the write below, so the moment
     // this schedule counts from is the moment the capture counter started, and the schedule's edges
     // and the captured edges are on one scale. Reading a clock here instead put whatever that read
-    // cost onto every edge afterwards, which is what `CLOCK_OFFSET_NS` used to subtract.
+    // cost onto every edge afterwards.
     let pps_schedule = PpsSchedule::at_enable(
         clk_sys_freq(),
         pps_high,
@@ -1059,9 +1056,9 @@ async fn main(spawner: Spawner) {
     // `main` returning is enough to start that. The state machines live on in their tasks and keep
     // running; the pin they were driving quietly stops being connected to them.
     //
-    // It cost an afternoon. GP6 read funcsel 7 at the last line of `main` and 31 two seconds later,
-    // with the state machine still enabled and still consuming a period every second, driving a pad
-    // that was no longer listening. Nothing in the firmware's own telemetry could see it.
+    // Nothing in the firmware's own telemetry sees it: the state machine stays enabled and keeps
+    // consuming a period every second. GP6 reads funcsel 7 at the last line of `main` and 31 two
+    // seconds later, driving a pad that is no longer listening.
     core::mem::forget(common);
     core::mem::forget(eth_common);
 

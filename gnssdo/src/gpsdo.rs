@@ -44,9 +44,9 @@ pub struct DisciplinedClockConfig {
     pub lock_samples: NonZeroU32,
     /// **Emergency-stop** window (1s ± `sane_dev_ns`, default 1ms). Intervals outside this (the PIO
     /// ~68s wrap glitch's false short interval ≈ -37ms, or a ~2s gap) are clearly invalid. At 50ms
-    /// the wrap glitch slipped through and contaminated the EMA (found in on-hardware evaluation).
+    /// the wrap glitch slips through and contaminates the EMA.
     /// This is the last safety net rather than the normal quality check; normal quality is filtered
-    /// by the converge/residual gates below (per smart-friend GPT-5.5).
+    /// by the converge/residual gates below.
     pub sane_dev_ns: NonZeroU64,
     /// Absolute quality gate while unlocked/converging (default ±100µs). The EMA is not yet
     /// trustworthy, so reject by absolute value. Prevents medium multipath at a weak window position
@@ -97,7 +97,7 @@ pub struct DisciplinedClockConfig {
     /// [`predicted_freq_mppb`] use an online-learned model `freq ≈ base + k·(temp − ref)` to predict
     /// the crystal frequency from temperature with **no EMA lag**, instead of the α-β level. On a bare
     /// crystal the medium-term (64–300 s) frequency wander — the dominant output-phase wander — is
-    /// largely temperature-driven and ~80 % predictable from the on-chip sensor (verified out-of-sample
+    /// largely temperature-driven and ~80 % predictable from the on-chip sensor (out-of-sample
     /// on real logs), so feeding it forward removes the lag-induced wander before the phase loop sees
     /// it. Default `false` (α-β only; production unchanged until a temp source is wired + validated).
     pub temp_ff_enable: bool,

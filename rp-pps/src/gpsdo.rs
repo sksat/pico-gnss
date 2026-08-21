@@ -104,8 +104,7 @@ impl PpsGpsdo {
     ///
     /// Worth reaching for: [`PpsNmeaAssociation`](crate::PpsNmeaAssociation) is documented as the
     /// biggest footgun in this library, because getting it wrong shifts the whole UTC epoch by a
-    /// second while every *phase* measurement still looks perfect. Until this existed, the turn-key
-    /// bundle was the one path that could not change it.
+    /// second while every *phase* measurement still looks perfect.
     ///
     /// The symptom is invisible without an external time reference — a disciplined 1PPS output can
     /// sit on the GPS edge to nanoseconds and still be labelled with the wrong second.
@@ -384,9 +383,8 @@ mod tests {
 
     #[test]
     fn the_default_time_source_is_zda() {
-        // The point of the change that made it so: a caller who does not think about this at all
-        // should get the sentence that is defined against the pulse, not the one that merely
-        // happens to carry a clock.
+        // A caller who does not think about this at all should get the sentence that is defined
+        // against the pulse, not the one that merely happens to carry a clock.
         let mut g = PpsGpsdo::new();
         g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);
         assert!(

@@ -82,7 +82,7 @@ pub const OUTPUT_OVERHEAD_CYCLES: u32 = 7;
 /// input within nanoseconds. Only a comparison against an outside clock shows it.
 ///
 /// Polarity is a property of the receiver and the board it sits on, so it belongs in the firmware's
-/// configuration — but finding out what to configure can take work. The AE-GNSS-EXTANT board this
+/// configuration, and the documents do not always agree. The AE-GNSS-EXTANT board this
 /// project is built around documents `1PPS 出力 : C-MOS ロジック (3.3V) レベル,
 /// パルス幅 :100mS (アクティブ Low)`, while the MediaTek software specifications underneath it
 /// describe the pulse against its *rising* edge and state no polarity anywhere; the two agree only
@@ -416,7 +416,7 @@ pub fn loopback_phase_ticks(
 /// small true phase; a **mis-pairing** (captures from non-adjacent edges, e.g. after a PPS
 /// dropout/drain/relock) makes it ≈ ±`ticks_per_second`. [`loopback_phase_ticks`] folds mod the
 /// nominal second, which *hides* such a slip and leaves a ppm×1s residual the servo then locks to
-/// (the historic "stale pairing" failure family). Gate the measurement on `|raw| <= max_lag_ticks`
+/// as if it were alignment. Gate the measurement on `|raw| <= max_lag_ticks`
 /// (a few ms ≫ any real phase, ≪ 1 s) so only correctly-paired edges drive the loop, keeping
 /// `phase == 0 ⟺ aligned`.
 pub fn loopback_raw_lag_ticks(

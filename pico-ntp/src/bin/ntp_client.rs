@@ -76,12 +76,12 @@ const CAPTURE_NS: i64 = (CAPTURE_WORDS as i64) * 16 * 25;
 /// The capture ends, the DMA raises its interrupt, the executor wakes this task, and only then is
 /// the clock read. All of that is time the frame has already spent arriving, and none of it is
 /// visible from in here: the firmware's own numbers are consistent with a clock that is out by any
-/// constant at all. It took the oscilloscope. With this at zero, the client's 1PPS sat 21.41 us
-/// (sd 3.68, n=24) past the receiver's second while the server's own sat 55.02 us (sd 1.13) past
-/// it - and the server's transmit lag was calibrated against that same second, so its packets are
-/// right and what was left over was this.
+/// constant at all, so the figure has to come from outside. With this at zero, the client's 1PPS
+/// sits 21.41 us (sd 3.68, n=24) past the receiver's second while the server's own sits 55.02 us
+/// (sd 1.13) past it; the server's transmit lag is calibrated against that same second, so its
+/// packets are right and the remainder is this.
 ///
-/// The counterpart of `TX_LAG_NS` on the server, arrived at the same way and no more satisfying:
+/// The counterpart of `TX_LAG_NS` on the server, and no more satisfying:
 /// a constant measured once, on a rig, at a temperature. Timestamping the edge in PIO is what
 /// replaces it.
 const RX_LAG_NS: i64 = 21_400;
@@ -211,9 +211,9 @@ async fn pin_watch_task() {
             }
             Timer::after(Duration::from_micros(2000)).await;
         }
-        // The pin as the chip sees it is only half the answer: a PIO pin whose input enable is
-        // off reads zero however hard it is being driven. The routing is the other half, and it is
-        // the half that failed silently - see the note in `main` about keeping `Common`.
+        // Two things have to hold and neither is visible in the level alone: a PIO pin whose input
+        // enable is off reads zero however hard it is being driven, and the routing can be taken
+        // away underneath it - see the note in `main` about keeping `Common`.
         let funcsel = embassy_rp::pac::IO_BANK0.gpio(6).ctrl().read().funcsel();
         info!("GP6 high {}/1000, funcsel {}", high, funcsel);
     }
@@ -309,8 +309,8 @@ async fn link_task(mut rx: Rx10BaseT<'static, PIO0, 0>) {
                 }
             }
             // The beacon still goes out, and it is still true; it just cannot say how long it took
-            // to arrive. Counted, not used - the exchange is what this client runs on, unless it
-            // was built the other way round to measure what the difference is worth.
+            // to arrive. Counted and not used, unless `broadcast-client` is on: a beacon carries no
+            // path measurement, so mixing the two would leave neither mode measurable on its own.
             Mode::Broadcast => {
                 broadcasts = broadcasts.wrapping_add(1);
                 if !cfg!(feature = "broadcast-client") {
@@ -362,8 +362,8 @@ async fn link_task(mut rx: Rx10BaseT<'static, PIO0, 0>) {
 /// back untouched and [`measure`] matches on it, so nothing else has to be remembered.
 #[embassy_executor::task]
 async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>) {
-    // A broadcast client listens and nothing else. Leaving the questions running would measure
-    // both modes at once and report it as one, which is what this build exists to avoid.
+    // A broadcast client listens and nothing else (RFC 5905 §9.1). With the questions still going
+    // out, the clock would be disciplined from both sources and neither could be told apart.
     if cfg!(feature = "broadcast-client") {
         core::future::pending::<()>().await;
     }
@@ -540,9 +540,9 @@ async fn main(spawner: Spawner) {
     // `main` returning is enough to start that. The state machines live on in their tasks and keep
     // running; the pin they were driving quietly stops being connected to them.
     //
-    // It cost an afternoon. GP6 read funcsel 7 at the last line of `main` and 31 two seconds later,
-    // with the state machine still enabled and still consuming a period every second, driving a pad
-    // that was no longer listening. Nothing in the firmware's own telemetry could see it.
+    // Nothing in the firmware's own telemetry sees it: the state machine stays enabled and keeps
+    // consuming a period every second. GP6 reads funcsel 7 at the last line of `main` and 31 two
+    // seconds later, driving a pad that is no longer listening.
     core::mem::forget(common);
     core::mem::forget(pps_common);
 
