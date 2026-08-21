@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
 
-//! **Stratum-1 NTP broadcast server on an RP2040.**
+//! **Stratum-1 NTP server on an RP2040.**
 //!
-//! A GNSS 1PPS-disciplined clock serving time over 10BASE-T Ethernet driven straight from two GPIO
-//! pins and three resistors — no PHY chip, no MAC.
+//! A GNSS 1PPS-disciplined clock serving time over 10BASE-T Ethernet driven straight from GPIO
+//! pins — no PHY chip, no MAC. One pair sends, the other receives.
 //!
 //! ```text
 //! GNSS module ──NMEA──> UART0 RX (GP1)  ──┐
@@ -15,6 +15,7 @@
 //!                                    pico-10base-t            (Ethernet/IPv4/UDP + Manchester)
 //!                                          │
 //!                                    PIO1 SM0 + DMA ──> GP16 (TX−) / GP17 (TX+)
+//!                                    PIO1 SM1       <── GP18 (RX−) / GP19 (RX+)
 //! ```
 //!
 //! # Wiring
@@ -25,23 +26,34 @@
 //! | GNSS 1PPS | GP2 |
 //! | Ethernet TX− | GP16 |
 //! | Ethernet TX+ | GP17 |
+//! | Ethernet RX− | GP18 |
+//! | Ethernet RX+ | GP19 |
 //!
-//! 2 × 47 Ω in series with the TX pins and 1 × 470 Ω across the pair, into an RJ45's pins 1 and 2.
-//! A pulse transformer is strongly recommended: without one there is no galvanic isolation between
-//! the Pico and whatever it is plugged into.
+//! Into a segment: 2 × 33 Ω in series with the TX pins and 1 × 1 kΩ across the pair, into an
+//! RJ45's pins 1 and 2. A pulse transformer is strongly recommended: without one there is no
+//! galvanic isolation between the Pico and whatever it is plugged into. The RX pair needs a
+//! transformer and a comparator, neither of which this build has, so reception off a segment does
+//! not work.
 //!
-//! PIO0 belongs to the PPS capture and PIO1 to the Ethernet serialiser, so the two never contend.
+//! Board to board: jumper this board's GP16/GP17 to the other board's GP18/GP19 and vice versa,
+//! and tie the two grounds together. Both sides drive 3.3 V logic into a GPIO input, so no
+//! resistors and no transformer are involved — the link is Ethernet in everything above the
+//! physical layer.
+//!
+//! PIO0 belongs to the PPS capture and PIO1 to the Ethernet serialiser and deserialiser, so the
+//! two never contend.
 //!
 //! # Receiving this
 //!
-//! Broadcast (RFC 5905 mode 5) is one-way, which is all the present wiring can do — **not** where
-//! this is meant to end up. The unicast exchange is the better protocol in every respect: it lets a
-//! client measure the path instead of assuming it. [`tiny_ntp::server::respond`] already builds
-//! those replies and is tested; what is missing is a receive path in the hardware.
+//! Over the board-to-board link this server answers the unicast exchange (RFC 5905 modes 3/4),
+//! replying to whatever asked (`src_mac` / `src_ip` / `src_port`). That is the better protocol in
+//! every respect: it lets a client measure the path instead of assuming it.
 //!
-//! Meanwhile, note that **chrony and systemd-timesyncd do not implement broadcast client mode at
-//! all** — the reference `ntpd` does, with `broadcastclient` (and, since we cannot answer the
-//! calibration exchange it would like to make, `disable auth` and an explicit `broadcastdelay`).
+//! Broadcast (mode 5) is still served every second, and is all a listener off a real segment can
+//! use, since reception needs the analogue front end this build does not have. Note that **chrony
+//! and systemd-timesyncd do not implement broadcast client mode at all** — the reference `ntpd`
+//! does, with `broadcastclient` (and, since we cannot answer the calibration exchange it would
+//! like to make, `disable auth` and an explicit `broadcastdelay`).
 
 #[cfg(feature = "swd-rx")]
 mod swd_rx;
