@@ -88,8 +88,7 @@ use pico_10base_t::phy::{NLP_INTERVAL_US, encode_frame, encoded_words};
 use pico_10base_t::rx::decode_frame;
 use rp_pps::embassy::{
     EventCapture, PpsCapture, PpsOutput, TimedPpsCapture, run_capture, run_nmea,
-    set_capture_polarity,
-    start_in_sync,
+    set_capture_polarity, start_in_sync,
 };
 use rp_pps::{
     EVENT_CAPTURE_TOLL_TICKS, PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, TickTimeline,
@@ -391,7 +390,9 @@ const PPS_BLANK_NS: u32 = 200_000_000;
 /// started by one write; a counter that ran a *different* program would tick at the same rate and
 /// pay a different toll at every capture, which is a drift and not an offset.
 static ARRIVAL_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
-    BlockingMutex::new(RefCell::new(TickTimeline::with_toll(EVENT_CAPTURE_TOLL_TICKS)));
+    BlockingMutex::new(RefCell::new(TickTimeline::with_toll(
+        EVENT_CAPTURE_TOLL_TICKS,
+    )));
 
 /// Words per capture on the receive side. See the client for the arithmetic; a request is smaller
 /// than a reply, and this covers either.
@@ -499,7 +500,10 @@ async fn link_rx_task(
                     "NTPRX seen={} requests={} hw_ticks={=u64} sw_ns={} surplus={}",
                     seen, taken, ticks, arrived_local, surplus
                 ),
-                None => info!("NTPRX seen={} requests={} (no hardware timestamp)", seen, taken),
+                None => info!(
+                    "NTPRX seen={} requests={} (no hardware timestamp)",
+                    seen, taken
+                ),
             }
         }
     }
@@ -720,10 +724,7 @@ async fn answer(
 /// Both jobs live in one task because they share the transmitter. Interleaving them here also keeps
 /// the ordering obvious: a link pulse is never emitted while a frame is going out.
 #[embassy_executor::task]
-async fn ntp_task(
-    mut tx: Tx10BaseT<'static, PIO1, 0>,
-    mut egress: EventCapture<'static, PIO0, 3>,
-) {
+async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>, mut egress: EventCapture<'static, PIO0, 3>) {
     let mut frame = [0u8; FRAME_LEN];
     let mut symbols = [0u32; SYMBOL_WORDS];
     let mut ip_id: u16 = 0;
@@ -739,7 +740,15 @@ async fn ntp_task(
         // it is what lets a client measure the round trip instead of assuming it.
         if let Ok(request) = REQUESTS.try_receive() {
             ip_id = ip_id.wrapping_add(1);
-            answer(&mut tx, &mut egress, &request, ip_id, &mut frame, &mut symbols).await;
+            answer(
+                &mut tx,
+                &mut egress,
+                &request,
+                ip_id,
+                &mut frame,
+                &mut symbols,
+            )
+            .await;
             continue;
         }
 
@@ -1025,15 +1034,14 @@ async fn main(spawner: Spawner) {
     // All of them stopped, and started later in the same write as the 1PPS output: the counters
     // are one timebase then, and the output can be placed without reading a software clock.
     let counter = common.load_program(&event_capture_program());
-    let mut capture =
-        TimedPpsCapture::new_stopped_shared(
-            &mut common,
-            sm0,
-            p.PIN_2,
-            clk_sys_freq(),
-            EVENT_CAPTURE_TOLL_TICKS,
-            &counter,
-        );
+    let mut capture = TimedPpsCapture::new_stopped_shared(
+        &mut common,
+        sm0,
+        p.PIN_2,
+        clk_sys_freq(),
+        EVENT_CAPTURE_TOLL_TICKS,
+        &counter,
+    );
     // After the capture has claimed the pin, never before: assigning it to PIO rewrites the same
     // control register the inversion lives in, so an earlier setting is silently dropped. Found by
     // Without that ordering the inversion is silently dropped and the offset comes back at −98 ms
@@ -1044,17 +1052,28 @@ async fn main(spawner: Spawner) {
     // The two link monitors, on the same block and so on the same timebase as the 1PPS above. They
     // claim nothing: both pins belong to the serialiser and deserialiser over in PIO1, and reading
     // a pad is not driving it.
-    let mut arrival =
-        EventCapture::<PIO0, 2>::new_stopped_shared(sm2, embassy_rp::pac::PIO0, ARRIVAL_GPIO, &counter);
-    let mut egress =
-        EventCapture::<PIO0, 3>::new_stopped_shared(sm3, embassy_rp::pac::PIO0, EGRESS_GPIO, &counter);
+    let mut arrival = EventCapture::<PIO0, 2>::new_stopped_shared(
+        sm2,
+        embassy_rp::pac::PIO0,
+        ARRIVAL_GPIO,
+        &counter,
+    );
+    let mut egress = EventCapture::<PIO0, 3>::new_stopped_shared(
+        sm3,
+        embassy_rp::pac::PIO0,
+        EGRESS_GPIO,
+        &counter,
+    );
     let blank = event_blank_counts(FRAME_BLANK_NS, clk_sys_freq());
     capture
         .capture_mut()
         .arm(event_blank_counts(PPS_BLANK_NS, clk_sys_freq()));
     arrival.arm(blank);
     egress.arm(blank);
-    info!("link monitors armed on GP{} and GP{}", EGRESS_GPIO, ARRIVAL_GPIO);
+    info!(
+        "link monitors armed on GP{} and GP{}",
+        EGRESS_GPIO, ARRIVAL_GPIO
+    );
 
     // PIO1: the Ethernet serialiser. A separate PIO block so the two never contend for a state
     // machine or for instruction memory.

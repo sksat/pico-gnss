@@ -53,7 +53,10 @@ const PPS_POLARITY: PpsPolarity = PpsPolarity::ActiveLow;
 async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     let clk = clk_sys_freq();
-    info!("tsbase: three counters on GP{}, clk {} Hz", WATCHED_GPIO, clk);
+    info!(
+        "tsbase: three counters on GP{}, clk {} Hz",
+        WATCHED_GPIO, clk
+    );
 
     let Pio {
         mut common,
@@ -67,10 +70,20 @@ async fn main(_spawner: Spawner) {
     // One claims the pin, two watch it by number. All three stopped.
     let mut a = PpsCapture::<PIO0, 0>::new_stopped(&mut common, sm0, p.PIN_2, &program);
     set_capture_polarity(WATCHED_GPIO as usize, PPS_POLARITY);
-    let mut b =
-        EventCapture::<PIO0, 2>::new_stopped(&mut common, sm2, embassy_rp::pac::PIO0, WATCHED_GPIO, &program);
-    let mut c =
-        EventCapture::<PIO0, 3>::new_stopped(&mut common, sm3, embassy_rp::pac::PIO0, WATCHED_GPIO, &program);
+    let mut b = EventCapture::<PIO0, 2>::new_stopped(
+        &mut common,
+        sm2,
+        embassy_rp::pac::PIO0,
+        WATCHED_GPIO,
+        &program,
+    );
+    let mut c = EventCapture::<PIO0, 3>::new_stopped(
+        &mut common,
+        sm3,
+        embassy_rp::pac::PIO0,
+        WATCHED_GPIO,
+        &program,
+    );
 
     // One write: enable all three and restart their dividers on the same cycle.
     let mask = PpsCapture::<PIO0, 0>::sm_mask()

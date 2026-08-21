@@ -202,8 +202,9 @@ const ARRIVAL_GPIO: u8 = 18;
 /// nothing between the pad and here is on the path — no DMA completion, no interrupt, no executor.
 /// What it costs is that it is a *tick* count with no origin, so it is only ever useful as a
 /// difference, and it has to be fed often enough to stay ahead of the counter's wrap.
-static ARRIVAL: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
-    BlockingMutex::new(RefCell::new(TickTimeline::with_toll(EVENT_CAPTURE_TOLL_TICKS)));
+static ARRIVAL: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> = BlockingMutex::new(
+    RefCell::new(TickTimeline::with_toll(EVENT_CAPTURE_TOLL_TICKS)),
+);
 
 /// How long the line stays busy after a frame's first bit.
 ///
@@ -452,10 +453,7 @@ async fn link_task(
 /// The transmit timestamp is the whole of the client's state for an exchange: the server echoes it
 /// back untouched and [`measure`] matches on it, so nothing else has to be remembered.
 #[embassy_executor::task]
-async fn ask_task(
-    mut tx: Tx10BaseT<'static, PIO0, 1>,
-    mut egress: EventCapture<'static, PIO0, 3>,
-) {
+async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<'static, PIO0, 3>) {
     // A broadcast client listens and nothing else (RFC 5905 §9.1). With the questions still going
     // out, the clock would be disciplined from both sources and neither could be told apart.
     if cfg!(feature = "broadcast-client") {
@@ -630,10 +628,18 @@ async fn main(spawner: Spawner) {
     // Loaded once. Two eleven-instruction copies plus the serialiser and deserialiser would not
     // leave room in the block's 32 instructions.
     let counter = common.load_program(&event_capture_program());
-    let mut arrival =
-        EventCapture::<PIO0, 2>::new_stopped_shared(sm2, embassy_rp::pac::PIO0, ARRIVAL_GPIO, &counter);
-    let mut egress =
-        EventCapture::<PIO0, 3>::new_stopped_shared(sm3, embassy_rp::pac::PIO0, EGRESS_GPIO, &counter);
+    let mut arrival = EventCapture::<PIO0, 2>::new_stopped_shared(
+        sm2,
+        embassy_rp::pac::PIO0,
+        ARRIVAL_GPIO,
+        &counter,
+    );
+    let mut egress = EventCapture::<PIO0, 3>::new_stopped_shared(
+        sm3,
+        embassy_rp::pac::PIO0,
+        EGRESS_GPIO,
+        &counter,
+    );
     // The program blocks on its first instruction until it has this, so arm before starting.
     let blank = event_blank_counts(FRAME_BLANK_NS, clk);
     arrival.arm(blank);
