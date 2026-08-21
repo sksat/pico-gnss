@@ -16,6 +16,7 @@ state machine で測る。差が経路で、この配線ではジャンパ 2 本
   uv run docs/report/pico-link-ptp/logs/plot_path.py
 """
 
+import csv
 import os
 import re
 import statistics as st
@@ -39,6 +40,9 @@ NS_PER_TICK = 2 * 1_000_000_000 // 125_000_000
 
 CLIENT = re.compile(r"HWRTT n=\d+ rtt_(ns|ticks)=(-?\d+)")
 SERVER = re.compile(r"hw_turnaround_(ns|ticks)=(-?\d+)")
+
+# オシロが 1 回のトリガで読んだ、受信機の秒に対する 2 枚の GP6 の位置。
+PPS_CSV = "pair-ptp-stack.csv"
 
 
 def read(name, pattern):
@@ -72,10 +76,84 @@ def pair(client_log, server_log):
     return np.array(best[1]) / 1000.0  # µs
 
 
+def read_pps():
+    """`scope_pair.py` の CSV から、2 枚の GP6 の位置を ns で読む。"""
+    server, client = [], []
+    with open(os.path.join(RAW, PPS_CSV)) as f:
+        for row in csv.DictReader(f):
+            if not row["server_ns"] or not row["client_ns"]:
+                continue
+            server.append(float(row["server_ns"]))
+            client.append(float(row["client_ns"]))
+    return np.array(server), np.array(client)
+
+
+def fig_pps():
+    """4 つのカウンタを 1 回の書き込みで起動したあとの、出力 1PPS の締まり具合。
+
+    Pico client の +58 µs は精度ではなく、送信の定数 `TX_LAG_NS` が噛み合っていないぶんである。
+    ここで見たいのは Pico server が動かないことなので、軸は server に合わせて別々に取る。
+    """
+    server, client = read_pps()
+    fig, (ax, bx) = plt.subplots(
+        1, 2, figsize=(11, 3.6), gridspec_kw={"width_ratios": [1.25, 1]}
+    )
+
+    shots = np.arange(len(server))
+    ax.plot(shots, server, "o-", ms=4, lw=1.0, color="tab:blue")
+    ax.axhline(server.mean(), color="tab:red", lw=1.0, label="平均")
+    ax.fill_between(
+        shots,
+        server.mean() - server.std(),
+        server.mean() + server.std(),
+        color="tab:red",
+        alpha=0.12,
+        label="±1 標準偏差",
+    )
+    ax.set_xlabel("取り込み")
+    ax.set_ylabel("Pico server の GP6 − 受信機の秒 (ns)")
+    ax.set_title(
+        f"平均 {server.mean():+.1f} ns   1 回ごとの揺れ {server.std():.1f} ns   "
+        f"幅 {server.max() - server.min():.0f} ns   (n={len(server)})",
+        fontsize=10,
+    )
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(alpha=0.3)
+
+    bx.plot(shots, client / 1000.0, "o-", ms=4, lw=1.0, color="tab:orange")
+    bx.set_xlabel("取り込み")
+    bx.set_ylabel("Pico client の GP6 − 受信機の秒 (µs)")
+    bx.set_title(
+        f"平均 {client.mean() / 1000:+.1f} µs   揺れ {client.std() / 1000:.2f} µs\n"
+        "(送信の定数が噛み合っていないぶんで、精度ではない)",
+        fontsize=10,
+    )
+    bx.grid(alpha=0.3)
+
+    fig.suptitle(
+        "PIO0 の 4 本を 1 回の書き込みで起動したあと、出力 1PPS は起動直後から締まっている",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    path = os.path.join(OUT, "fig-pps.png")
+    fig.savefig(path, dpi=140)
+    print(f"saved {path}")
+    print(
+        f"pps: server {server.mean():+.1f} ns sd {server.std():.1f} "
+        f"range {server.max() - server.min():.0f} n={len(server)}  "
+        f"client {client.mean() / 1000:+.1f} us sd {client.std() / 1000:.2f}"
+    )
+
+
 def main():
     if not os.path.isdir(RAW):
         print(f"生データが見つからない: {RAW}", file=sys.stderr)
         raise SystemExit(1)
+
+    if os.path.exists(os.path.join(RAW, PPS_CSV)):
+        fig_pps()
+    else:
+        print(f"{PPS_CSV} が無いので 1PPS の図は飛ばす", file=sys.stderr)
 
     before = pair("rtt-client-pair2.log", "rtt-server-pair2.log")
     after = pair("rtt-client-fix.log", "rtt-server-fix.log")
