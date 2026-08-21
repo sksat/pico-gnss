@@ -502,8 +502,8 @@ async fn link_task(
                 let c = c.borrow();
                 DisciplineUpdate {
                     stepped: false,
-                    residual_ns: offset_ns - (c.utc_at(arrived_ns).unwrap_or(arrived_ns)
-                        - arrived_ns),
+                    residual_ns: offset_ns
+                        - (c.utc_at(arrived_ns).unwrap_or(arrived_ns) - arrived_ns),
                     offset_ns,
                     drift_ppb: c.drift_ppb(),
                 }

@@ -397,6 +397,12 @@ pub struct PpsEdgeTimeline {
     clk_hz: u32,
     last: Option<u32>,
     edge_ns: u64,
+    /// Whether the next observation is the first since the counter was enabled.
+    ///
+    /// A capture pays its toll *after* pushing its value, so the interval from the counter's start
+    /// to its first capture has no toll in it. Charging one there puts a constant on every edge
+    /// afterwards.
+    at_counter_start: bool,
     /// Ticks the counter loses each time it captures, added back to every interval.
     ///
     /// [`pps_capture_program`] cannot decrement while it is pushing, and neither can
@@ -420,6 +426,7 @@ impl PpsEdgeTimeline {
             clk_hz,
             last: None,
             edge_ns: 0,
+            at_counter_start: false,
             toll,
         }
     }
@@ -447,9 +454,11 @@ impl PpsEdgeTimeline {
         Self {
             clk_hz,
             // Zero is not "no reading yet" here, it is the reading the counter had when it was
-            // enabled. The first capture then measures an interval like any other.
+            // enabled. The first capture then measures an interval like any other — except for the
+            // toll, which that capture has not paid yet at the moment it pushes.
             last: Some(0),
             edge_ns: 0,
+            at_counter_start: true,
             toll,
         }
     }
@@ -460,6 +469,12 @@ impl PpsEdgeTimeline {
         // Ticks first, then nanoseconds: the toll is a tick count, and adding it after the
         // conversion would round it twice.
         let interval_ns = match self.last {
+            // The first interval after the counter's start is the one exception: that capture has
+            // not paid its toll at the moment it pushes.
+            Some(prev) if self.at_counter_start => {
+                self.at_counter_start = false;
+                ticks_to_ns(interval_ticks(prev, raw) as u64, self.clk_hz)
+            }
             Some(prev) => ticks_to_ns(interval_ticks(prev, raw) as u64 + self.toll, self.clk_hz),
             None => 0,
         };

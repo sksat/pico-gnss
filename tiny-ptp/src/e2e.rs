@@ -38,6 +38,8 @@ pub enum Reject {
     /// counts — and this profile does not read that one, because on this hardware it cannot be
     /// written accurately.
     NotTwoStep,
+    /// Nothing is wrong: a `Sync` was taken and the exchange is waiting on its `Follow_Up`.
+    AwaitingFollowUp,
 }
 
 /// One complete exchange, as the slave saw it.
@@ -202,7 +204,7 @@ impl Slave {
                 // Keeping the older one would let a late Follow_Up be paired with the wrong moment
                 // on the wire, so the newer Sync replaces it outright.
                 self.pending = Some((msg, arrived_ns));
-                Action::Ignored(Reject::NotForUs)
+                Action::Ignored(Reject::AwaitingFollowUp)
             }
             Body::FollowUp(_) => self.on_follow_up(msg),
             Body::DelayResp { requesting, .. } => self.on_delay_resp(msg, requesting),
@@ -467,7 +469,10 @@ mod tests {
     /// Drive a slave up to the point where it has handed out a `Delay_Req`.
     fn armed(t1: i64, t2: i64) -> (Slave, Message) {
         let mut s = Slave::new(slave());
-        assert_eq!(s.on_message(sync(7), t2), Action::Ignored(Reject::NotForUs));
+        assert_eq!(
+            s.on_message(sync(7), t2),
+            Action::Ignored(Reject::AwaitingFollowUp)
+        );
         match s.on_message(follow_up(7, t1), t2 + 1) {
             Action::SendDelayReq(req) => (s, req),
             other => panic!("expected a Delay_Req to go out, got {other:?}"),

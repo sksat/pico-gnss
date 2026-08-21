@@ -149,7 +149,12 @@ pub fn ticks_between(
     later_captures: u64,
     toll: u64,
 ) -> i64 {
-    let counted = earlier.wrapping_sub(later) as i64;
+    // Sign-extended, not widened. `wrapping_sub` on a `u32` widened straight to `i64` is always in
+    // `[0, 2³²)`, so an event that turns out to be *before* the reference comes back as a whole
+    // wrap minus the gap — 68.7 seconds instead of a few hundred nanoseconds. That is not
+    // hypothetical: it happened twice in 164 exchanges on the link, whenever a `Delay_Req` was
+    // captured just before the 1PPS edge it was later measured against.
+    let counted = earlier.wrapping_sub(later) as i32 as i64;
     counted - toll as i64 * (earlier_captures as i64 - later_captures as i64)
 }
 
@@ -228,6 +233,27 @@ mod tests {
             let ns = ticks_to_ns(ticks, CLK);
             assert_eq!(ns, second * 1_000_000_000, "second {second}");
         }
+    }
+
+    #[test]
+    fn an_event_before_the_reference_comes_back_negative() {
+        // The reference is the most recent 1PPS edge; a frame captured just before it is earlier,
+        // not 68 seconds later. Widening a `u32` wrapping subtraction straight to `i64` gave the
+        // latter, and it reached the link: two exchanges in 164 reported a 67.7 s turnaround.
+        let reference: u32 = 1_000_000;
+        let a_microsecond_earlier = reference.wrapping_add(ns_to_ticks(1_000, CLK) as u32);
+        assert_eq!(
+            ticks_between(reference, 5, a_microsecond_earlier, 5, 2),
+            -(ns_to_ticks(1_000, CLK) as i64)
+        );
+    }
+
+    #[test]
+    fn a_reference_and_an_event_either_side_of_a_wrap_still_differ_by_the_gap() {
+        let earlier: u32 = 4;
+        let later: u32 = earlier.wrapping_sub(10);
+        assert_eq!(ticks_between(earlier, 3, later, 3, 2), 10);
+        assert_eq!(ticks_between(later, 3, earlier, 3, 2), -10);
     }
 
     #[test]
@@ -346,12 +372,26 @@ mod tests {
     }
 
     #[test]
-    fn the_toll_is_added_from_the_first_capture_of_an_anchored_timeline() {
-        // A capturing program cannot decrement while it pushes, so every capture loses `toll`
-        // ticks — including the first one after the start, which an unanchored timeline never
-        // charges because it treats that capture as the origin.
+    fn the_first_capture_after_the_start_has_not_paid_its_toll_yet() {
+        // A capture pays its toll *after* pushing, so the interval from the counter's start to the
+        // first capture has none in it. Charging one there is a constant on every edge afterwards,
+        // and it hid behind an equal and opposite off-by-one in the caller.
         let mut t = TickTimeline::from_counter_start_with_toll(2);
         let elapsed = ns_to_ticks(1_000_000, CLK);
-        assert_eq!(t.observe(0u32.wrapping_sub(elapsed as u32)), elapsed + 2);
+        assert_eq!(
+            t.observe_with_captures(0u32.wrapping_sub(elapsed as u32), 0),
+            elapsed
+        );
+    }
+
+    #[test]
+    fn a_capture_that_follows_others_is_charged_for_them() {
+        let mut t = TickTimeline::from_counter_start_with_toll(2);
+        let elapsed = ns_to_ticks(1_000_000, CLK);
+        // Three captures completed before this value was pushed.
+        assert_eq!(
+            t.observe_with_captures(0u32.wrapping_sub(elapsed as u32), 3),
+            elapsed + 6
+        );
     }
 }

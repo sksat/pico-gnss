@@ -367,7 +367,8 @@ async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
     let mut captures: u64 = 0;
     loop {
         let (edge, raw) = capture.next_edge_with_raw().await;
-        captures = captures.wrapping_add(1);
+        // Stored before the increment: `ticks_between` wants the tolls already paid when this
+        // value was pushed, and a capture's own toll comes after its push.
         PPS_ANCHOR.lock(|a| {
             a.set(Some(PpsAnchor {
                 raw,
@@ -375,6 +376,7 @@ async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
                 edge_ns: edge.edge_ns,
             }))
         });
+        captures = captures.wrapping_add(1);
         CLOCK.lock(|g| g.borrow_mut().on_pps_edge(edge, now_ns()));
     }
 }
@@ -539,7 +541,9 @@ async fn link_rx_task(
         // was pushed, and a capture's own toll comes after its push.
         let arrived_captures = arrival.captures();
         let hw_raw = arrival.try_read();
-        let hw_ticks = hw_raw.map(|raw| ARRIVAL_TICKS.lock(|a| a.borrow_mut().observe(raw)));
+        let hw_ticks = hw_raw.map(|raw| {
+            ARRIVAL_TICKS.lock(|a| a.borrow_mut().observe_with_captures(raw, arrived_captures))
+        });
         let surplus = arrival.drain();
         seen = seen.wrapping_add(1);
         let Some(arrived_ns) = CLOCK.lock(|g| g.borrow().now_from_query_ns(arrived_local as u64))
