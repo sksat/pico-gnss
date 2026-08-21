@@ -711,7 +711,25 @@ fn clock_state() -> (Option<i64>, ClockState) {
 /// Set from what the other board needs, not from the standard: its receiver decodes one frame
 /// before it can wait for the next, so anything sent inside that window is not slow — it is
 /// invisible. Twenty milliseconds is comfortably past it and still far inside the second.
-const PTP_GAP_MS: u64 = 20;
+const PTP_GAP_MS: u64 = match option_env!("PTP_GAP_MS") {
+    Some(s) => parse_gap_ms(s),
+    None => 20,
+};
+
+/// Decimal `&str` to `u64` at compile time.
+const fn parse_gap_ms(s: &str) -> u64 {
+    let bytes = s.as_bytes();
+    assert!(!bytes.is_empty(), "PTP_GAP_MS is empty");
+    let mut value: u64 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let digit = bytes[i];
+        assert!(digit >= b'0' && digit <= b'9', "PTP_GAP_MS must be decimal");
+        value = value * 10 + (digit - b'0') as u64;
+        i += 1;
+    }
+    value
+}
 
 /// Send one PTP message and say, in UTC, when its first bit actually left the pin.
 ///

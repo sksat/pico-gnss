@@ -46,6 +46,14 @@ required-features = ["bench"]
 # still, which is what this flag is for — the same binary, the same board, the same run length.
 broadcast-client = []
 
+# Builds `ntp_client` to set its clock from the PTP exchange rather than from NTP.
+#
+# Same reasoning as `broadcast-client`, and the same shape of comparison: one binary, one board,
+# one run length, and the only thing that differs is which of the two measurements the clock is
+# allowed to believe. Both keep running either way, so the one that is not driving is still logged
+# beside the one that is.
+ptp-client = []
+
 # Builds the on-target benchmark binary. It needs no extra dependencies — the flag exists so a
 # normal build does not produce a second firmware image that would be easy to flash by accident.
 bench = []

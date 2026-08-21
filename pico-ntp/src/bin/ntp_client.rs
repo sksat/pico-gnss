@@ -56,7 +56,7 @@ use rp_pps::{
     event_capture_program, output_high_cycles, output_period_cycles, ticks_between, ticks_to_ns,
 };
 use tiny_ntp::client::{accept_broadcast, measure, request};
-use tiny_ntp::discipline::{DisciplineConfig, NtpDiscipline};
+use tiny_ntp::discipline::{DisciplineConfig, DisciplineUpdate, NtpDiscipline};
 use tiny_ntp::packet::{Mode, NtpPacket, PACKET_LEN};
 
 use defmt_rtt as _;
@@ -239,19 +239,24 @@ static COUNTER_ORIGIN_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
     BlockingMutex::new(Cell::new(i64::MIN));
 
 /// A counter value from a pin, as this board's UTC.
-fn ticks_utc_ns(ticks: u64) -> Option<i64> {
+/// A pin's counter value as **local** time, not as UTC.
+///
+/// Deliberately not disciplined. PTP's own arithmetic is what turns the difference between this
+/// board's timescale and the master's into a number, so putting a clock model in front of it would
+/// only mean measuring the model. It would also make the exchange fragile: t2 is converted when a
+/// `Sync` arrives and t3 when the `Delay_Req` leaves, and a step between the two would land in the
+/// path delay as though the wire had got longer.
+///
+/// What comes back is the counter, offset by the one software read this board makes.
+fn ticks_local_ns(ticks: u64) -> Option<i64> {
     let origin = COUNTER_ORIGIN_NS.lock(|o| o.get());
-    if origin == i64::MIN {
-        return None;
-    }
-    let since_start = ticks_to_ns(ticks, clk_sys_freq()) as i64;
-    CLOCK.lock(|c| c.borrow().utc_at(origin + since_start))
+    (origin != i64::MIN).then(|| origin + ticks_to_ns(ticks, clk_sys_freq()) as i64)
 }
 
-/// A value from the pin frames leave by, as this board's UTC.
-fn egress_utc_ns(raw: u32, captures: u64) -> Option<i64> {
+/// A value from the pin frames leave by, as local time.
+fn egress_local_ns(raw: u32, captures: u64) -> Option<i64> {
     let ticks = EGRESS_TICKS.lock(|t| t.borrow_mut().observe_with_captures(raw, captures));
-    ticks_utc_ns(ticks)
+    ticks_local_ns(ticks)
 }
 
 /// A PTP message that arrived, and the counter value the pin saw its first bit at.
@@ -487,7 +492,25 @@ async fn link_task(
         // `measure` worked against the hint we handed it as our own receive time; what the estimate
         // wants is the offset against local time, which is the same number shifted by the hint.
         let offset_ns = measurement.offset_ns + (hint - arrived_ns);
-        let update = CLOCK.lock(|c| c.borrow_mut().observe(arrived_ns, offset_ns));
+        // One source at a time. Both measurements keep being taken and logged whichever way this
+        // is built — what the flag decides is only which of them the clock is allowed to believe,
+        // because two sources steering one estimate is neither of them.
+        let update = if cfg!(feature = "ptp-client") {
+            // Measured and reported, but not believed: the offset is what NTP would have set the
+            // clock to, held against the clock PTP is actually setting.
+            CLOCK.lock(|c| {
+                let c = c.borrow();
+                DisciplineUpdate {
+                    stepped: false,
+                    residual_ns: offset_ns - (c.utc_at(arrived_ns).unwrap_or(arrived_ns)
+                        - arrived_ns),
+                    offset_ns,
+                    drift_ppb: c.drift_ppb(),
+                }
+            })
+        } else {
+            CLOCK.lock(|c| c.borrow_mut().observe(arrived_ns, offset_ns))
+        };
         used = used.wrapping_add(1);
 
         if let Some(ticks) = hw_ticks {
@@ -563,7 +586,7 @@ async fn send_ptp(
     let captures = egress.captures();
     let raw = egress.try_read()?;
     egress.drain();
-    egress_utc_ns(raw, captures)
+    egress_local_ns(raw, captures)
 }
 
 #[embassy_executor::task]
@@ -590,8 +613,8 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<
             let Ok(arrival) = with_timeout(remaining, PTP_IN.receive()).await else {
                 break;
             };
-            let Some(arrived_ns) = ticks_utc_ns(arrival.arrived_ticks) else {
-                warn!("PTP arrival with no clock to name it by");
+            let Some(arrived_ns) = ticks_local_ns(arrival.arrived_ticks) else {
+                warn!("PTP arrival before the counters had an origin");
                 continue;
             };
             match slave.on_message(arrival.message, arrived_ns) {
@@ -624,16 +647,26 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<
                             t4 - exchange.delay_req_left_ns,
                             exchange.delay_req_left_ns - exchange.sync_arrived_ns,
                         );
-                        // Logged, not applied. What the discipline does with this is the next
-                        // step; what it is worth has to be readable before then, beside the
-                        // number NTP produces from the same link in the same second.
+                        // The sign is the standard's, and it is the opposite of the
+                        // discipline's. `offset_from_master_ns` is how far the slave is *ahead*;
+                        // `observe` is told how far UTC is ahead of local. Since t2 and t3 went in
+                        // as local time, what comes back is exactly local minus the master's UTC,
+                        // and negating it is the whole of the conversion.
+                        let correction_ns = -m.offset_from_master_ns;
+                        // Halfway through the exchange, in the timescale the two moments were
+                        // measured on. Both are local, so the midpoint needs no clock to find.
+                        let at_local_ns =
+                            (exchange.sync_arrived_ns + exchange.delay_req_left_ns) / 2;
+                        if cfg!(feature = "ptp-client") {
+                            CLOCK.lock(|c| c.borrow_mut().observe(at_local_ns, correction_ns));
+                        }
                         info!(
-                            "PTP n={} seq={} offset_ns={} path_ns={} ntp_offset_ns={}",
+                            "PTP n={} seq={} offset_ns={} path_ns={} applied={}",
                             measured,
                             m.sequence,
                             m.offset_from_master_ns,
                             m.mean_path_delay_ns,
-                            CLOCK.lock(|c| c.borrow().offset_ns()),
+                            cfg!(feature = "ptp-client"),
                         );
                     }
                     Err(reason) => warn!("PTP refused: {}", defmt::Debug2Format(&reason)),
