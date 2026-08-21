@@ -27,6 +27,9 @@ pub struct TickTimeline {
     last_raw: u32,
     /// Ticks since the first observation.
     ticks: u64,
+    /// The state machine's capture tally at the last observation, so the tolls paid by captures
+    /// that were drained rather than read can still be charged.
+    last_captures: u64,
     /// Ticks the counter loses each time it captures, added back on every observation.
     ///
     /// A counter cannot decrement while it is pushing. For a 1PPS that is one capture a second and
@@ -47,6 +50,7 @@ impl TickTimeline {
             started: false,
             last_raw: 0,
             ticks: 0,
+            last_captures: 0,
             toll,
         }
     }
@@ -66,6 +70,7 @@ impl TickTimeline {
             started: true,
             last_raw: 0,
             ticks: 0,
+            last_captures: 0,
             toll,
         }
     }
@@ -86,6 +91,30 @@ impl TickTimeline {
         // half a wrap: past that, falling a long way and rising a short way look the same.
         self.ticks += self.last_raw.wrapping_sub(raw) as u64 + self.toll;
         self.last_raw = raw;
+        self.ticks
+    }
+
+    /// Take one raw value, knowing how many times the counter has stopped to capture.
+    ///
+    /// [`observe`](Self::observe) charges one toll per call, which is right only when the caller
+    /// reads every capture. A caller that reads one value and drains the rest — which is what
+    /// watching a *frame* means, since every edge in it stops the counter — has skipped tolls that
+    /// were nonetheless paid, and the timeline falls behind by that much every frame. It does not
+    /// look like error: it looks like a clock running slow.
+    ///
+    /// `captures` is the state machine's own tally at the moment `raw` was pushed. What is charged
+    /// is the number of stops since the last observation, however many of them were read.
+    pub fn observe_with_captures(&mut self, raw: u32, captures: u64) -> u64 {
+        if !self.started {
+            self.started = true;
+            self.last_raw = raw;
+            self.last_captures = captures;
+            return 0;
+        }
+        let stops = captures.saturating_sub(self.last_captures);
+        self.ticks += self.last_raw.wrapping_sub(raw) as u64 + self.toll * stops;
+        self.last_raw = raw;
+        self.last_captures = captures;
         self.ticks
     }
 
@@ -274,6 +303,46 @@ mod tests {
 
         assert_eq!(pps.observe(raw).edge_ns, at_ns);
         assert_eq!(ticks_to_ns(frame.observe(raw), CLK), at_ns);
+    }
+
+    #[test]
+    fn tolls_paid_by_captures_that_were_drained_are_still_charged() {
+        // A frame stops the counter once per edge in it, and the caller reads the first and drains
+        // the rest. Charging one toll per read loses the others, every frame, for as long as the
+        // link is up — which does not read as error, it reads as a clock running slow.
+        let mut t = TickTimeline::from_counter_start_with_toll(2);
+        let elapsed = ns_to_ticks(1_000_000, CLK);
+        // Eight captures went by; one of them is the value being read.
+        assert_eq!(
+            t.observe_with_captures(0u32.wrapping_sub(elapsed as u32), 8),
+            elapsed + 2 * 8
+        );
+    }
+
+    #[test]
+    fn only_the_stops_since_the_last_reading_are_charged() {
+        let mut t = TickTimeline::from_counter_start_with_toll(2);
+        let first = ns_to_ticks(1_000_000, CLK);
+        t.observe_with_captures(0u32.wrapping_sub(first as u32), 4);
+        let second = ns_to_ticks(2_000_000, CLK);
+        assert_eq!(
+            t.observe_with_captures(0u32.wrapping_sub(second as u32), 7),
+            second + 2 * 7
+        );
+    }
+
+    #[test]
+    fn a_capture_tally_that_goes_backwards_charges_nothing_rather_than_wrapping() {
+        // The tally is the state machine's, read across a lock. It should only ever grow, but a
+        // wrapping subtraction on a `u64` that did go backwards would add several thousand years.
+        let mut t = TickTimeline::from_counter_start_with_toll(2);
+        let elapsed = ns_to_ticks(1_000_000, CLK);
+        t.observe_with_captures(0u32.wrapping_sub(elapsed as u32), 9);
+        let later = ns_to_ticks(2_000_000, CLK);
+        assert_eq!(
+            t.observe_with_captures(0u32.wrapping_sub(later as u32), 3),
+            later + 2 * 9
+        );
     }
 
     #[test]

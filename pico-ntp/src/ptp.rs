@@ -47,8 +47,12 @@ pub fn port_identity(mac: MacAddr) -> PortIdentity {
 /// The timeline has to be the one anchored at the start
 /// ([`TickTimeline::from_counter_start_with_toll`]); one anchored at its first capture counts from
 /// a different origin, and the number would be an interval wearing a timestamp's clothes.
-pub fn capture_ns(raw: u32, timeline: &mut TickTimeline, clk_hz: u32) -> u64 {
-    ticks_to_ns(timeline.observe(raw), clk_hz)
+///
+/// `captures` is the state machine's tally when `raw` was pushed. Every edge in a frame stops the
+/// counter and only the first is read, so charging one toll per reading loses the rest — and what
+/// that looks like on the wire is a path delay that grows by a hundred nanoseconds a second.
+pub fn capture_ns(raw: u32, captures: u64, timeline: &mut TickTimeline, clk_hz: u32) -> u64 {
+    ticks_to_ns(timeline.observe_with_captures(raw, captures), clk_hz)
 }
 
 /// Put one PTP message into an Ethernet frame.

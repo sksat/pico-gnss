@@ -89,13 +89,13 @@ use pico_10base_t::frame::{
 use pico_10base_t::phy::{NLP_INTERVAL_US, encode_frame, encoded_words};
 use pico_10base_t::rx::decode_frame;
 use rp_pps::embassy::{
-    EventCapture, PpsCapture, PpsOutput, TimedPpsCapture, run_capture, run_nmea,
-    set_capture_polarity, start_in_sync,
+    EventCapture, PpsCapture, PpsOutput, TimedPpsCapture, run_nmea, set_capture_polarity,
+    start_in_sync,
 };
 use rp_pps::{
     EVENT_CAPTURE_TOLL_TICKS, PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, TickTimeline,
     event_blank_counts, event_capture_program, output_high_cycles, output_period_cycles,
-    ticks_between,
+    ticks_between, ticks_to_ns,
 };
 use tiny_ntp::packet::{NtpPacket, PACKET_LEN};
 use tiny_ntp::server::{
@@ -218,7 +218,17 @@ const CFG: ServerConfig = ServerConfig {
     max_holdover_ns: 3_600 * 1_000_000_000,
 };
 
-const FRAME_LEN: usize = frame_len(PACKET_LEN);
+/// The longest payload this firmware sends, so one pair of buffers serves both protocols.
+///
+/// A `Delay_Resp` is 54 bytes — header, timestamp, and the identity of whoever asked — against
+/// NTP's 48. Sizing on NTP alone does not fail loudly: `build_udp_frame` refuses the buffer and
+/// returns `None`, the send is skipped, and the only symptom is an exchange that never completes.
+const MAX_PAYLOAD: usize = if tiny_ptp::MAX_MESSAGE_LEN > PACKET_LEN {
+    tiny_ptp::MAX_MESSAGE_LEN
+} else {
+    PACKET_LEN
+};
+const FRAME_LEN: usize = frame_len(MAX_PAYLOAD);
 const SYMBOL_WORDS: usize = encoded_words(FRAME_LEN);
 
 /// How many outgoing frames to hexdump over RTT at start-up.
@@ -349,8 +359,59 @@ fn capture_now_ns() -> Option<u64> {
 const PPS_POLARITY: PpsPolarity = PpsPolarity::ActiveLow;
 
 #[embassy_executor::task]
-async fn pps_task(capture: TimedPpsCapture<'static, PIO0, 0>) {
-    run_capture(capture, &CLOCK, now_ns).await
+async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
+    // What `run_capture` does, plus one thing it has no reason to: keep the raw value and the
+    // tally of the edge just taken. A frame's counter is not this one, and the two fall apart at
+    // the rate their capture counts differ — measured on the link at about 112 ns a second, which
+    // is a hundred times the exchange it was corrupting.
+    let mut captures: u64 = 0;
+    loop {
+        let (edge, raw) = capture.next_edge_with_raw().await;
+        captures = captures.wrapping_add(1);
+        PPS_ANCHOR.lock(|a| {
+            a.set(Some(PpsAnchor {
+                raw,
+                captures,
+                edge_ns: edge.edge_ns,
+            }))
+        });
+        CLOCK.lock(|g| g.borrow_mut().on_pps_edge(edge, now_ns()));
+    }
+}
+
+/// The most recent 1PPS edge, as its own counter saw it.
+///
+/// The reference every other counter's value is expressed against. `edge_ns` is on the scale the
+/// disciplined clock was built from, which is what makes it the one scale `now_from_capture_ns`
+/// can be asked about.
+#[derive(Clone, Copy)]
+struct PpsAnchor {
+    raw: u32,
+    captures: u64,
+    edge_ns: u64,
+}
+
+static PPS_ANCHOR: BlockingMutex<CriticalSectionRawMutex, Cell<Option<PpsAnchor>>> =
+    BlockingMutex::new(Cell::new(None));
+
+/// A frame's counter value, on the 1PPS counter's scale.
+///
+/// Not on its own. Each state machine stops while it pushes, so a counter watching a link that
+/// carries several frames a second falls behind one watching a pulse that comes once — and the
+/// difference is a drift, not an offset. [`ticks_between`] takes it out using how many times each
+/// counter has actually stopped, which is why every caller carries a tally alongside its value.
+fn frame_capture_ns(raw: u32, captures: u64) -> Option<u64> {
+    let anchor = PPS_ANCHOR.lock(|a| a.get())?;
+    let since_edge = ticks_between(
+        anchor.raw,
+        anchor.captures,
+        raw,
+        captures,
+        EVENT_CAPTURE_TOLL_TICKS,
+    );
+    let ns = anchor.edge_ns as i64
+        + ticks_to_ns(since_edge.unsigned_abs(), clk_sys_freq()) as i64 * since_edge.signum();
+    (ns >= 0).then_some(ns as u64)
 }
 
 /// How far ahead a reply's departure is set when the reply is built (ns).
@@ -399,12 +460,6 @@ static ARRIVAL_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimelin
         EVENT_CAPTURE_TOLL_TICKS,
     )));
 
-/// The same, for the pin frames leave by.
-static EGRESS_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
-    BlockingMutex::new(RefCell::new(TickTimeline::from_counter_start_with_toll(
-        EVENT_CAPTURE_TOLL_TICKS,
-    )));
-
 /// A `Delay_Req` that arrived, and the counter value the pin saw it at.
 ///
 /// The raw value rather than a time: converting it costs a 64-bit division on a core without a
@@ -413,6 +468,9 @@ static EGRESS_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline
 struct PtpRequest {
     message: tiny_ptp::Message,
     arrived_raw: u32,
+    /// The state machine's tally when `arrived_raw` was pushed, so the tolls paid by the rest of
+    /// the frame's edges can be charged too.
+    arrived_captures: u64,
 }
 
 static PTP_REQUESTS: Channel<CriticalSectionRawMutex, PtpRequest, 2> = Channel::new();
@@ -503,6 +561,7 @@ async fn link_rx_task(
                     .try_send(PtpRequest {
                         message,
                         arrived_raw,
+                        arrived_captures,
                     })
                     .is_err()
             {
@@ -647,6 +706,13 @@ fn clock_state() -> (Option<i64>, ClockState) {
     })
 }
 
+/// How long to leave the link quiet before each PTP message.
+///
+/// Set from what the other board needs, not from the standard: its receiver decodes one frame
+/// before it can wait for the next, so anything sent inside that window is not slow — it is
+/// invisible. Twenty milliseconds is comfortably past it and still far inside the second.
+const PTP_GAP_MS: u64 = 20;
+
 /// Send one PTP message and say, in UTC, when its first bit actually left the pin.
 ///
 /// The two halves of that sentence are the point. Everything this firmware does with NTP writes a
@@ -661,6 +727,13 @@ async fn send_ptp(
     frame: &mut [u8; FRAME_LEN],
     symbols: &mut [u32; SYMBOL_WORDS],
 ) -> Option<i64> {
+    // The receiver on the other board captures one frame, then decodes it before it can look for
+    // the next. Sending two back to back means the second arrives while it is still busy and is
+    // never seen at all — and the pin's own capture has a blanking window of its own, shorter than
+    // a frame but not shorter than nothing. Leaving a gap costs nothing here: none of these
+    // timestamps are claims about when a frame *will* leave.
+    Timer::after_millis(PTP_GAP_MS).await;
+
     let peer = ptp::Peer {
         src_mac: SRC_MAC,
         dst_mac: DST_MAC,
@@ -671,9 +744,12 @@ async fn send_ptp(
     let words = encode_frame(&frame[..len], symbols)?;
     egress.drain();
     tx.send(&symbols[..words]).await;
+    // The tally before the read and the drain after it: what has to be charged is every stop the
+    // counter made, not every value that was looked at.
+    let captures = egress.captures();
     let raw = egress.try_read()?;
     egress.drain();
-    let capture = EGRESS_TICKS.lock(|t| ptp::capture_ns(raw, &mut t.borrow_mut(), clk_sys_freq()));
+    let capture = frame_capture_ns(raw, captures)?;
     CLOCK.lock(|g| g.borrow().now_from_capture_ns(capture))
 }
 
@@ -722,8 +798,7 @@ async fn ptp_answer(
     let tiny_ptp::Body::DelayReq(_) = request.message.body else {
         return None;
     };
-    let capture = ARRIVAL_TICKS
-        .lock(|t| ptp::capture_ns(request.arrived_raw, &mut t.borrow_mut(), clk_sys_freq()));
+    let capture = frame_capture_ns(request.arrived_raw, request.arrived_captures)?;
     let t4 = CLOCK.lock(|g| g.borrow().now_from_capture_ns(capture))?;
 
     let resp = tiny_ptp::Message {
@@ -739,7 +814,14 @@ async fn ptp_answer(
         },
     };
     *ip_id = ip_id.wrapping_add(1);
-    send_ptp(tx, egress, &resp, *ip_id, frame, symbols).await;
+    if send_ptp(tx, egress, &resp, *ip_id, frame, symbols)
+        .await
+        .is_none()
+    {
+        // Worth saying out loud: a response that was never built looks, from the slave's side,
+        // exactly like one that was lost on the wire.
+        warn!("PTP response not sent");
+    }
     Some(t4)
 }
 

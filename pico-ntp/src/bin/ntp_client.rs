@@ -172,7 +172,15 @@ const REQ_LAG_NS: i64 = 1_000_000;
 /// state machine at the same clock, so it is the same number.
 const WIRE_LAG_NS: i64 = 117_800;
 
-const REQ_FRAME_LEN: usize = frame_len(PACKET_LEN);
+/// The longest payload this board sends. A `Delay_Req` is shorter than an NTP packet, but sizing
+/// on the largest of the two keeps the buffers from depending on which protocol happens to be
+/// bigger this week — and a frame that does not fit is refused silently, not loudly.
+const MAX_PAYLOAD: usize = if tiny_ptp::MAX_MESSAGE_LEN > PACKET_LEN {
+    tiny_ptp::MAX_MESSAGE_LEN
+} else {
+    PACKET_LEN
+};
+const REQ_FRAME_LEN: usize = frame_len(MAX_PAYLOAD);
 const REQ_SYMBOL_WORDS: usize = encoded_words(REQ_FRAME_LEN);
 
 /// The question currently outstanding, and when it left.
@@ -231,23 +239,27 @@ static COUNTER_ORIGIN_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
     BlockingMutex::new(Cell::new(i64::MIN));
 
 /// A counter value from a pin, as this board's UTC.
-fn pin_utc_ns(
-    raw: u32,
-    timeline: &BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>>,
-) -> Option<i64> {
+fn ticks_utc_ns(ticks: u64) -> Option<i64> {
     let origin = COUNTER_ORIGIN_NS.lock(|o| o.get());
     if origin == i64::MIN {
         return None;
     }
-    let since_start = timeline.lock(|t| ptp::capture_ns(raw, &mut t.borrow_mut(), clk_sys_freq()));
-    CLOCK.lock(|c| c.borrow().utc_at(origin + since_start as i64))
+    let since_start = ticks_to_ns(ticks, clk_sys_freq()) as i64;
+    CLOCK.lock(|c| c.borrow().utc_at(origin + since_start))
+}
+
+/// A value from the pin frames leave by, as this board's UTC.
+fn egress_utc_ns(raw: u32, captures: u64) -> Option<i64> {
+    let ticks = EGRESS_TICKS.lock(|t| t.borrow_mut().observe_with_captures(raw, captures));
+    ticks_utc_ns(ticks)
 }
 
 /// A PTP message that arrived, and the counter value the pin saw its first bit at.
 #[derive(Clone, Copy)]
 struct PtpArrival {
     message: tiny_ptp::Message,
-    arrived_raw: u32,
+    /// Already on the timeline: the receive task advanced it once, in arrival order.
+    arrived_ticks: u64,
 }
 
 static PTP_IN: Channel<CriticalSectionRawMutex, PtpArrival, 4> = Channel::new();
@@ -342,7 +354,12 @@ async fn link_task(
         let arrival_captures = arrival.captures();
         let hw_raw = arrival.try_read();
         let surplus = arrival.drain();
-        let hw_ticks = hw_raw.map(|raw| ARRIVAL.lock(|a| a.borrow_mut().observe(raw)));
+        // One advance per frame, here, in arrival order. The PTP path used to advance the
+        // same timeline again from the other task, which put two observations of one value
+        // on it and let the order depend on which task ran first.
+        let hw_ticks = hw_raw.map(|raw| {
+            ARRIVAL.lock(|a| a.borrow_mut().observe_with_captures(raw, arrival_captures))
+        });
         let mut hw_rtt_ticks: Option<i64> = None;
         seen = seen.wrapping_add(1);
 
@@ -370,12 +387,12 @@ async fn link_task(
         // value the pin reported to the task that owns the transmitter — the conversion to UTC is
         // a 64-bit division, and this task has a link to keep up with.
         if datagram.dst_port == ptp::PTP_PORT {
-            match (tiny_ptp::decode(datagram.payload), hw_raw) {
-                (Some(message), Some(arrived_raw)) => {
+            match (tiny_ptp::decode(datagram.payload), hw_ticks) {
+                (Some(message), Some(arrived_ticks)) => {
                     if PTP_IN
                         .try_send(PtpArrival {
                             message,
-                            arrived_raw,
+                            arrived_ticks,
                         })
                         .is_err()
                     {
@@ -543,9 +560,10 @@ async fn send_ptp(
     let words = encode_frame(&frame[..len], symbols)?;
     egress.drain();
     tx.send(&symbols[..words]).await;
+    let captures = egress.captures();
     let raw = egress.try_read()?;
     egress.drain();
-    pin_utc_ns(raw, &EGRESS_TICKS)
+    egress_utc_ns(raw, captures)
 }
 
 #[embassy_executor::task]
@@ -572,21 +590,40 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<
             let Ok(arrival) = with_timeout(remaining, PTP_IN.receive()).await else {
                 break;
             };
-            let Some(arrived_ns) = pin_utc_ns(arrival.arrived_raw, &ARRIVAL) else {
+            let Some(arrived_ns) = ticks_utc_ns(arrival.arrived_ticks) else {
+                warn!("PTP arrival with no clock to name it by");
                 continue;
             };
             match slave.on_message(arrival.message, arrived_ns) {
                 tiny_ptp::e2e::Action::SendDelayReq(req) => {
                     ip_id = ip_id.wrapping_add(1);
-                    if let Some(left_ns) =
-                        send_ptp(&mut tx, &mut egress, &req, ip_id, &mut frame, &mut symbols).await
+                    match send_ptp(&mut tx, &mut egress, &req, ip_id, &mut frame, &mut symbols)
+                        .await
                     {
-                        slave.on_delay_req_sent(left_ns);
+                        Some(left_ns) => slave.on_delay_req_sent(left_ns),
+                        None => warn!("PTP request left without a timestamp"),
                     }
                 }
                 tiny_ptp::e2e::Action::Complete(exchange) => match tiny_ptp::measure(&exchange) {
                     Ok(m) => {
                         measured = measured.wrapping_add(1);
+                        // The four moments as well as what they came to. `offset` and `path` are
+                        // sums, and a sum that drifts says nothing about which of its terms did.
+                        let t1 = match exchange.follow_up.body {
+                            tiny_ptp::Body::FollowUp(ts) => ts.to_ns(),
+                            _ => 0,
+                        };
+                        let t4 = match exchange.delay_resp.body {
+                            tiny_ptp::Body::DelayResp { receive, .. } => receive.to_ns(),
+                            _ => 0,
+                        };
+                        info!(
+                            "PTPRAW n={} to_slave={} to_master={} gap={}",
+                            measured,
+                            exchange.sync_arrived_ns - t1,
+                            t4 - exchange.delay_req_left_ns,
+                            exchange.delay_req_left_ns - exchange.sync_arrived_ns,
+                        );
                         // Logged, not applied. What the discipline does with this is the next
                         // step; what it is worth has to be readable before then, beside the
                         // number NTP produces from the same link in the same second.
@@ -601,7 +638,14 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<
                     }
                     Err(reason) => warn!("PTP refused: {}", defmt::Debug2Format(&reason)),
                 },
-                tiny_ptp::e2e::Action::Ignored(_) => {}
+                tiny_ptp::e2e::Action::Ignored(reason) => {
+                    // A Sync always lands here — its own timestamp is a placeholder, so there is
+                    // nothing to do until the Follow_Up. Anything else is a message that did not
+                    // belong to the exchange it arrived in, and the reason is worth seeing.
+                    if !matches!(arrival.message.body, tiny_ptp::Body::Sync(_)) {
+                        warn!("PTP ignored: {}", defmt::Debug2Format(&reason));
+                    }
+                }
             }
         }
 

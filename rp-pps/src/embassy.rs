@@ -434,6 +434,17 @@ impl<'d, PIO: Instance, const SM: usize> TimedPpsCapture<'d, PIO, SM> {
         self.timeline.observe(raw)
     }
 
+    /// The same, and the raw counter value it came from.
+    ///
+    /// The timed edge is on this counter's own scale. Another state machine's value is not — each
+    /// counter stops for its own captures, so two that started together drift apart in proportion
+    /// to how often each fires. [`crate::ticks_between`] closes that gap, and it needs the raw
+    /// value this edge was made from as its reference point.
+    pub async fn next_edge_with_raw(&mut self) -> (crate::TimedEdge, u32) {
+        let raw = self.capture.wait_edge().await;
+        (self.timeline.observe(raw), raw)
+    }
+
     /// Borrow the underlying raw capture (the fine tier) — e.g. for [`PpsCapture::jmp_pin`].
     pub fn capture(&self) -> &PpsCapture<'d, PIO, SM> {
         &self.capture
