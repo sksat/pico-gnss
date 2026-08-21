@@ -12,6 +12,7 @@
 
 import csv
 import os
+import re
 import sys
 
 import matplotlib
@@ -28,7 +29,10 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.dirname(HERE)
-RAW = os.path.join(HERE, "..", "..", "..", "..", "logs", "20260820-pico-link")
+LOGS = os.path.join(HERE, "..", "..", "..", "..", "logs")
+RAW = os.path.join(LOGS, "20260820-pico-link")
+# 前回 (スイッチと AP を挟んで PC で受けた回) の生ログ。同じ数字を書き写さず、ここから読む。
+RAW_MAIN = os.path.join(LOGS, "20260819-ntp-wired")
 
 
 def read_pairs(name):
@@ -396,10 +400,124 @@ def fig_ntp_accuracy():
     print(f"saved {path}")
 
 
+RECV_LINE = re.compile(r"^(?P<iface>\S+)\s+\S+\s+mode=\S+.*?offset=(?P<off>[-+\d.]+)us")
+# 前回の受信ホストのインタフェース名。有線と無線で同じ broadcast が二度届く。
+MAIN_IFACES = [
+    ("wlp1s0", "broadcast・無線 (AP 経由)"),
+    ("eth0", "broadcast・有線 (switch 直)"),
+]
+
+
+def read_main_offsets():
+    """前回の受信ログから、インタフェースごとの offset (µs) を読む。"""
+    out = {}
+    with open(os.path.join(RAW_MAIN, "paths.log")) as f:
+        for line in f:
+            m = RECV_LINE.match(line)
+            if m:
+                out.setdefault(m.group("iface"), []).append(float(m.group("off")))
+    return {k: np.array(v) for k, v in out.items()}
+
+
+def read_mode_diff(tag):
+    """`pair-mode-<tag>.csv` の client − server を µs で読む。"""
+    server, client = read_pairs(f"pair-mode-{tag}.csv")
+    return client - server
+
+
+def fig_progression():
+    """同じ broadcast のまま、構成を変えると桁がどう動くか。
+
+    前回の 2 行は PC が読んだ値で、PC の時計と受信経路まで含んでいて分けられない。
+    今回の 2 行は受け取った板の秒を GPS の秒に対して直接読んだもので、その分けられない部分が
+    測定系から外れている。同じ量ではないので、比べているのは桁である。
+    """
+    main = read_main_offsets()
+    rows = []
+    for iface, label in MAIN_IFACES:
+        if iface in main:
+            rows.append(("これまで: PC で受ける", label, main[iface]))
+    for tag, label in (
+        ("broadcast", "broadcast・片道"),
+        ("unicast", "unicast・往復"),
+    ):
+        if os.path.exists(os.path.join(RAW, f"pair-mode-{tag}.csv")):
+            rows.append(("今回: Pico 直結", label, read_mode_diff(tag)))
+    if not rows:
+        print("progression: 読める記録が無い", file=sys.stderr)
+        return
+
+    fig, ax = plt.subplots(figsize=(11, 4.0))
+    for i, (era, label, v) in enumerate(rows):
+        y = len(rows) - 1 - i
+        colour = "#c1442e" if era.startswith("これまで") else "#2e7d5b"
+        mag = abs(v.mean())
+        ax.errorbar(
+            mag,
+            y,
+            xerr=[[min(v.std(), mag * 0.95)], [v.std()]],
+            fmt="o",
+            ms=7,
+            capsize=4,
+            lw=1.6,
+            color=colour,
+        )
+        # 端の行は注釈が枠から出るので、点の左右どちらに置くかを位置で決める。
+        right = mag > 1e4
+        ax.annotate(
+            f"{fmt_us(v.mean())} ± {fmt_us(v.std(), sign=False)}  (n={len(v)})",
+            xy=(mag, y),
+            xytext=(-12 if right else 12, 11),
+            textcoords="offset points",
+            fontsize=9,
+            ha="right" if right else "left",
+            color=colour,
+        )
+
+    ax.set_xscale("log")
+    ax.set_xlim(4, 6e5)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels(
+        [f"{era}\n{label}" for era, label, _ in reversed(rows)], fontsize=8.5
+    )
+    ax.set_ylim(-0.9, len(rows) - 0.3)
+    ax.set_xlabel("配られた時刻が、受け取った側でどれだけずれていたか — 平均の大きさ (µs、対数)")
+    ax.set_title(
+        "同じ broadcast のまま、無線と PC の時計が測定系から外れた分だけ縮む", fontsize=10
+    )
+    ax.grid(axis="x", which="both", alpha=0.3)
+    fig.text(
+        0.5,
+        0.015,
+        "上 2 行は PC が読んだ値で、PC の時計と受信経路まで含む。"
+        "下 2 行は受け取った板の秒を GPS の秒に対して読んだもの。同じ量ではないので、"
+        "比べているのは桁である。\n"
+        "下 2 行どうしも、平均は比べられない (送信側の校正定数が配り方ごとに違う)。"
+        "比べられるのは横棒の長さ、つまり 1 回ごとの揺れのほうである。",
+        fontsize=7.8,
+        color="0.35",
+        ha="center",
+    )
+    fig.tight_layout(rect=(0, 0.10, 1, 1))
+    path = os.path.join(OUT, "fig-progression.png")
+    fig.savefig(path, dpi=140)
+    print(f"saved {path}")
+
+
+def fmt_us(value, sign=True):
+    """µs の値を、桁に合わせて µs か ms で書く。"""
+    unit, scale = ("ms", 1000.0) if abs(value) >= 1000.0 else ("µs", 1.0)
+    return f"{value / scale:{'+' if sign else ''}.2f} {unit}"
+
+
 def main():
     if not os.path.isdir(RAW):
         print(f"生データが見つからない: {RAW}", file=sys.stderr)
         raise SystemExit(1)
+    if os.path.exists(os.path.join(RAW_MAIN, "paths.log")):
+        fig_progression()
+    else:
+        print(f"前回の生ログが無いので進み方の図は飛ばす: {RAW_MAIN}", file=sys.stderr)
     fig_broadcast_series()
     fig_ntp_accuracy()
     if os.path.exists(os.path.join(RAW, "trace-5us.csv")):
