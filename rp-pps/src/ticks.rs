@@ -51,6 +51,25 @@ impl TickTimeline {
         }
     }
 
+    /// A timeline whose origin is the moment the counter was enabled, not its first capture.
+    ///
+    /// [`with_toll`](Self::with_toll) makes the first observation the origin, which is right when
+    /// the only thing wanted is intervals. It is wrong when the ticks have to mean the same as
+    /// another counter's: state machines started by one [`crate::embassy::start_in_sync`] write all
+    /// hold zero at that instant, so a timeline anchored there is on the same scale as
+    /// [`crate::PpsEdgeTimeline::from_counter_start`] — and that is the scale a capture has to be on
+    /// for `now_from_capture_ns` to turn it into UTC.
+    pub const fn from_counter_start_with_toll(toll: u64) -> Self {
+        Self {
+            // Zero is not "nothing seen yet" here, it is the value the counter held when the write
+            // enabled it. The first capture is an interval from that, like every one after it.
+            started: true,
+            last_raw: 0,
+            ticks: 0,
+            toll,
+        }
+    }
+
     /// Take one raw counter value and place it on the timeline.
     ///
     /// The first observation is the origin and returns zero. Every one after that is the number of
@@ -230,5 +249,40 @@ mod tests {
         t.observe(raw);
         let ticks = t.observe(raw.wrapping_sub(ns_to_ticks(102_400, CLK) as u32));
         assert_eq!(ticks_to_ns(ticks, CLK), 102_400);
+    }
+
+    #[test]
+    fn a_timeline_anchored_at_the_counter_start_measures_from_the_start() {
+        // Started by one `start_in_sync` write, the counter holds zero at that instant. The very
+        // first capture is therefore already an interval — 0.5 ms after the start, here — and not
+        // an origin that reads zero.
+        let mut t = TickTimeline::from_counter_start_with_toll(0);
+        let elapsed = ns_to_ticks(500_000, CLK);
+        assert_eq!(t.observe(0u32.wrapping_sub(elapsed as u32)), elapsed);
+    }
+
+    #[test]
+    fn a_frame_and_a_pps_on_the_same_start_agree_on_when_they_were() {
+        // The point of anchoring at the start: a frame's counter value has to mean the same thing
+        // as the 1PPS counter's, because it is `now_from_capture_ns` — fed from the 1PPS timeline —
+        // that turns it into UTC. Two counters, same program, same start, same instant.
+        let at_ns = 3_000_000_000; // 3 s in, well past one 68 s wrap of neither
+        let raw = 0u32.wrapping_sub(ns_to_ticks(at_ns, CLK) as u32);
+
+        let mut pps = crate::PpsEdgeTimeline::from_counter_start(CLK);
+        let mut frame = TickTimeline::from_counter_start_with_toll(0);
+
+        assert_eq!(pps.observe(raw).edge_ns, at_ns);
+        assert_eq!(ticks_to_ns(frame.observe(raw), CLK), at_ns);
+    }
+
+    #[test]
+    fn the_toll_is_added_from_the_first_capture_of_an_anchored_timeline() {
+        // A capturing program cannot decrement while it pushes, so every capture loses `toll`
+        // ticks — including the first one after the start, which an unanchored timeline never
+        // charges because it treats that capture as the origin.
+        let mut t = TickTimeline::from_counter_start_with_toll(2);
+        let elapsed = ns_to_ticks(1_000_000, CLK);
+        assert_eq!(t.observe(0u32.wrapping_sub(elapsed as u32)), elapsed + 2);
     }
 }

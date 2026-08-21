@@ -21,7 +21,7 @@
 //! exchange can see it — which is why an asymmetry has to be found by other means, and why this
 //! module has a test that says exactly that.
 
-use crate::message::{Body, Message, PortIdentity};
+use crate::message::{Body, Message, PortIdentity, Timestamp};
 
 /// Why an exchange was not turned into a measurement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +41,7 @@ pub enum Reject {
 }
 
 /// One complete exchange, as the slave saw it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Exchange {
     /// The `Sync`, as received.
     pub sync: Message,
@@ -139,6 +139,146 @@ pub fn measure(exchange: &Exchange) -> Result<Measurement, Reject> {
         mean_path_delay_ns: (mean_path_delay / SCALE) as i64,
         sequence: exchange.sync.sequence,
     })
+}
+
+/// What a slave should do with the message it just took off the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Nothing, and why.
+    Ignored(Reject),
+    /// The master's half is complete. Send this, then say when it left.
+    SendDelayReq(Message),
+    /// All four moments are in. Hand it to [`measure`].
+    Complete(Exchange),
+}
+
+/// The slave half of the exchange, as a state machine over arriving messages.
+///
+/// It lives here rather than in the firmware because every rule it keeps is a rule about message
+/// ordering, and none of them need hardware to exercise. A `Follow_Up` that crosses the next
+/// `Sync`, a `Delay_Resp` answering a request two sequences old, a response addressed to the other
+/// port: each is a way to compute an offset out of timestamps that do not belong together, and each
+/// is cheaper to refuse than to explain afterwards.
+#[derive(Clone, Copy, Debug)]
+pub struct Slave {
+    us: PortIdentity,
+    /// A `Sync` waiting for the `Follow_Up` that says when it really left.
+    pending: Option<(Message, i64)>,
+    /// A `Delay_Req` we have handed out: the request, when it left (once known), and the master's
+    /// half of the exchange it belongs to.
+    outstanding: Option<Outstanding>,
+    next_sequence: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Outstanding {
+    delay_req: Message,
+    left_ns: Option<i64>,
+    sync: Message,
+    sync_arrived_ns: i64,
+    follow_up: Message,
+}
+
+impl Slave {
+    pub const fn new(us: PortIdentity) -> Self {
+        Self {
+            us,
+            pending: None,
+            outstanding: None,
+            next_sequence: 0,
+        }
+    }
+
+    /// This port's identity, as it appears in the `requestingPortIdentity` of a `Delay_Resp`.
+    pub const fn port(&self) -> PortIdentity {
+        self.us
+    }
+
+    /// A message came off the wire at `arrived_ns` by this clock.
+    pub fn on_message(&mut self, msg: Message, arrived_ns: i64) -> Action {
+        match msg.body {
+            Body::Sync(_) => {
+                // A Sync arriving while one is pending means that one's Follow_Up is not coming.
+                // Keeping the older one would let a late Follow_Up be paired with the wrong moment
+                // on the wire, so the newer Sync replaces it outright.
+                self.pending = Some((msg, arrived_ns));
+                Action::Ignored(Reject::NotForUs)
+            }
+            Body::FollowUp(_) => self.on_follow_up(msg),
+            Body::DelayResp { requesting, .. } => self.on_delay_resp(msg, requesting),
+            Body::DelayReq(_) => Action::Ignored(Reject::WrongMessage),
+        }
+    }
+
+    fn on_follow_up(&mut self, follow_up: Message) -> Action {
+        let Some((sync, sync_arrived_ns)) = self.pending else {
+            return Action::Ignored(Reject::SequenceMismatch);
+        };
+        if follow_up.sequence != sync.sequence {
+            return Action::Ignored(Reject::SequenceMismatch);
+        }
+        if follow_up.source != sync.source {
+            return Action::Ignored(Reject::DifferentSource);
+        }
+        self.pending = None;
+
+        let delay_req = Message {
+            domain: sync.domain,
+            two_step: false,
+            correction_sub_ns: 0,
+            source: self.us,
+            sequence: self.next_sequence,
+            // A Delay_Req is sent when the slave decides to, so it has no interval to declare.
+            log_interval: 0x7F_u8 as i8,
+            body: Body::DelayReq(Timestamp::default()),
+        };
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        self.outstanding = Some(Outstanding {
+            delay_req,
+            left_ns: None,
+            sync,
+            sync_arrived_ns,
+            follow_up,
+        });
+        Action::SendDelayReq(delay_req)
+    }
+
+    fn on_delay_resp(&mut self, delay_resp: Message, requesting: PortIdentity) -> Action {
+        let Some(out) = self.outstanding else {
+            return Action::Ignored(Reject::SequenceMismatch);
+        };
+        if requesting != self.us {
+            return Action::Ignored(Reject::NotForUs);
+        }
+        if delay_resp.sequence != out.delay_req.sequence {
+            return Action::Ignored(Reject::SequenceMismatch);
+        }
+        let Some(delay_req_left_ns) = out.left_ns else {
+            return Action::Ignored(Reject::WrongMessage);
+        };
+        // One response per request. A duplicate would produce a second measurement from the same
+        // four moments, which reads as new information and is not.
+        self.outstanding = None;
+        Action::Complete(Exchange {
+            sync: out.sync,
+            sync_arrived_ns: out.sync_arrived_ns,
+            follow_up: out.follow_up,
+            delay_req: out.delay_req,
+            delay_req_left_ns,
+            delay_resp,
+            us: self.us,
+        })
+    }
+
+    /// The `Delay_Req` handed out by [`Action::SendDelayReq`] left the pin at `left_ns`.
+    ///
+    /// Until this is called the exchange cannot complete: t3 is the one moment the slave measures
+    /// about itself, and a response arriving before it is refused rather than guessed at.
+    pub fn on_delay_req_sent(&mut self, left_ns: i64) {
+        if let Some(out) = self.outstanding.as_mut() {
+            out.left_ns = Some(left_ns);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -301,5 +441,161 @@ mod tests {
         let mut e = exchange(0, 20_000, 20_000);
         e.delay_resp.body = Body::DelayReq(Timestamp::default());
         assert_eq!(measure(&e), Err(Reject::WrongMessage));
+    }
+
+    // --- the slave's state machine ---
+
+    fn sync(sequence: u16) -> Message {
+        msg(master(), sequence, Body::Sync(Timestamp::default()))
+    }
+
+    fn follow_up(sequence: u16, t1: i64) -> Message {
+        msg(master(), sequence, Body::FollowUp(Timestamp::from_ns(t1)))
+    }
+
+    fn delay_resp(sequence: u16, t4: i64, requesting: PortIdentity) -> Message {
+        msg(
+            master(),
+            sequence,
+            Body::DelayResp {
+                receive: Timestamp::from_ns(t4),
+                requesting,
+            },
+        )
+    }
+
+    /// Drive a slave up to the point where it has handed out a `Delay_Req`.
+    fn armed(t1: i64, t2: i64) -> (Slave, Message) {
+        let mut s = Slave::new(slave());
+        assert_eq!(s.on_message(sync(7), t2), Action::Ignored(Reject::NotForUs));
+        match s.on_message(follow_up(7, t1), t2 + 1) {
+            Action::SendDelayReq(req) => (s, req),
+            other => panic!("expected a Delay_Req to go out, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sync_alone_does_not_start_a_request() {
+        // The Sync's own timestamp is a placeholder in two-step, so there is nothing to answer
+        // until the Follow_Up says when it really left.
+        let mut s = Slave::new(slave());
+        assert!(matches!(s.on_message(sync(1), 1_000), Action::Ignored(_)));
+    }
+
+    #[test]
+    fn a_follow_up_completes_the_masters_half_and_asks_for_the_return_leg() {
+        let (_, req) = armed(1_787_180_000_000_000_000, 1_787_180_000_000_020_000);
+        assert!(matches!(req.body, Body::DelayReq(_)));
+        assert_eq!(req.source, slave());
+    }
+
+    #[test]
+    fn a_follow_up_for_another_sequence_is_refused() {
+        let mut s = Slave::new(slave());
+        s.on_message(sync(7), 1_000);
+        assert_eq!(
+            s.on_message(follow_up(8, 900), 1_100),
+            Action::Ignored(Reject::SequenceMismatch)
+        );
+    }
+
+    #[test]
+    fn a_follow_up_from_another_port_is_refused() {
+        let mut s = Slave::new(slave());
+        s.on_message(sync(7), 1_000);
+        let stranger = msg(slave(), 7, Body::FollowUp(Timestamp::from_ns(900)));
+        assert_eq!(
+            s.on_message(stranger, 1_100),
+            Action::Ignored(Reject::DifferentSource)
+        );
+    }
+
+    #[test]
+    fn a_sync_that_crosses_its_follow_up_replaces_the_pending_one() {
+        // The Follow_Up for 7 was lost. Its timestamp arriving late must not be paired with the
+        // Sync for 8, which is a different moment on the wire.
+        let mut s = Slave::new(slave());
+        s.on_message(sync(7), 1_000);
+        s.on_message(sync(8), 2_000);
+        assert_eq!(
+            s.on_message(follow_up(7, 900), 2_100),
+            Action::Ignored(Reject::SequenceMismatch)
+        );
+        assert!(matches!(
+            s.on_message(follow_up(8, 1_900), 2_200),
+            Action::SendDelayReq(_)
+        ));
+    }
+
+    #[test]
+    fn a_response_before_the_request_left_is_refused() {
+        // t3 is the one moment the slave measures about itself. Without it there are three
+        // timestamps, not four.
+        let (mut s, req) = armed(1_787_180_000_000_000_000, 1_787_180_000_000_020_000);
+        let resp = delay_resp(req.sequence, 1_787_180_000_000_060_000, slave());
+        assert!(matches!(s.on_message(resp, 0), Action::Ignored(_)));
+    }
+
+    #[test]
+    fn a_response_addressed_to_the_other_port_is_refused() {
+        let (mut s, req) = armed(1_787_180_000_000_000_000, 1_787_180_000_000_020_000);
+        s.on_delay_req_sent(1_787_180_000_000_040_000);
+        let resp = delay_resp(req.sequence, 1_787_180_000_000_060_000, master());
+        assert_eq!(s.on_message(resp, 0), Action::Ignored(Reject::NotForUs));
+    }
+
+    #[test]
+    fn a_response_to_a_request_two_sequences_old_is_refused() {
+        let (mut s, req) = armed(1_787_180_000_000_000_000, 1_787_180_000_000_020_000);
+        s.on_delay_req_sent(1_787_180_000_000_040_000);
+        let stale = delay_resp(
+            req.sequence.wrapping_sub(2),
+            1_787_180_000_000_060_000,
+            slave(),
+        );
+        assert_eq!(
+            s.on_message(stale, 0),
+            Action::Ignored(Reject::SequenceMismatch)
+        );
+    }
+
+    #[test]
+    fn a_complete_exchange_measures_the_offset_the_four_moments_imply() {
+        // Path 20 µs each way, slave 5 µs ahead.
+        let t1 = 1_787_180_000_000_000_000i64;
+        let (mut s, req) = armed(t1, t1 + 20_000 + 5_000);
+        let t3 = t1 + 40_000 + 5_000;
+        s.on_delay_req_sent(t3);
+        let resp = delay_resp(req.sequence, t3 - 5_000 + 20_000, slave());
+        let Action::Complete(done) = s.on_message(resp, 0) else {
+            panic!("expected the exchange to complete");
+        };
+        let m = measure(&done).expect("four timestamps that belong together");
+        assert_eq!(m.offset_from_master_ns, 5_000);
+        assert_eq!(m.mean_path_delay_ns, 20_000);
+    }
+
+    #[test]
+    fn a_second_response_to_the_same_request_is_refused() {
+        let t1 = 1_787_180_000_000_000_000i64;
+        let (mut s, req) = armed(t1, t1 + 25_000);
+        s.on_delay_req_sent(t1 + 45_000);
+        let resp = delay_resp(req.sequence, t1 + 65_000, slave());
+        assert!(matches!(s.on_message(resp, 0), Action::Complete(_)));
+        assert!(matches!(s.on_message(resp, 0), Action::Ignored(_)));
+    }
+
+    #[test]
+    fn successive_exchanges_use_successive_sequences() {
+        let t1 = 1_787_180_000_000_000_000i64;
+        let (mut s, first) = armed(t1, t1 + 25_000);
+        s.on_delay_req_sent(t1 + 45_000);
+        s.on_message(delay_resp(first.sequence, t1 + 65_000, slave()), 0);
+
+        s.on_message(sync(9), t1 + 1_000_025_000);
+        let Action::SendDelayReq(second) = s.on_message(follow_up(9, t1 + 1_000_000_000), 0) else {
+            panic!("expected a second request");
+        };
+        assert_ne!(second.sequence, first.sequence);
     }
 }
