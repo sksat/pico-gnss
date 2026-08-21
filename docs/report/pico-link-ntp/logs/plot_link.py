@@ -406,12 +406,18 @@ MAIN_IFACES = [
     ("wlp1s0", "broadcast・無線 (AP 経由)"),
     ("eth0", "broadcast・有線 (switch 直)"),
 ]
+# 前回の記録のうち、送信時刻の補正を入れたあとのもの。構成どうしを比べるならこちらを使う。
+MAIN_LOG = "paths-corrected.log"
 
 
-def read_main_offsets():
-    """前回の受信ログから、インタフェースごとの offset (µs) を読む。"""
+def read_main_offsets(name=MAIN_LOG):
+    """前回の受信ログから、インタフェースごとの offset (µs) を読む。
+
+    ログの `offset` は「パケットが申告した送信時刻 − カーネルが付けた受信時刻」である。
+    片道の所要時間も、受信ホストの時計のずれも、この 1 つの値に入っていて分けられない。
+    """
     out = {}
-    with open(os.path.join(RAW_MAIN, "paths.log")) as f:
+    with open(os.path.join(RAW_MAIN, name)) as f:
         for line in f:
             m = RECV_LINE.match(line)
             if m:
@@ -420,7 +426,10 @@ def read_main_offsets():
 
 
 def read_mode_diff(tag):
-    """`pair-mode-<tag>.csv` の client − server を µs で読む。"""
+    """`pair-mode-<tag>.csv` の client − server を µs で読む。
+
+    オシロが 1 回のトリガで読んだ、2 枚の GP6 の立ち上がりの差である。PC の時計は入らない。
+    """
     server, client = read_pairs(f"pair-mode-{tag}.csv")
     return client - server
 
@@ -428,27 +437,36 @@ def read_mode_diff(tag):
 def fig_progression():
     """同じ broadcast のまま、構成を変えると桁がどう動くか。
 
-    前回の 2 行は PC が読んだ値で、PC の時計と受信経路まで含んでいて分けられない。
-    今回の 2 行は受け取った板の秒を GPS の秒に対して直接読んだもので、その分けられない部分が
-    測定系から外れている。同じ量ではないので、比べているのは桁である。
+    どの行も「その run の全サンプルの相加平均」と「その標準偏差」だが、平均している量は上下で
+    違う。上は PC が読んだ「申告 − 受信」、下はオシロが読んだ「client の秒 − server の秒」で、
+    前者には片道の所要時間と PC の時計が入っていて分けられない。比べているのは桁である。
     """
     main = read_main_offsets()
     rows = []
     for iface, label in MAIN_IFACES:
         if iface in main:
-            rows.append(("これまで: PC で受ける", label, main[iface]))
+            rows.append(
+                ("これまで: PC で受ける", label, "申告 − PC の受信", main[iface])
+            )
     for tag, label in (
         ("broadcast", "broadcast・片道"),
         ("unicast", "unicast・往復"),
     ):
         if os.path.exists(os.path.join(RAW, f"pair-mode-{tag}.csv")):
-            rows.append(("今回: Pico 直結", label, read_mode_diff(tag)))
+            rows.append(
+                (
+                    "今回: Pico 直結",
+                    label,
+                    "client の秒 − server の秒",
+                    read_mode_diff(tag),
+                )
+            )
     if not rows:
         print("progression: 読める記録が無い", file=sys.stderr)
         return
 
-    fig, ax = plt.subplots(figsize=(11, 4.0))
-    for i, (era, label, v) in enumerate(rows):
+    fig, ax = plt.subplots(figsize=(11, 4.4))
+    for i, (era, label, _quantity, v) in enumerate(rows):
         y = len(rows) - 1 - i
         colour = "#c1442e" if era.startswith("これまで") else "#2e7d5b"
         mag = abs(v.mean())
@@ -478,10 +496,11 @@ def fig_progression():
     ax.set_xlim(4, 6e5)
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels(
-        [f"{era}\n{label}" for era, label, _ in reversed(rows)], fontsize=8.5
+        [f"{era}\n{label}\n{quantity}" for era, label, quantity, _ in reversed(rows)],
+        fontsize=8.5,
     )
     ax.set_ylim(-0.9, len(rows) - 0.3)
-    ax.set_xlabel("配られた時刻が、受け取った側でどれだけずれていたか — 平均の大きさ (µs、対数)")
+    ax.set_xlabel("受け取った側が server の秒からどれだけずれていたか — 平均の大きさ (µs、対数)")
     ax.set_title(
         "同じ broadcast のまま、無線と PC の時計が測定系から外れた分だけ縮む", fontsize=10
     )
@@ -489,16 +508,17 @@ def fig_progression():
     fig.text(
         0.5,
         0.015,
-        "上 2 行は PC が読んだ値で、PC の時計と受信経路まで含む。"
-        "下 2 行は受け取った板の秒を GPS の秒に対して読んだもの。同じ量ではないので、"
-        "比べているのは桁である。\n"
+        "どの行も、その run の全サンプルの相加平均と標準偏差である (点が平均の大きさ、"
+        "横棒が標準偏差)。ただし平均している量が上下で違う。\n"
+        "上 2 行の「申告 − PC の受信」には、片道の所要時間と PC の時計のずれが入っていて"
+        "分けられない。下 2 行にはどちらも入らない。同じ量ではないので、比べているのは桁である。\n"
         "下 2 行どうしも、平均は比べられない (送信側の校正定数が配り方ごとに違う)。"
         "比べられるのは横棒の長さ、つまり 1 回ごとの揺れのほうである。",
         fontsize=7.8,
         color="0.35",
         ha="center",
     )
-    fig.tight_layout(rect=(0, 0.10, 1, 1))
+    fig.tight_layout(rect=(0, 0.14, 1, 1))
     path = os.path.join(OUT, "fig-progression.png")
     fig.savefig(path, dpi=140)
     print(f"saved {path}")
