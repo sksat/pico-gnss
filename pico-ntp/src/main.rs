@@ -61,9 +61,9 @@ use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::uart::{
     BufferedInterruptHandler, BufferedUart, BufferedUartRx, Config as UartConfig,
 };
-use embassy_sync::channel::Channel;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::Read as _;
 use static_cell::StaticCell;
@@ -79,8 +79,7 @@ use rp_pps::embassy::{
     start_in_sync,
 };
 use rp_pps::{
-    PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, output_high_cycles,
-    output_period_cycles,
+    PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, output_high_cycles, output_period_cycles,
 };
 use tiny_ntp::packet::{NtpPacket, PACKET_LEN};
 use tiny_ntp::server::{
