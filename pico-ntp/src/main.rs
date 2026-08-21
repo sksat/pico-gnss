@@ -411,8 +411,21 @@ fn frame_capture_ns(raw: u32, captures: u64) -> Option<u64> {
         captures,
         EVENT_CAPTURE_TOLL_TICKS,
     );
-    let ns = anchor.edge_ns as i64
-        + ticks_to_ns(since_edge.unsigned_abs(), clk_sys_freq()) as i64 * since_edge.signum();
+    // The anchor is the most recent 1PPS edge, so a frame belongs a fraction of a second either
+    // side of it: a little before, when the frame was captured and the edge landed while it was
+    // still queued, and up to a second after. Anything outside that is an anchor from a different
+    // second or a counter left unfed across its wrap, and a wrong answer here looks like a
+    // perfectly ordinary timestamp — so refuse rather than convert.
+    let since_ns =
+        ticks_to_ns(since_edge.unsigned_abs(), clk_sys_freq()) as i64 * since_edge.signum();
+    if !(-100_000_000..=2_000_000_000).contains(&since_ns) {
+        warn!(
+            "PTP timestamp {} ns from the last 1PPS edge, refused",
+            since_ns
+        );
+        return None;
+    }
+    let ns = anchor.edge_ns as i64 + since_ns;
     (ns >= 0).then_some(ns as u64)
 }
 
@@ -476,6 +489,13 @@ struct PtpRequest {
 }
 
 static PTP_REQUESTS: Channel<CriticalSectionRawMutex, PtpRequest, 2> = Channel::new();
+
+/// Whether the arrival counter's FIFO has ever overflowed.
+///
+/// A capture that is never read is a toll that is never charged, and the correction stays short by
+/// it — a permanent two ticks, which is eight nanoseconds on every path delay the exchange
+/// produces. Silent unless something says so.
+static ARRIVAL_MISSED: AtomicBool = AtomicBool::new(false);
 
 /// Words per capture on the receive side. See the client for the arithmetic; a request is smaller
 /// than a reply, and this covers either.
@@ -545,6 +565,9 @@ async fn link_rx_task(
             ARRIVAL_TICKS.lock(|a| a.borrow_mut().observe_with_captures(raw, arrived_captures))
         });
         let surplus = arrival.drain();
+        if arrival.missed_captures() {
+            ARRIVAL_MISSED.store(true, Ordering::Relaxed);
+        }
         seen = seen.wrapping_add(1);
         let Some(arrived_ns) = CLOCK.lock(|g| g.borrow().now_from_query_ns(arrived_local as u64))
         else {
@@ -990,7 +1013,13 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>, mut egress: EventCapture<
             )
             .await
             {
-                info!("PTPRESP seq={} t4={}", request.message.sequence, t4);
+                info!(
+                    "PTPRESP seq={} t4={} missed_in={} missed_out={}",
+                    request.message.sequence,
+                    t4,
+                    ARRIVAL_MISSED.load(Ordering::Relaxed),
+                    egress.missed_captures(),
+                );
             }
             continue;
         }
