@@ -224,8 +224,219 @@ pub fn build_udp_frame(spec: &UdpFrameSpec, out: &mut [u8]) -> Option<usize> {
     Some(total)
 }
 
+/// One UDP datagram, as found inside a received frame.
+///
+/// The payload borrows the frame, so nothing is copied and the caller keeps the buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UdpDatagram<'a> {
+    pub src_mac: MacAddr,
+    pub dst_mac: MacAddr,
+    pub src_ip: Ipv4Addr,
+    pub dst_ip: Ipv4Addr,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload: &'a [u8],
+}
+
+/// Find the UDP datagram in `frame`, which is a frame with its FCS already checked and removed.
+///
+/// The inverse of [`build_udp_frame`], and stricter than it needs to be on purpose: both header
+/// checksums are verified, so a frame that survived its FCS but was built wrong is still refused.
+///
+/// The payload is bounded by the IP total length, not by the frame. A frame shorter than
+/// [`MIN_ETHERNET_PAYLOAD`] is padded to reach it, and that padding is not payload.
+pub fn parse_udp_frame(frame: &[u8]) -> Option<UdpDatagram<'_>> {
+    const IP: usize = ETHERNET_HEADER_LEN;
+    if frame.len() < IP + IPV4_HEADER_LEN + UDP_HEADER_LEN {
+        return None;
+    }
+    if u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE_IPV4 {
+        return None;
+    }
+
+    // --- IPv4 ---
+    if frame[IP] >> 4 != 4 {
+        return None;
+    }
+    // Options are legal and this build never sends them, but a receiver that assumed their absence
+    // would read the UDP header out of the middle of one.
+    let ihl = (frame[IP] & 0x0F) as usize * 4;
+    if ihl < IPV4_HEADER_LEN {
+        return None;
+    }
+    let ip_total = u16::from_be_bytes([frame[IP + 2], frame[IP + 3]]) as usize;
+    // Room for the UDP header, not merely for the IP one. `ihl` may be as much as 60 bytes, so a
+    // packet that stops at the end of its own header passes `ip_total >= ihl` and still leaves
+    // nothing to read — and the frame it came in may be no longer than the header either.
+    if ip_total < ihl + UDP_HEADER_LEN || IP + ip_total > frame.len() {
+        return None;
+    }
+    if frame[IP + 9] != IP_PROTO_UDP {
+        return None;
+    }
+    // A one's-complement sum over a header that already carries its own checksum comes to zero.
+    if ones_complement_checksum(&frame[IP..IP + ihl], 0) != 0 {
+        return None;
+    }
+    // Fragments carry only a piece of the datagram, and the UDP header is in the first one alone.
+    let frag = u16::from_be_bytes([frame[IP + 6], frame[IP + 7]]);
+    if frag & 0x3FFF != 0 {
+        return None;
+    }
+
+    // --- UDP ---
+    let udp = IP + ihl;
+    let udp_len = u16::from_be_bytes([frame[udp + 4], frame[udp + 5]]) as usize;
+    if udp_len < UDP_HEADER_LEN || udp_len > ip_total - ihl {
+        return None;
+    }
+    let datagram = &frame[udp..udp + udp_len];
+    let carried = u16::from_be_bytes([frame[udp + 6], frame[udp + 7]]);
+    // Zero means the sender declined to compute one, which IPv4 allows.
+    if carried != 0 {
+        let mut pseudo = 0u32;
+        for c in frame[IP + 12..IP + 20].chunks_exact(2) {
+            pseudo += u16::from_be_bytes([c[0], c[1]]) as u32;
+        }
+        pseudo += IP_PROTO_UDP as u32 + udp_len as u32;
+        if ones_complement_checksum(datagram, pseudo) != 0 {
+            return None;
+        }
+    }
+
+    Some(UdpDatagram {
+        src_mac: MacAddr(frame[6..12].try_into().ok()?),
+        dst_mac: MacAddr(frame[0..6].try_into().ok()?),
+        src_ip: Ipv4Addr(frame[IP + 12..IP + 16].try_into().ok()?),
+        dst_ip: Ipv4Addr(frame[IP + 16..IP + 20].try_into().ok()?),
+        src_port: u16::from_be_bytes([frame[udp], frame[udp + 1]]),
+        dst_port: u16::from_be_bytes([frame[udp + 2], frame[udp + 3]]),
+        payload: &datagram[UDP_HEADER_LEN..],
+    })
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// The spec `pico-ntp` actually sends, with a payload the caller chooses.
+    fn ntp_spec(payload: &[u8]) -> UdpFrameSpec<'_> {
+        UdpFrameSpec {
+            src_mac: MacAddr([0x02, 0x00, 0x00, 0xC0, 0xFF, 0xEE]),
+            dst_mac: MacAddr::BROADCAST,
+            src_ip: Ipv4Addr::new(192, 168, 0, 200),
+            dst_ip: Ipv4Addr::BROADCAST,
+            src_port: 123,
+            dst_port: 123,
+            ip_id: 0x1234,
+            ttl: 1,
+            payload,
+        }
+    }
+
+    /// Build a frame and hand back what a receiver would have: no FCS.
+    fn received(spec: &UdpFrameSpec, out: &mut [u8]) -> usize {
+        let len = build_udp_frame(spec, out).expect("frame fits");
+        len - FCS_LEN
+    }
+
+    #[test]
+    fn a_frame_parses_back_into_what_was_put_in_it() {
+        let payload: [u8; 48] = core::array::from_fn(|i| i as u8);
+        let spec = ntp_spec(&payload);
+        let mut buf = [0u8; 128];
+        let len = received(&spec, &mut buf);
+
+        let got = parse_udp_frame(&buf[..len]).expect("parses");
+        assert_eq!(got.src_mac, spec.src_mac);
+        assert_eq!(got.dst_mac, spec.dst_mac);
+        assert_eq!(got.src_ip, spec.src_ip);
+        assert_eq!(got.dst_ip, spec.dst_ip);
+        assert_eq!(got.src_port, spec.src_port);
+        assert_eq!(got.dst_port, spec.dst_port);
+        assert_eq!(got.payload, &payload[..]);
+    }
+
+    #[test]
+    fn the_padding_on_a_short_frame_is_not_payload() {
+        // Four bytes of payload, which is far under the 46-byte minimum: the rest is padding, and
+        // a parser that trusted the frame length would hand back 18 bytes of zeros as well.
+        let payload = [0xDE, 0xAD, 0xBE, 0xEF];
+        let spec = ntp_spec(&payload);
+        let mut buf = [0u8; 128];
+        let len = received(&spec, &mut buf);
+        assert!(
+            len >= ETHERNET_HEADER_LEN + MIN_ETHERNET_PAYLOAD,
+            "frame was padded"
+        );
+
+        let got = parse_udp_frame(&buf[..len]).expect("parses");
+        assert_eq!(got.payload, &payload[..]);
+    }
+
+    #[test]
+    fn a_frame_that_is_not_ipv4_is_refused() {
+        let payload = [0u8; 48];
+        let spec = ntp_spec(&payload);
+        let mut buf = [0u8; 128];
+        let len = received(&spec, &mut buf);
+        buf[12] = 0x86;
+        buf[13] = 0xDD;
+        assert_eq!(parse_udp_frame(&buf[..len]), None);
+    }
+
+    #[test]
+    fn a_frame_that_is_not_udp_is_refused() {
+        let payload = [0u8; 48];
+        let spec = ntp_spec(&payload);
+        let mut buf = [0u8; 128];
+        let len = received(&spec, &mut buf);
+        // Protocol byte, and the IP checksum recomputed so only the protocol is wrong.
+        let ip = ETHERNET_HEADER_LEN;
+        buf[ip + 9] = 6;
+        buf[ip + 10] = 0;
+        buf[ip + 11] = 0;
+        let sum = ones_complement_checksum(&buf[ip..ip + IPV4_HEADER_LEN], 0);
+        buf[ip + 10..ip + 12].copy_from_slice(&sum.to_be_bytes());
+        assert_eq!(parse_udp_frame(&buf[..len]), None);
+    }
+
+    #[test]
+    fn a_frame_with_a_broken_ip_checksum_is_refused() {
+        let payload = [0u8; 48];
+        let spec = ntp_spec(&payload);
+        let mut buf = [0u8; 128];
+        let len = received(&spec, &mut buf);
+        buf[ETHERNET_HEADER_LEN + 10] ^= 0xFF;
+        assert_eq!(parse_udp_frame(&buf[..len]), None);
+    }
+
+    #[test]
+    fn a_frame_with_a_broken_udp_checksum_is_refused() {
+        let payload = [0u8; 48];
+        let spec = ntp_spec(&payload);
+        let mut buf = [0u8; 128];
+        let len = received(&spec, &mut buf);
+        let udp = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
+        buf[udp + 6] ^= 0xFF;
+        assert_eq!(parse_udp_frame(&buf[..len]), None);
+    }
+
+    #[test]
+    fn a_frame_cut_short_is_refused() {
+        let payload = [0u8; 48];
+        let spec = ntp_spec(&payload);
+        let mut buf = [0u8; 128];
+        let len = received(&spec, &mut buf);
+        for cut in [
+            0,
+            1,
+            ETHERNET_HEADER_LEN,
+            ETHERNET_HEADER_LEN + IPV4_HEADER_LEN,
+            len - 1,
+        ] {
+            assert_eq!(parse_udp_frame(&buf[..cut]), None, "cut at {cut}");
+        }
+    }
     use super::*;
 
     const NTP_PAYLOAD: [u8; 48] = [0xAB; 48];
@@ -436,6 +647,26 @@ mod tests {
             (IPV4_HEADER_LEN + UDP_HEADER_LEN + 1) as u16,
             "IP total length describes the datagram, not the padded Ethernet payload"
         );
+    }
+
+    /// A header long enough to satisfy every length check, and a total length that leaves nothing
+    /// after it. `ip_total >= ihl` holds and `IP + ip_total` is inside the frame, so the parser
+    /// used to reach the UDP header and index past the end of what it was given.
+    #[test]
+    fn an_ipv4_packet_with_no_room_for_a_udp_header_is_refused() {
+        const IHL_WORDS: u8 = 15; // 60 bytes: the largest an IPv4 header may be
+        const IHL: usize = IHL_WORDS as usize * 4;
+        let mut frame = [0u8; ETHERNET_HEADER_LEN + IHL];
+        frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+        let ip = ETHERNET_HEADER_LEN;
+        frame[ip] = 0x40 | IHL_WORDS;
+        // Total length stops at the end of the header: a legal encoding of an empty payload.
+        frame[ip + 2..ip + 4].copy_from_slice(&(IHL as u16).to_be_bytes());
+        frame[ip + 9] = IP_PROTO_UDP;
+        let checksum = ones_complement_checksum(&frame[ip..ip + IHL], 0);
+        frame[ip + 10..ip + 12].copy_from_slice(&checksum.to_be_bytes());
+
+        assert!(parse_udp_frame(&frame).is_none());
     }
 
     #[test]

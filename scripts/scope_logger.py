@@ -8,7 +8,7 @@ hwphase (= PIO で測る同じ output-GPS) と時刻で突き合わせ、第3計
 なぜ wall-time を打つか: ホストが NTP 同期していれば `time.time()` は絶対 UTC なので、scope が
 捉えたパルスがどの UTC 秒・どの firmware エッジかを後から対応づけられる (`timedatectl` で
 synchronized を確認すること)。冒頭に firmware ログの最新 RTT 時刻と wall を 1 行記録しておくと、
-firmware の RTT 時計と wall の橋になり、相互相関でラグを較正できる (analyze 側でやる)。
+firmware の RTT 時計と wall の橋になり、相互相関でラグを校正できる (analyze 側でやる)。
 
 途中で止めて再開しても良いように append 対応: SCOPE_LOG に既存の橋ヘッダがあれば再利用して
 追記する (firmware を再フラッシュしていない限り橋定数 wall-RTT は連続なので有効)。

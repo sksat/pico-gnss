@@ -44,7 +44,10 @@ pub mod embassy;
 pub mod rp2040;
 
 mod assembler;
+mod schedule;
 mod timesync;
+
+pub use schedule::{PpsSchedule, PpsScheduleConfig, PpsStep, first_edge_ns};
 
 pub use assembler::{MAX_SENTENCE_LEN, NmeaLineAssembler, nmea_checksum, nmea_checksum_valid};
 pub use timesync::{
@@ -79,7 +82,7 @@ pub const OUTPUT_OVERHEAD_CYCLES: u32 = 7;
 /// input within nanoseconds. Only a comparison against an outside clock shows it.
 ///
 /// Polarity is a property of the receiver and the board it sits on, so it belongs in the firmware's
-/// configuration — but finding out what to configure can take work. The AE-GNSS-EXTANT board this
+/// configuration, and the documents do not always agree. The AE-GNSS-EXTANT board this
 /// project is built around documents `1PPS 出力 : C-MOS ロジック (3.3V) レベル,
 /// パルス幅 :100mS (アクティブ Low)`, while the MediaTek software specifications underneath it
 /// describe the pulse against its *rising* edge and state no polarity anywhere; the two agree only
@@ -223,6 +226,19 @@ pub fn pps_capture_program_wrap_balanced() -> Program<32> {
     .program
 }
 
+/// The instruction that puts a state machine's `X` at zero, for injecting before it is enabled.
+///
+/// [`pps_capture_program`] and its variants count `X` down and never load it, so where the count
+/// starts is whatever `X` happened to hold. That is fine for intervals and useless for anything
+/// that has to line up with another state machine, because there is then no shared origin — see
+/// [`PpsEdgeTimeline::from_counter_start`].
+///
+/// Written to `SMx_INSTR`, which executes immediately whether or not the machine is enabled, so
+/// this is the way to set a register a program never writes.
+pub fn zero_x_instruction() -> u16 {
+    pio::pio_asm!("mov x, null").program.code[0]
+}
+
 /// Steerable **1PPS output** program for one state machine, with a configurable high-pulse width.
 ///
 /// Once at start it pulls a *high-width word* and stashes it in `ISR` (the high pulse length in PIO
@@ -325,6 +341,25 @@ impl PpsEdgeTimeline {
         }
     }
 
+    /// Create a timeline whose zero is the moment the state machine started counting.
+    ///
+    /// [`new`](Self::new) puts zero at the *first edge*, which is all a frequency estimate needs.
+    /// Anything that has to be compared with another state machine needs a zero the two share, and
+    /// state machines enabled by one write share the instant they started.
+    ///
+    /// The caller must have left `X` at zero before enabling (inject `mov x, null` while stopped),
+    /// because that is what makes the first captured value say how long the counting had been
+    /// going: the counter runs down from zero, so `0 - raw` is the elapsed ticks.
+    pub const fn from_counter_start(clk_hz: u32) -> Self {
+        Self {
+            clk_hz,
+            // Zero is not "no reading yet" here, it is the reading the counter had when it was
+            // enabled. The first capture then measures an interval like any other.
+            last: Some(0),
+            edge_ns: 0,
+        }
+    }
+
     /// Record a raw capture-counter value (e.g. from `wait_edge()`); returns the interval since the
     /// previous edge and the running timeline. The first call returns `interval_ns = edge_ns = 0`.
     pub fn observe(&mut self, raw: u32) -> TimedEdge {
@@ -381,7 +416,7 @@ pub fn loopback_phase_ticks(
 /// small true phase; a **mis-pairing** (captures from non-adjacent edges, e.g. after a PPS
 /// dropout/drain/relock) makes it ≈ ±`ticks_per_second`. [`loopback_phase_ticks`] folds mod the
 /// nominal second, which *hides* such a slip and leaves a ppm×1s residual the servo then locks to
-/// (the historic "stale pairing" failure family). Gate the measurement on `|raw| <= max_lag_ticks`
+/// as if it were alignment. Gate the measurement on `|raw| <= max_lag_ticks`
 /// (a few ms ≫ any real phase, ≪ 1 s) so only correctly-paired edges drive the loop, keeping
 /// `phase == 0 ⟺ aligned`.
 pub fn loopback_raw_lag_ticks(
@@ -999,6 +1034,29 @@ mod tests {
                 edge_ns: 0
             }
         );
+    }
+
+    #[test]
+    fn zeroing_x_is_the_instruction_the_datasheet_gives() {
+        // MOV: 101 | delay/side-set 00000 | destination X 001 | operation none 00 | source NULL 011
+        assert_eq!(zero_x_instruction(), 0xA023);
+    }
+
+    #[test]
+    fn edge_timeline_can_start_where_the_counter_did() {
+        // X is left at zero before the state machine is enabled, so the counter runs down from
+        // zero and the first captured value is the elapsed ticks negated. A timeline that starts
+        // there can be lined up with any other state machine enabled by the same write.
+        let mut t = PpsEdgeTimeline::from_counter_start(125_000_000);
+        // 0.4 s of counting before the first edge: 25M ticks at 62.5M ticks/s.
+        let first = t.observe(0u32.wrapping_sub(25_000_000));
+        assert_eq!(
+            first.edge_ns, 400_000_000,
+            "first edge, measured from the start"
+        );
+        let second = t.observe(0u32.wrapping_sub(25_000_000 + 62_500_000));
+        assert_eq!(second.interval_ns, 1_000_000_000);
+        assert_eq!(second.edge_ns, 1_400_000_000);
     }
 
     #[test]

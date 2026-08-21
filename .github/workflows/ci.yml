@@ -85,6 +85,7 @@ jobs:
       # The firmware crate was the only member without a fmt gate, so it had drifted. Formatting
       # needs no target, but it belongs in the job that owns pico-gnss rather than the cores job.
       - run: cargo fmt -p pico-gnss --check
+      - run: cargo fmt -p pico-ntp --check
       # Firmware `check` (not build): needs neither flip-link nor a probe. This also compiles
       # rp-pps's embassy-rp backend, which can't be checked standalone (it needs the chip feature
       # the firmware selects).

@@ -26,7 +26,10 @@ use embassy_rp::pio::{
 use fixed::FixedU32;
 use fixed::types::extra::U8;
 
-use crate::phy::{NLP_WORD, pio_clock_divider_bits, ser_10base_t_program};
+use crate::phy::{
+    NLP_WORD, des_10base_t_program, pio_clock_divider_bits, rx_pio_clock_divider_bits,
+    ser_10base_t_program,
+};
 
 /// 10BASE-T transmitter on one PIO state machine plus one DMA channel.
 pub struct Tx10BaseT<'d, PIO: Instance, const SM: usize> {
@@ -111,3 +114,81 @@ impl<'d, PIO: Instance, const SM: usize> Tx10BaseT<'d, PIO, SM> {
 // No tests here: this file needs the target to compile at all. Everything that can be decided
 // without a chip — the symbol encoding, the program's shape, the clock divider — lives in
 // `crate::phy` and is tested there on the host.
+
+/// The receive half: one state machine sampling the pair, and a DMA channel taking the words away.
+///
+/// Where [`Tx10BaseT`] owns two output pins, this owns two inputs, and they have to be the same two
+/// in the same order — TX− first. A sampled word then reads as the value the far side's side-set
+/// wrote, and [`crate::rx::FrameDecoder`] can take it without a translation table.
+pub struct Rx10BaseT<'d, PIO: Instance, const SM: usize> {
+    sm: StateMachine<'d, PIO, SM>,
+    dma: DmaChannel<'d>,
+    #[allow(dead_code)]
+    prog: LoadedProgram<'d, PIO>,
+    #[allow(dead_code)]
+    pins: (Pin<'d, PIO>, Pin<'d, PIO>),
+}
+
+impl<'d, PIO: Instance, const SM: usize> Rx10BaseT<'d, PIO, SM> {
+    /// Load the deserialiser onto `sm` and point it at the pair.
+    ///
+    /// `clk_hz` is the system clock; the deserialiser runs at [`crate::phy::RX_PIO_CLOCK_HZ`],
+    /// which is twice the symbol rate so the sampling loop has room for its counter.
+    pub fn new(
+        common: &mut Common<'d, PIO>,
+        mut sm: StateMachine<'d, PIO, SM>,
+        rx_minus: Peri<'d, impl PioPin>,
+        rx_plus: Peri<'d, impl PioPin>,
+        dma: DmaChannel<'d>,
+        clk_hz: u32,
+    ) -> Self {
+        let prog = common.load_program(&des_10base_t_program());
+        let minus = common.make_pio_pin(rx_minus);
+        let plus = common.make_pio_pin(rx_plus);
+        sm.set_pin_dirs(Direction::In, &[&minus, &plus]);
+
+        let mut cfg = Config::default();
+        cfg.use_program(&prog, &[]);
+        // `in pins, 2` and `wait 1 pin 0` both count from here, so TX− has to be first.
+        cfg.set_in_pins(&[&minus, &plus]);
+        // First symbol sampled ends up in the low two bits, which is where `rx::symbols_of` looks.
+        cfg.shift_in = ShiftConfig {
+            threshold: 32,
+            direction: ShiftDirection::Right,
+            auto_fill: true,
+        };
+        // Both FIFOs stay. Giving the TX depth to RX looks free — this state machine transmits
+        // nothing — but the program takes its symbol count through `pull`, and joining leaves no
+        // TX FIFO for that to come from. It blocks there forever, and the capture never starts.
+        cfg.fifo_join = FifoJoin::Duplex;
+        cfg.clock_divider = FixedU32::<U8>::from_bits(rx_pio_clock_divider_bits(clk_hz));
+        sm.set_config(&cfg);
+        sm.set_enable(true);
+
+        Self {
+            sm,
+            dma,
+            prog,
+            pins: (minus, plus),
+        }
+    }
+
+    /// Wait for the line to leave idle, then fill `words` with what follows.
+    ///
+    /// One capture is a fixed length because the state machine cannot see where a frame ends —
+    /// that is the decoder's job, and it stops on TP_IDL. Ask for more words than the frame needs
+    /// and the tail is idle, which the decoder ignores.
+    ///
+    /// Returns once the DMA has the whole buffer. There is no timeout: a link with nothing on it
+    /// never leaves idle, so a caller that needs one has to impose it.
+    pub async fn capture(&mut self, words: &mut [u32]) {
+        // The program takes a sample count, minus one, before each capture.
+        let samples = (words.len() * SAMPLES_PER_WORD) as u32;
+        self.sm.tx().push(samples - 1);
+        self.sm.rx().dma_pull(&mut self.dma, words, false).await;
+    }
+}
+
+/// Line samples in one 32-bit word: 2 bits each. At [`crate::rx::OVERSAMPLE`] samples per symbol
+/// this is eight symbols' worth.
+const SAMPLES_PER_WORD: usize = 16;

@@ -77,7 +77,7 @@ embedded 専用で、`pico-gnss/`(その `.cargo/config.toml` が `thumbv6m-none
   (数分で ~150 ns、~10 分超で σ ~200–250 ns) は **ハード律速で firmware では詰められない** — 出所は
   外部基準なしには分離できないが、データはむしろ水晶/発振器側 (温度相関) で受信機ではない
   (受信律速なのは極小の ~13–18 ns 下限のみ)。出力 vs GPS の絶対オフセットは **≤100 ns に中心化・
-  再起動再現性あり** (Smith 予測子サーボ + ループバック自己較正。旧ソフトサーボは ±1.4 ms)。
+  再起動再現性あり** (Smith 予測子サーボ + ループバック自己校正。旧ソフトサーボは ±1.4 ms)。
   窓依存と限界は [`docs/report/REPORT.md`](docs/report/REPORT.md) を参照。
 
 before/after — 位相の「測定」精度 (Instant ±ms → PIO 16 ns) と、その結果の出力位相:

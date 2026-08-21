@@ -15,6 +15,16 @@ default-run = "pico-ntp"
 name = "pico-ntp"
 path = "src/main.rs"
 
+# The other board in the pair: reads the link and reports what arrived.
+[[bin]]
+name = "link_rx"
+path = "src/bin/link_rx.rs"
+
+# The client side of the pair: takes the time off the link and puts it on GP6.
+[[bin]]
+name = "ntp_client"
+path = "src/bin/ntp_client.rs"
+
 # On-target transmit benchmark; not built by a normal build.
 # On hardware: cd pico-ntp && cargo run --release --features bench --bin bench_tx
 [[bin]]
@@ -23,6 +33,14 @@ path = "src/bin/bench_tx.rs"
 required-features = ["bench"]
 
 [features]
+# Builds `ntp_client` to discipline from the server's beacon rather than from its own request and
+# the reply to it.
+#
+# The two are different measurements, not different settings: an exchange lets the client sound the
+# path, a beacon has to be believed. Comparing what they achieve means holding everything else
+# still, which is what this flag is for — the same binary, the same board, the same run length.
+broadcast-client = []
+
 # Builds the on-target benchmark binary. It needs no extra dependencies — the flag exists so a
 # normal build does not produce a second firmware image that would be easy to flash by accident.
 bench = []

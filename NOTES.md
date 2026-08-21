@@ -108,7 +108,7 @@ PIO の精密な PPS 間隔から **RP2040 水晶の周波数オフセットを�
 - **UTC 位相同期 stage ② (PIO ハード測定, 実装済)**: 位相を Instant でなく **PIO の生カウンタ差**で測る。
   GPS PPS は SM0、出力ループバックは SM2 が捕捉。両者は同じ clk_sys なので位相 = `signed_mod(C0_gps −
   C2_out − K)×16ns` (16ns 分解能, Instant の ~ms ノイズ無し)。**K** は起動時に SM2 を一瞬 GP2 に向け SM0 と
-  同じ GPS エッジを両方で捕捉して較正 (`set_config` は scratch X を触らないのでピン切替後も K 有効。位相は
+  同じ GPS エッジを両方で捕捉して校正 (`set_config` は scratch X を触らないのでピン切替後も K 有効。位相は
   mod 1秒なので K の整数秒誤差は無害)。この ns 測定でコントローラを回すと **±ms → ロック後 σ~460ns
   (sub-µs) で数分間張り付く**。実測比較 (`webapp/plot_compare.py`): 測定が Instant σ~360µs → PIO 16ns
   (~2万×), 出力位相が 旧 Instant 制御 ±1.2ms → 新 PIO 制御 sub-µs。`PPSGEN ... hwphase_ns=` を追加。
@@ -333,7 +333,7 @@ SLAS/CLAS 対応受信機 (u-blox F9 系等) が必要。
 
 ### 実効 K スリップの再計測 (20260703): エッジ非対称ゼロでも這う
 
-stage-3 (起動時較正のみ、recal なし) を 100 分定点観測すると、gap (scope 実測 − hwphase) は
+stage-3 (起動時校正のみ、recal なし) を 100 分定点観測すると、gap (scope 実測 − hwphase) は
 +187→+424 ns と単調に歩いた (t000-t080、+3.8 ns/min。最終点 t100 はオシロ側の計測不良で棄却)。
 この間 PPS の Irregular/missed は **0**。旧仮説「capture エッジ数の非対称 × capture gap (~2 tick) の蓄積」
 では説明できない (非対称イベントが無いのに這う)。recal あり 40 分連続 (2402 shot、失敗 0) では

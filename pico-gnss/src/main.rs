@@ -147,7 +147,7 @@ const PHASE_USE_HW: bool = true;
 /// type-II ループの underdamped 共振** と判明した。根拠 (5 系統で確認): 実ログ4本 + scope 実測が
 /// いずれも卓越周期 32-37s (= 2π√(i_den) edge、i_den=32 で 35.5edge=36s) かつ電力の 73-94% が 16-64s 帯、
 /// 受信品質(HDOP)・温度と無相関、実 PhaseLockLoop の step 応答が 35.0s で ~24 回リンギング、反証検証
-/// (aliasing/K再較正/量子化/適応スイッチ) を全て排除。受信機の位相ステップ/低周波擾乱がこの固有モードを
+/// (aliasing/K再校正/量子化/適応スイッチ) を全て排除。受信機の位相ステップ/低周波擾乱がこの固有モードを
 /// 叩いてリンギング増幅される。**白色位相ノイズでは励起されず** (2 つの独立 host sim が 11ns→~5-8ns に
 /// 減衰、replay も 46ns) excitation はモデル外なので、**修正の振幅効果は実機が判定者**。
 /// **結論 (de-confound 後)**: i_den は wander の**振幅を変えない**。振幅は**受信律速**である。
@@ -264,20 +264,20 @@ const KICK_INJECT: bool = false; // boost 強制発火/回復計測の実験。*
 const KICK_AMP_NS: i64 = 8000; // outlier_ns(3000) 超の明確なステップ。reject 後受理で boost 発火、lock 窓外
 const KICK_PERIOD: u32 = 150; // locked エッジ毎に 1 発(セグメント 300 に ~2 発、回復が収まる間隔)
 
-/// 定期 K 再較正の cadence (locked 中の出力エッジ数 ≈ 秒)。実効 K の温度ドリフト (#5 後で ~5ns/min) を
+/// 定期 K 再校正の cadence (locked 中の出力エッジ数 ≈ 秒)。実効 K の温度ドリフト (#5 後で ~5ns/min) を
 /// 追従する。短くすると holdover 中断が増える tradeoff。
 /// **実験A 退避**: recal の holdover gap (SM2 を数秒 GPS へ奪う) が PRBS h[k] 窓を汚すので、セグメント長
 /// (CONTROLLER_SWEEP_EDGES=900) より十分大きくして実験中は recal を発火させない。実験後は production の
-/// 300 へ戻す (boot 一発較正で K の初期値は確定済み)。
+/// 300 へ戻す (boot 一発校正で K の初期値は確定済み)。
 const RECAL_EDGES: u32 = 150; // production: ~2.5分毎に ΔC(実効K)再測。dk≈-5tick/300edge のスリップ sawtooth を ~40ns に抑える。
 
 /// **実験: 間欠ループバック特性化**。ループバックを常時でなく間欠で使う設計 (普段は SM を別用途に空ける) に
-/// したとき、出力位相がどう振る舞うかを実機で測る。閉窓 (通常の位相ループ + 窓入口で K 再較正) と
+/// したとき、出力位相がどう振る舞うかを実機で測る。閉窓 (通常の位相ループ + 窓入口で K 再校正) と
 /// 開窓 (周波数FFのみ = `predicted_freq`、位相補正と recal を停止) を交互に回し、開窓中も hwphase は
 /// 捕捉し続けてログ (適用しないだけ) → 開ループの位相ドリフトが hwphase と scope の両方に出る。
 /// 開窓長 `EXP_TOFF_SCHEDULE` を巡回掃引し、「開窓時間 → 最大オフセット偏差」を得る。false で production。
 const INTERMITTENT_EXP: bool = false;
-const EXP_TON_EDGES: u32 = 30; // 閉窓 (locked edges≈秒): 入口の K 再較正 + ループ整定に十分
+const EXP_TON_EDGES: u32 = 30; // 閉窓 (locked edges≈秒): 入口の K 再校正 + ループ整定に十分
 const EXP_TOFF_SCHEDULE: [u32; 4] = [30, 60, 120, 300]; // 開窓長 (locked edges≈秒) を巡回
 /// 開窓の出力周波数: true=学習済みトリムを保持 (pred + 閉窓最後の trim。現実的な間欠設計) /
 /// false=素朴 (pred のみ。ループ補正を丸ごと捨てる最悪ケース)。両者を比較して間欠化の特性差を測る。
@@ -299,12 +299,12 @@ const TEMP_FF_GAIN_Q8: i64 = 64; // matched-lead 経路では未使用 (旧 λ h
 const TEMP_FF_LAG_Q8: i64 = 1536; // τ/Ts を Q8 で (≈6s @1Hz)。検証で 61s 平滑が水晶を r≈0.99 で予測
 const TEMP_FF_DLEAD_SHIFT: u32 = 2; // 微分の帯域制限 EMA (α=1/4)
 const RESID_OBS_SHIFT: u32 = 2; // 残差 observer ゲイン K=1/2^shift=0.25
-/// 再較正で取る (c0,c2) 同一エッジ対の数。先頭 1 個は GP4→GP2 切替トランジェントとして捨て、残りで K を測る。
+/// 再校正で取る (c0,c2) 同一エッジ対の数。先頭 1 個は GP4→GP2 切替トランジェントとして捨て、残りで K を測る。
 const RECAL_SAMPLES: u32 = 6;
-/// 再較正サンプルの旧 K 近傍ゲート (tick)。正しい同一エッジ対なら c0-c2 は旧 K から高々 ~数十 tick
+/// 再校正サンプルの旧 K 近傍ゲート (tick)。正しい同一エッジ対なら c0-c2 は旧 K から高々 ~数十 tick
 /// (5分のドリフトは ~6tick) なので、これを超える対は spurious エッジとのミスペア (~±1秒) として捨てる。
 const RECAL_SAMPLE_TICK_GATE: u32 = 64; // ≈1µs。実ドリフト ~19ns/min に対し十分広く、±1秒ミスペアは確実に弾く
-/// 再較正で測った新 K は段差で適用せず、1 エッジあたり最大このtick数だけ slew して寄せる。実効 K は連続的に
+/// 再校正で測った新 K は段差で適用せず、1 エッジあたり最大このtick数だけ slew して寄せる。実効 K は連続的に
 /// 這うので補正も連続が自然。段差適用だと累積ドリフト(~6tick=96ns)を loop が急補正し D 項が跳ねて
 /// offset② が ~30s 暴れる (実機確認)。slew で ramp 化すると loop は滑らかに追従する。dk≈6 なら ~3 エッジで適用。
 const RECAL_K_SLEW_TICKS: i32 = 2;
@@ -720,8 +720,8 @@ async fn time_task() {
     }
 }
 
-/// 定期 K 再較正。両捕捉 SM (SM0=GP2 GPS, SM2=GP4 出力ループバック) の生カウンタは runtime/温度で相対
-/// スリップし、boot 較正した K が古くなって offset② (出力 PPS vs GPS の絶対位相) がゆっくり這う (実機確認:
+/// 定期 K 再校正。両捕捉 SM (SM0=GP2 GPS, SM2=GP4 出力ループバック) の生カウンタは runtime/温度で相対
+/// スリップし、boot 校正した K が古くなって offset② (出力 PPS vs GPS の絶対位相) がゆっくり這う (実機確認:
 /// C0 publish を Locked 限定にした後も ~5ns/min・温度相関)。SM2 を一時的に GP2 へ向け、SM0 と同一 GP2
 /// エッジで K=mean(c0-c2) を測り直して現在の相対関係に追従する。
 ///
@@ -838,15 +838,15 @@ async fn recal_k(
 async fn gen_capture_task(
     mut output: SteeredPpsOutput<'static, PIO0, 1>,
     mut sm: StateMachine<'static, PIO0, 2>,
-    mut k: u32, // stage② 較正済みカウンタオフセット (C0−C2)。定期再較正で更新する。
-    cfg_gp2: PioConfig<'static, PIO0>, // SM2 を GPS(GP2) へ向ける config (再較正用)
+    mut k: u32, // stage② 校正済みカウンタオフセット (C0−C2)。定期再校正で更新する。
+    cfg_gp2: PioConfig<'static, PIO0>, // SM2 を GPS(GP2) へ向ける config (再校正用)
     cfg_gp4: PioConfig<'static, PIO0>, // SM2 を出力ループバック(GP4) へ向ける config (通常運用)
 ) {
     let clk = clk_sys_freq();
     let mut last_x: Option<u32> = None;
     let mut count: u32 = 0;
     let mut last_gen: u32 = 0;
-    let mut k_target: u32 = k; // 再較正が測った最新 K。毎エッジ k をここへ slew して寄せる (段差→ramp)。
+    let mut k_target: u32 = k; // 再校正が測った最新 K。毎エッジ k をここへ slew して寄せる (段差→ramp)。
     let k0_boot: u32 = k; // shadow recal 用: 起動時 K0 を保持し K_shadow の drift を dk=K_shadow-K0 で出す。
     let mut edges_since_shadow: u32 = 0;
     // SM3 shadow の状態: cadence カウンタと、GP2 滞在の残エッジ数 (0 = GP4 常駐中)。
@@ -855,8 +855,8 @@ async fn gen_capture_task(
     // 温度 FF A/B の状態。初期値は段ゲートの設定 (stage-3 なら off 始まり)。
     let mut edges_since_tffab: u32 = 0;
     let mut tffab_on: bool = temp_ff(PRECISION_STAGE);
-    // 直近の出力周期語。再較正中の holdover 生 push に再利用する。必ず set_next_period (下) で代入されてから
-    // recal_k に渡る (再較正はループ末尾＝周期語確定後にしか発火しない) ので、初期値は不要。
+    // 直近の出力周期語。再校正中の holdover 生 push に再利用する。必ず set_next_period (下) で代入されてから
+    // recal_k に渡る (再校正はループ末尾＝周期語確定後にしか発火しない) ので、初期値は不要。
     let mut last_period: u32;
     let mut edges_since_recal: u32 = 0;
     // 間欠ループバック実験の状態。exp_open=開窓(周波数FFのみ)、edges_in_mode=現窓の経過 locked edges、
@@ -905,7 +905,7 @@ async fn gen_capture_task(
     let mut prbs_lfsr: u16 = 0xACE1;
     loop {
         let x0 = sm.rx().wait_pull().await; // 出力エッジの生カウンタ (C2_out)。wait_pull は FIFO 最古を返す。
-        // backlog があれば最新エッジまで drain する (K 較正の drain と同じ対策)。ループが holdover 復帰等で
+        // backlog があれば最新エッジまで drain する (K 校正の drain と同じ対策)。ループが holdover 復帰等で
         // 遅れると stale な出力エッジが FIFO に溜まり、それを現 GPS と対にすると N 秒ずれる。loopback_phase の
         // 公称秒 fold はその N 秒を消すが N×ppm×1s が残り、hwphase を ~0 と誤認させて誤った位相に再ロックする
         // (オシロで実害 ~9.5µs=3×ppm×1s を確認)。最新エッジを使えば現 GPS と正しく対になる。
@@ -939,7 +939,7 @@ async fn gen_capture_task(
         // 出力周期。PIO ~68s 周回グリッチの偽エッジは間隔が異常 → 位相補正に使わない。
         let interval_ns = last_x.map(|lx| rp_pps::interval_ns(lx, x, clk) as i64);
         let sane = interval_ns.is_some_and(|iv| (iv - 1_000_000_000).abs() < 300_000_000);
-        // 再較正で測った K (k_target) へ毎エッジ最大 RECAL_K_SLEW_TICKS だけ slew。段差で適用すると
+        // 再校正で測った K (k_target) へ毎エッジ最大 RECAL_K_SLEW_TICKS だけ slew。段差で適用すると
         // 累積ドリフトを loop が急補正し snap するので、ramp 化して滑らかに追従させる。
         if k != k_target {
             let diff =
@@ -1053,7 +1053,7 @@ async fn gen_capture_task(
         } else {
             0
         };
-        // 周期語を保持: 再較正中の holdover 生 push に再利用 (dither はこの通常経路でのみ前進)。
+        // 周期語を保持: 再校正中の holdover 生 push に再利用 (dither はこの通常経路でのみ前進)。
         let pcorr_ns = if exp_hold { 0 } else { u.pcorr_ns };
         // 残ドリフト調査: 出力周波数へループに隠して既知バイアスを注入 (freq_mppb には足すが last_applied/loop 状態には非反映)。
         let inj_mppb = if INJECT_FREQ_MPPB != 0 && u.locked && count >= INJECT_START_COUNT {
@@ -1120,8 +1120,8 @@ async fn gen_capture_task(
             );
         }
         last_x = Some(x);
-        // 定期 K 再較正: locked 中、RECAL_EDGES 出力エッジ毎に SM2 を GPS へ戻して実効 K を測り直す。
-        // 実効 K は温度で這う (#5 後も ~5ns/min) ので boot 一発較正では追えない。再較正中は holdover。
+        // 定期 K 再校正: locked 中、RECAL_EDGES 出力エッジ毎に SM2 を GPS へ戻して実効 K を測り直す。
+        // 実効 K は温度で這う (#5 後も ~5ns/min) ので boot 一発校正では追えない。再校正中は holdover。
         // 実験: 制御器巡回。**全エッジ評価**で切替: (a) locked エッジが CONTROLLER_SWEEP_EDGES に達したら通常
         // 切替、(b) 総エッジが 3× に達したら **force-advance** — 非ロックの config (発散する対照など) がスイープを
         // stall させないため。一定受信下で各手法の hwphase / PRBS h[k] を比較する。切替は start_segment: 出力
@@ -1289,11 +1289,11 @@ async fn gen_capture_task(
                     last_period,
                 )
                 .await;
-                last_x = None; // GP4 捕捉が再較正の gap を跨ぐので次の interval は無効化
+                last_x = None; // GP4 捕捉が再校正の gap を跨ぐので次の interval は無効化
                 last_gen = C0_GEN.load(Ordering::Acquire); // 復帰直後の偽 fresh ジャンプを避ける
             }
         } else {
-            // cadence は「連続 locked」で数える。unlock したらリセットし、relock 直後に重い再較正
+            // cadence は「連続 locked」で数える。unlock したらリセットし、relock 直後に重い再校正
             // (SM2 を ~数秒奪う) が走らないようにする。
             edges_since_recal = 0;
         }
@@ -1383,11 +1383,11 @@ async fn main(spawner: Spawner) {
         // 設定すると黙って消える。詳細は `pico_gnss::pps`。
         //
         // ループバック計測 (SM2) も同じ GP2 を見るので、ここで反転しておけば両方が秒境界のエッジを
-        // 見る。K の較正は両者の生カウンタ差なので、片方だけ反転すると 100 ms ずれる。
+        // 見る。K の校正は両者の生カウンタ差なので、片方だけ反転すると 100 ms ずれる。
         pico_gnss::pps::configure_capture(2);
 
         // stage②: SM2 (ループバック位相計測。rp-pps 外の実験機能) は capture と GP2 を共有して生カウンタ差
-        // K=C0−C2 を較正する。embassy の set_jmp_pin は &Pin を要求し GP2 は一度しか make できないので、
+        // K=C0−C2 を校正する。embassy の set_jmp_pin は &Pin を要求し GP2 は一度しか make できないので、
         // capture.jmp_pin() で GP2 Pin を借り、capture プログラムをもう一枚 load する。
         let lb_loaded = common.load_program(&capture_prog);
         let lb_pin = common.make_pio_pin(p.PIN_4);
@@ -1397,7 +1397,7 @@ async fn main(spawner: Spawner) {
         cfg_gp2.set_jmp_pin(capture.capture().jmp_pin()); // SM0 と同じ GP2 を捕捉 (fine tier へ escape)
         sm2.set_config(&cfg_gp2);
         sm2.set_enable(true);
-        // K 較正: 較正前に両 SM の RX FIFO を drain → 次エッジから c0/c2 が同一 GP2 エッジになることを保証。
+        // K 校正: 校正前に両 SM の RX FIFO を drain → 次エッジから c0/c2 が同一 GP2 エッジになることを保証。
         // (古い値が残り c0/c2 が 1 エッジずれると、loopback の fold は公称秒 (62.5M tick) なので K に
         //  「実秒ぶんの tick」が混じり、mean が 水晶 ppm × 1s ≈ 数µs だけ boot ごとにずれる。)
         // 健全性検査: 同一エッジなら全 diff(c0−c2) が ~一定 (spread ≤ 1 tick)。混入があれば再 drain/retry。
@@ -1411,7 +1411,7 @@ async fn main(spawner: Spawner) {
             let mut samples: heapless::Vec<(u32, u32), 8> = heapless::Vec::new();
             for _ in 0..6u32 {
                 match with_timeout(Duration::from_secs(30), async {
-                    let c0 = capture.capture_mut().wait_edge().await; // 較正は生カウンタ (fine tier へ escape)
+                    let c0 = capture.capture_mut().wait_edge().await; // 校正は生カウンタ (fine tier へ escape)
                     let c2 = sm2.rx().wait_pull().await;
                     (c0, c2)
                 })
@@ -1502,8 +1502,8 @@ async fn main(spawner: Spawner) {
         let output = SteeredPpsOutput::new(&mut common, sm1, p.PIN_3, clk_sys_freq(), PPS_PULSE_NS);
 
         // --- 実験: SM3 を GP2 に常時向けた純観測 SM として起動 (KEXP 診断。制御には非関与) ---
-        // boot K 較正・verify・cfg_gp4 切替が全部終わった後・spawn 直前に enable する (late enable):
-        // 較正の繊細な c0/c2 read に干渉しえず、SM3 の enabled 全期間で consumer は pps_task 1 個に保たれる。
+        // boot K 校正・verify・cfg_gp4 切替が全部終わった後・spawn 直前に enable する (late enable):
+        // 校正の繊細な c0/c2 read に干渉しえず、SM3 の enabled 全期間で consumer は pps_task 1 個に保たれる。
         // 既存 cfg_gp2 (jmp_pin=GP2, lb_loaded 再利用) をそのまま借りる。set_config は &Config を借りるだけで
         // この後 cfg_gp2 が gen_capture_task へ move されても借用は set_config で終わるので衝突しない。
         // GP2 の pindirs は SM0 が設定済み → set_pin_dirs 不要。X は初期化しない (絶対値は無意味、解析は
@@ -1524,7 +1524,7 @@ async fn main(spawner: Spawner) {
         }
 
         // pps_task と gen_capture を高優先度割込エグゼキュータで起動 (ウェイクアップ遅延 ms→µs)。
-        // cfg_gp2 は Copy なので gen_capture_task へも渡せる (SM2 の再較正切替に使う)。
+        // cfg_gp2 は Copy なので gen_capture_task へも渡せる (SM2 の再校正切替に使う)。
         spawner_high.spawn(pps_task(capture, sm3).unwrap());
         spawner_high.spawn(gen_capture_task(output, sm2, k, cfg_gp2, cfg_gp4).unwrap());
     } else {

@@ -104,8 +104,7 @@ impl PpsGpsdo {
     ///
     /// Worth reaching for: [`PpsNmeaAssociation`](crate::PpsNmeaAssociation) is documented as the
     /// biggest footgun in this library, because getting it wrong shifts the whole UTC epoch by a
-    /// second while every *phase* measurement still looks perfect. Until this existed, the turn-key
-    /// bundle was the one path that could not change it.
+    /// second while every *phase* measurement still looks perfect.
     ///
     /// The symptom is invisible without an external time reference — a disciplined 1PPS output can
     /// sit on the GPS edge to nanoseconds and still be labelled with the wrong second.
@@ -171,6 +170,18 @@ impl PpsGpsdo {
     /// epoch is established.
     pub fn now_from_query_ns(&self, query_ns: u64) -> Option<i64> {
         self.clock.now_from_query_ns(query_ns)
+    }
+
+    /// UTC for a moment on the **capture counter**, rather than on the software clock.
+    ///
+    /// The 1PPS output knows where its edges fall on that counter and nowhere else: its state
+    /// machine was started by the same write, and every edge since is a period word this side
+    /// counted out. Asking in the query timebase instead means converting through a software clock
+    /// read, and whatever that read cost lands on the output as a fixed offset.
+    ///
+    /// `None` until an epoch is established, like [`now_from_query_ns`](Self::now_from_query_ns).
+    pub fn now_from_capture_ns(&self, capture_ns: u64) -> Option<i64> {
+        self.clock.now_from_capture_ns(capture_ns)
     }
 
     /// Estimated crystal frequency offset (ppb).
@@ -285,6 +296,27 @@ mod tests {
     }
 
     #[test]
+    fn utc_can_be_asked_for_on_the_capture_counter() {
+        // The counter and the software clock do not share an origin, and only the counter is what
+        // the output schedule counts in. Here the edge is at 1.0 s on the counter and 1.5 s on the
+        // software clock, so asking the wrong one is off by half a second.
+        let mut g = rmc_gpsdo();
+        g.on_pps_edge(edge(1_000_000_000), 1_500_000_000);
+        let want = crate::civil_to_unix(2026, 6, 7, 17, 6, 58) * 1_000_000_000;
+        assert_eq!(g.feed_nmea(RMC).map(|r| r.unix_ns), Some(want));
+        assert_eq!(
+            g.now_from_capture_ns(1_000_000_000),
+            Some(want),
+            "the edge itself, on the counter"
+        );
+        assert_eq!(
+            g.now_from_capture_ns(1_500_000_000),
+            Some(want + 500_000_000),
+            "half a second of counter is half a second of UTC"
+        );
+    }
+
+    #[test]
     fn edge_then_rmc_establishes_utc() {
         let mut g = rmc_gpsdo();
         g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);
@@ -351,9 +383,8 @@ mod tests {
 
     #[test]
     fn the_default_time_source_is_zda() {
-        // The point of the change that made it so: a caller who does not think about this at all
-        // should get the sentence that is defined against the pulse, not the one that merely
-        // happens to carry a clock.
+        // A caller who does not think about this at all should get the sentence that is defined
+        // against the pulse, not the one that merely happens to carry a clock.
         let mut g = PpsGpsdo::new();
         g.on_pps_edge(edge(1_000_000_000), 1_000_000_000);
         assert!(

@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
 
-//! **Stratum-1 NTP broadcast server on an RP2040.**
+//! **Stratum-1 NTP server on an RP2040.**
 //!
-//! A GNSS 1PPS-disciplined clock serving time over 10BASE-T Ethernet driven straight from two GPIO
-//! pins and three resistors — no PHY chip, no MAC.
+//! A GNSS 1PPS-disciplined clock serving time over 10BASE-T Ethernet driven straight from GPIO
+//! pins — no PHY chip, no MAC. One pair sends, the other receives.
 //!
 //! ```text
 //! GNSS module ──NMEA──> UART0 RX (GP1)  ──┐
@@ -15,6 +15,7 @@
 //!                                    pico-10base-t            (Ethernet/IPv4/UDP + Manchester)
 //!                                          │
 //!                                    PIO1 SM0 + DMA ──> GP16 (TX−) / GP17 (TX+)
+//!                                    PIO1 SM1       <── GP18 (RX−) / GP19 (RX+)
 //! ```
 //!
 //! # Wiring
@@ -25,28 +26,39 @@
 //! | GNSS 1PPS | GP2 |
 //! | Ethernet TX− | GP16 |
 //! | Ethernet TX+ | GP17 |
+//! | Ethernet RX− | GP18 |
+//! | Ethernet RX+ | GP19 |
 //!
-//! 2 × 47 Ω in series with the TX pins and 1 × 470 Ω across the pair, into an RJ45's pins 1 and 2.
-//! A pulse transformer is strongly recommended: without one there is no galvanic isolation between
-//! the Pico and whatever it is plugged into.
+//! Into a segment: 2 × 33 Ω in series with the TX pins and 1 × 1 kΩ across the pair, into an
+//! RJ45's pins 1 and 2. A pulse transformer is strongly recommended: without one there is no
+//! galvanic isolation between the Pico and whatever it is plugged into. The RX pair needs a
+//! transformer and a comparator, neither of which this build has, so reception off a segment does
+//! not work.
 //!
-//! PIO0 belongs to the PPS capture and PIO1 to the Ethernet serialiser, so the two never contend.
+//! Board to board: jumper this board's GP16/GP17 to the other board's GP18/GP19 and vice versa,
+//! and tie the two grounds together. Both sides drive 3.3 V logic into a GPIO input, so no
+//! resistors and no transformer are involved — the link is Ethernet in everything above the
+//! physical layer.
+//!
+//! PIO0 belongs to the PPS capture and PIO1 to the Ethernet serialiser and deserialiser, so the
+//! two never contend.
 //!
 //! # Receiving this
 //!
-//! Broadcast (RFC 5905 mode 5) is one-way, which is all the present wiring can do — **not** where
-//! this is meant to end up. The unicast exchange is the better protocol in every respect: it lets a
-//! client measure the path instead of assuming it. [`tiny_ntp::server::respond`] already builds
-//! those replies and is tested; what is missing is a receive path in the hardware.
+//! Over the board-to-board link this server answers the unicast exchange (RFC 5905 modes 3/4),
+//! replying to whatever asked (`src_mac` / `src_ip` / `src_port`). That is the better protocol in
+//! every respect: it lets a client measure the path instead of assuming it.
 //!
-//! Meanwhile, note that **chrony and systemd-timesyncd do not implement broadcast client mode at
-//! all** — the reference `ntpd` does, with `broadcastclient` (and, since we cannot answer the
-//! calibration exchange it would like to make, `disable auth` and an explicit `broadcastdelay`).
+//! Broadcast (mode 5) is still served every second, and is all a listener off a real segment can
+//! use, since reception needs the analogue front end this build does not have. Note that **chrony
+//! and systemd-timesyncd do not implement broadcast client mode at all** — the reference `ntpd`
+//! does, with `broadcastclient` (and, since we cannot answer the calibration exchange it would
+//! like to make, `disable auth` and an explicit `broadcastdelay`).
 
 #[cfg(feature = "swd-rx")]
 mod swd_rx;
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use defmt::{info, warn};
@@ -63,26 +75,36 @@ use embassy_rp::uart::{
 };
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::Read as _;
 use static_cell::StaticCell;
 
-use pico_10base_t::embassy::Tx10BaseT;
-use pico_10base_t::frame::{Ipv4Addr, MacAddr, UdpFrameSpec, build_udp_frame, frame_len};
+use pico_10base_t::embassy::{Rx10BaseT, Tx10BaseT};
+use pico_10base_t::frame::{
+    Ipv4Addr, MacAddr, UdpFrameSpec, build_udp_frame, frame_len, parse_udp_frame,
+};
 use pico_10base_t::phy::{NLP_INTERVAL_US, encode_frame, encoded_words};
-use rp_pps::embassy::{TimedPpsCapture, run_capture, run_nmea, set_capture_polarity};
-use rp_pps::{PpsGpsdo, PpsPolarity};
-use tiny_ntp::packet::PACKET_LEN;
+use pico_10base_t::rx::decode_frame;
+use rp_pps::embassy::{
+    PpsCapture, PpsOutput, TimedPpsCapture, run_capture, run_nmea, set_capture_polarity,
+    start_in_sync,
+};
+use rp_pps::{
+    PpsGpsdo, PpsPolarity, PpsSchedule, PpsScheduleConfig, output_high_cycles, output_period_cycles,
+};
+use tiny_ntp::packet::{NtpPacket, PACKET_LEN};
 use tiny_ntp::server::{
-    ClockState, LeapWarning, ServeDecision, ServerConfig, Source, broadcast, silent_reason,
+    ClockState, LeapWarning, ServeDecision, ServerConfig, Source, broadcast, respond, silent_reason,
 };
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     PIO1_IRQ_0 => PioInterruptHandler<PIO1>;
-    // The Ethernet serialiser's symbol feed. This firmware uses exactly one DMA channel.
-    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>;
+    // The Ethernet serialiser's symbol feed, and the deserialiser's. One channel each.
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>,
+                 embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH1>;
 });
 
 // --- Network identity -------------------------------------------------------------------------
@@ -149,11 +171,11 @@ const fn parse_port(s: &str) -> u16 {
 /// Split in two because the two halves are measured by different instruments, and only one of them
 /// is visible from inside.
 ///
-/// Applied to the timestamp rather than by firing early. Firing early was tried and made things
-/// worse: the residual moved 118.4 µs → 73.5 µs instead of to zero, its spread grew from 5.4 µs to
-/// 26.5 µs, and 13% of seconds ran out of sleep and handed over immediately. The approach lands
-/// anywhere within a 16 ms link-pulse interval, so taking 118 µs off what is left of it sometimes
-/// takes all of it. Correcting the timestamp leaves the schedule alone.
+/// Applied to the timestamp, not by firing early. The approach to the boundary lands anywhere
+/// within a 16 ms link-pulse interval, so taking 118 µs off what is left of it sometimes takes all
+/// of it: the residual settles at 73.5 µs rather than zero, its spread grows from 5.4 µs to
+/// 26.5 µs, and 13% of seconds hand over with no sleep left. Correcting the timestamp leaves the
+/// schedule alone.
 const TX_LAG_NS: i64 = HANDOVER_LAG_NS + WIRE_LAG_NS;
 
 /// Second boundary to the handover, from `residual_ns` below over 389 seconds: median 118.4 µs,
@@ -224,22 +246,17 @@ const GNSS_FAST_BAUD: u32 = 115_200;
 /// off leaves the receiver at 9600, and [`SOURCE_TRUSTED`] then keeps the server silent rather than
 /// letting it announce a second it cannot vouch for.
 ///
-/// An earlier attempt at this did fail — sending `PMTK251,115200` and switching the UART left the
-/// link producing nothing but framing errors, because the module needs time after power-up before
-/// it will take configuration and because the setting survives a reflash. Both are handled by
-/// probing the port either side of the command rather than assuming; see `establish_gnss_link`.
-///
-/// `PMTK314` is the other route to the same margin, trimming the sentence set instead, and does not
-/// require both ends to change rate in step. Untried.
+/// Sending `PMTK251,115200` and switching the UART is not enough on its own: the module needs time
+/// after power-up before it will take configuration, and the rate it is left at survives a reflash,
+/// so the port's current speed cannot be assumed. `establish_gnss_link` probes either side of the
+/// command instead.
 const RAISE_BAUD: bool = true;
 
 /// How the disciplined clock is configured, pinned rather than inherited.
 ///
-/// Both values now match `rp-pps`'s own defaults, so `PpsGpsdo::new()` would do the same thing.
+/// Both values match `rp-pps`'s own defaults, so `PpsGpsdo::new()` would do the same thing.
 /// They are spelled out anyway: this is a time server, and the setting that decides *which UTC
 /// second* a pulse is labelled with should not change under it because a library default moved.
-///
-/// # These were verified, not assumed
 ///
 /// ZDA is the sentence the receiver defines against its pulse ("outputs the time associated with
 /// the current 1PPS pulse … tells the time of the pulse that just occurred" — MT3333 NMEA
@@ -258,9 +275,9 @@ const RAISE_BAUD: bool = true;
 /// in place these two constants are correct on their own, with no ±1 s correction anywhere.
 /// Without it, either association is a coin toss that a longer NMEA burst can flip at runtime.
 ///
-/// Verified against an NTP-synchronised host over the debug probe, so no network path could be
-/// mistaken for clock error: `host − firmware = +0.11 … +0.20 s`, which is the probe's RTT polling
-/// latency and not an offset. See `logs/20260818-ntp-bringup/`.
+/// Against an NTP-synchronised host over the debug probe, where no network path can be mistaken
+/// for clock error, `host − firmware` is `+0.11 … +0.20 s`. That is the probe's RTT polling
+/// latency, not an offset. See `logs/20260818-ntp-bringup/`.
 const PPS_NMEA: rp_pps::PpsNmeaAssociation = rp_pps::PpsNmeaAssociation::SameSecond;
 /// Pair on ZDA — see [`PPS_NMEA`].
 const TIME_SOURCE: rp_pps::NmeaTimeSource = rp_pps::NmeaTimeSource::Zda;
@@ -282,13 +299,40 @@ fn now_ns() -> u64 {
     Instant::now().as_micros() * 1000
 }
 
+/// Software time of the instant the PIO counters were started, or `i64::MIN` before that.
+///
+/// The capture counter's zero is the write that enabled it, and that write is on the same line as
+/// the read below it: no await between them, no other task in the way, so the two are a few
+/// instructions apart rather than however long the executor takes to come round. Everything that
+/// has a software time and wants to ask the disciplined clock about it converts through this.
+///
+/// This is the one place a clock read still decides anything, and it is read once, at a moment the
+/// code chose rather than one it was handed.
+static COUNTER_ORIGIN_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
+    BlockingMutex::new(Cell::new(i64::MIN));
+
+/// A software time, on the capture counter's scale.
+fn capture_ns(software_ns: u64) -> Option<u64> {
+    let origin = COUNTER_ORIGIN_NS.lock(|o| o.get());
+    if origin == i64::MIN {
+        return None;
+    }
+    (software_ns as i64).checked_sub(origin).map(|d| d as u64)
+}
+
+/// Now, on the capture counter's scale.
+fn capture_now_ns() -> Option<u64> {
+    capture_ns(now_ns())
+}
+
 /// The polarity of the 1PPS this firmware is built for.
 ///
 /// [`rp_pps::pps_capture_program`] only ever watches for a rising edge, so an active-low receiver
 /// has to be inverted into PIO. Without that the capture lands on the *end* of the pulse — one
 /// pulse width past the second — and nothing on this board can tell: every interval is still
-/// exactly one second and the frequency estimate is unaffected. It took a client on the other side
-/// of the wire, which saw this server 100.23 ms slow (sd 0.55 ms, n=299).
+/// exactly one second and the frequency estimate is unaffected. Only a comparison against something
+/// outside the board shows it: a client on the other side of the wire sees this server 100.23 ms
+/// slow (sd 0.55 ms, n=299).
 ///
 /// The AE-GNSS-EXTANT carrier passes the module's 1PPS through one gate of its 74HC04, and its
 /// manual gives the result as `1PPS 出力 : C-MOS ロジック (3.3V) レベル,
@@ -305,6 +349,181 @@ async fn pps_task(capture: TimedPpsCapture<'static, PIO0, 0>) {
     run_capture(capture, &CLOCK, now_ns).await
 }
 
+/// How far ahead a reply's departure is set when the reply is built (ns).
+///
+/// The transmit timestamp has to be written before the bytes it sits in are checksummed and
+/// Manchester-encoded, so it is always a claim about a moment that has not happened. A broadcast
+/// gets away with it by choosing the moment first and building into the wait. A reply can do the
+/// same: pick a departure far enough ahead to build into, and then hold the frame until the clock
+/// reaches it.
+///
+/// It has to clear the worst build, not the typical one - a reply that misses its own departure is
+/// a reply that lies. Building was measured at 400-700 us on this board, so a millisecond.
+///
+/// The worst build, not the average: building varies by hundreds of microseconds, so no single
+/// average can guarantee the frame reaches the wire after the departure it claims. Handing the
+/// frame over as soon as it is ready puts the round-trip delay at -510 us on a link whose true
+/// delay is nanoseconds.
+const REPLY_LAG_NS: i64 = 1_000_000;
+
+/// Words per capture on the receive side. See the client for the arithmetic; a request is smaller
+/// than a reply, and this covers either.
+const RX_CAPTURE_WORDS: usize = 256;
+
+/// How long one capture covers (ns). The state machine starts on the frame's first bit and takes a
+/// fixed number of samples, so the DMA finishes exactly this long after that bit arrived.
+const RX_CAPTURE_NS: i64 = (RX_CAPTURE_WORDS as i64) * 16 * 25;
+
+/// Everything between the capture ending and the timestamp taken for it (ns): the DMA interrupt,
+/// the executor waking the task, and the clock read.
+///
+/// Measured on the client, which runs the same code on the same silicon — its 1PPS sat 21.41 us
+/// (sd 3.68, n=24) past the second with nothing here. It is the receive-side counterpart of
+/// `WIRE_LAG_NS`, and like it, a constant standing in for a timestamp nobody took.
+const RX_LAG_NS: i64 = 21_400;
+
+/// Largest frame the receive path will hold.
+const RX_MAX_FRAME: usize = 256;
+
+/// A request that arrived, and when.
+///
+/// The reply is not built here. Building it needs the transmitter, which belongs to [`ntp_task`],
+/// so what crosses is the question and the moment it was asked - the two things that cannot be
+/// recovered later.
+struct PendingRequest {
+    packet: NtpPacket,
+    receive_unix_ns: i64,
+    src_mac: MacAddr,
+    src_ip: Ipv4Addr,
+    src_port: u16,
+}
+
+/// Requests waiting for an answer.
+///
+/// Two deep. A client that asks faster than we answer is not owed a queue - it is owed the truth
+/// about a recent moment, and a stale request answered late is worse than one dropped.
+static REQUESTS: Channel<CriticalSectionRawMutex, PendingRequest, 2> = Channel::new();
+
+/// Read the link and hand any request on it to [`ntp_task`].
+#[embassy_executor::task]
+async fn link_rx_task(mut rx: Rx10BaseT<'static, PIO1, 1>) {
+    let mut words = [0u32; RX_CAPTURE_WORDS];
+    let mut frame = [0u8; RX_MAX_FRAME];
+    let mut seen: u32 = 0;
+    let mut taken: u32 = 0;
+
+    loop {
+        rx.capture(&mut words).await;
+        // Local, then UTC. `respond` puts this on the wire for a client to subtract from its own
+        // timestamps, so it has to be in the client's units, not this board's uptime.
+        let arrived_local = now_ns() as i64 - RX_CAPTURE_NS - RX_LAG_NS;
+        seen = seen.wrapping_add(1);
+        let Some(arrived_ns) = CLOCK.lock(|g| g.borrow().now_from_query_ns(arrived_local as u64))
+        else {
+            continue;
+        };
+
+        let Some(len) = decode_frame(&words, &mut frame) else {
+            continue;
+        };
+        let Some(datagram) = parse_udp_frame(&frame[..len]) else {
+            continue;
+        };
+        if datagram.dst_port != DST_PORT {
+            continue;
+        }
+        let Some(packet) = NtpPacket::decode(datagram.payload) else {
+            continue;
+        };
+
+        taken = taken.wrapping_add(1);
+        let request = PendingRequest {
+            packet,
+            receive_unix_ns: arrived_ns,
+            src_mac: datagram.src_mac,
+            src_ip: datagram.src_ip,
+            src_port: datagram.src_port,
+        };
+        // Never block the receiver on the transmitter: a full queue means the answer is already
+        // late, and waiting here would make us miss the next question as well.
+        if REQUESTS.try_send(request).is_err() {
+            warn!("NTPRX {} dropped, still answering the last one", seen);
+        }
+        if taken.is_multiple_of(16) {
+            info!("NTPRX seen={} requests={}", seen, taken);
+        }
+    }
+}
+
+/// Width of the 1PPS on GP6, matching the receiver's own so the two traces have the same shape.
+const PPS_OUT_PULSE_NS: u32 = 100_000_000;
+
+/// How early the word for the next edge is pushed, measured against the edge before it. See
+/// [`rp_pps::PpsSchedule`]: what the state machine pulls before an edge is the interval that
+/// follows, so the deadline is one edge earlier than the edge being positioned.
+const PPS_OUT_LEAD_NS: i64 = 200_000_000;
+
+/// Put the disciplined clock on GP6, so the thing this server is announcing can be seen.
+///
+/// The clock is already being read once a second for the packet; this reads it for a pin. The two
+/// answers come from the same estimate, so an oscilloscope comparing GP6 against the receiver's own
+/// 1PPS is measuring what the packets carry — including any constant this firmware is wrong by,
+/// which is the point.
+#[embassy_executor::task]
+async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSchedule) {
+    let mut edges: u32 = 0;
+
+    loop {
+        let push_at = schedule.edge_ns() - PPS_OUT_LEAD_NS;
+        let now = now_ns() as i64;
+        if push_at > now {
+            Timer::after(Duration::from_micros(((push_at - now) / 1000) as u64)).await;
+        }
+
+        let predicted = schedule.predicted_edge_ns();
+        let utc = CLOCK.lock(|g| g.borrow().now_from_capture_ns(predicted as u64));
+        let trusted = SOURCE_TRUSTED.load(Ordering::Relaxed);
+
+        let step = match utc {
+            Some(utc) if trusted => schedule.advance(0, pps_lateness_ns(utc)),
+            // Nothing to steer by yet: free-run at the nominal second so the FIFO stays fed.
+            _ => schedule.step(0, 0),
+        };
+        if step.acquired {
+            info!("PPSOUT placed, corr_ns={}", step.correction_ns);
+        }
+
+        if !out.set_period(step.period_word) {
+            warn!("PPSOUT push dropped, FIFO full");
+        }
+        edges = edges.wrapping_add(1);
+        if edges <= 8 || edges.is_multiple_of(16) {
+            let landed = CLOCK
+                .lock(|g| g.borrow().now_from_capture_ns(step.edge_ns as u64))
+                .map(pps_lateness_ns)
+                .unwrap_or(0);
+            info!(
+                "PPSOUT edges={} word={} corr_ns={} asked_late_ns={} landed_late_ns={}",
+                edges,
+                step.period_word,
+                step.correction_ns,
+                utc.map(pps_lateness_ns).unwrap_or(0),
+                landed
+            );
+        }
+    }
+}
+
+/// Signed distance from `utc_ns` to the nearest second boundary: positive when it is past one.
+fn pps_lateness_ns(utc_ns: i64) -> i64 {
+    let into = utc_ns.rem_euclid(1_000_000_000);
+    if into > 500_000_000 {
+        into - 1_000_000_000
+    } else {
+        into
+    }
+}
+
 #[embassy_executor::task]
 async fn nmea_task(rx: BufferedUartRx) {
     run_nmea(rx, &CLOCK).await
@@ -313,9 +532,12 @@ async fn nmea_task(rx: BufferedUartRx) {
 /// Read everything the server policy needs, in one lock so the values are mutually consistent.
 fn clock_state() -> (Option<i64>, ClockState) {
     let q = now_ns();
+    let c = capture_now_ns();
     CLOCK.lock(|g| {
         let g = g.borrow();
-        let now = g.now_from_query_ns(q);
+        // Time in the capture timebase, ageing in the software one. The first is what must not
+        // carry a scheduling delay; the second only gates service and is a millisecond quantity.
+        let now = c.and_then(|c| g.now_from_capture_ns(c));
         let holdover_ns = g.holdover_ns(q);
         (
             now,
@@ -331,6 +553,84 @@ fn clock_state() -> (Option<i64>, ClockState) {
             },
         )
     })
+}
+
+/// Build and send one reply.
+///
+/// The transmit timestamp is written before the frame is encoded, so it is a claim about a moment
+/// that has not happened yet: `REPLY_LAG_NS` is what stands in for the encoding, the handover and
+/// the wire. `build_ns` in the log is the part of that this firmware can see, and is what the
+/// constant was set from.
+async fn answer(
+    tx: &mut Tx10BaseT<'static, PIO1, 0>,
+    request: &PendingRequest,
+    ip_id: u16,
+    frame: &mut [u8; FRAME_LEN],
+    symbols: &mut [u32; SYMBOL_WORDS],
+) {
+    let started = now_ns() as i64;
+    let (now, state) = clock_state();
+    let Some(now) = now else {
+        return;
+    };
+    // Both timestamps go on the wire for a client to subtract from its own, so both are moved on
+    // to the receiver's second. A common shift would cancel out of the client's round-trip delay
+    // but not out of its offset, which is exactly the number it sets its clock by: without this the
+    // client tracked this board's clock faithfully, 51.73 us (sd 7.76, n=16) behind the receiver.
+    let decision = respond(
+        &CFG,
+        &state,
+        &request.packet,
+        request.receive_unix_ns,
+        now + REPLY_LAG_NS,
+    );
+    let packet = match decision {
+        ServeDecision::Silent(reason) => {
+            warn!("NTP reply withheld: {}", defmt::Debug2Format(&reason));
+            return;
+        }
+        ServeDecision::Serve(packet) => packet,
+    };
+
+    let payload = packet.encode();
+    let spec = UdpFrameSpec {
+        src_mac: SRC_MAC,
+        dst_mac: request.src_mac,
+        src_ip: SRC_IP,
+        dst_ip: request.src_ip,
+        src_port: DST_PORT,
+        dst_port: request.src_port,
+        ip_id,
+        ttl: 1,
+        payload: &payload,
+    };
+    let Some(len) = build_udp_frame(&spec, frame) else {
+        warn!("reply does not fit the frame buffer");
+        return;
+    };
+    let Some(words) = encode_frame(&frame[..len], symbols) else {
+        warn!("reply does not fit the symbol buffer");
+        return;
+    };
+    // The frame is ready; the moment it claims is not yet. Hold it until the clock is one wire lag
+    // short of the departure written inside it, so that what goes out is what was promised.
+    let departure = now + REPLY_LAG_NS;
+    let handover_ns = now_ns() as i64 - started;
+    let slack_ns = departure - WIRE_LAG_NS - (now + handover_ns);
+    if slack_ns > 0 {
+        Timer::after_micros((slack_ns / 1000) as u64).await;
+    }
+    tx.send(&symbols[..words]).await;
+
+    info!(
+        "NTPREPLY rx_ns={} claimed_tx_ns={} handover_ns={} slack_ns={} bytes={}",
+        request.receive_unix_ns, departure, handover_ns, slack_ns, len
+    );
+    if slack_ns <= 0 {
+        // The build overran the departure it had promised. Every reply from here is late by
+        // whatever this says, and no client can tell.
+        warn!("NTP reply missed its own departure by {} ns", -slack_ns);
+    }
 }
 
 /// Broadcast one NTP packet per UTC second, and keep the link alive in between.
@@ -350,6 +650,14 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
     let mut last_target_ns: i64 = i64::MIN;
 
     loop {
+        // A question outranks the beacon. Answering is the whole point of having a receive path:
+        // it is what lets a client measure the round trip instead of assuming it.
+        if let Ok(request) = REQUESTS.try_receive() {
+            ip_id = ip_id.wrapping_add(1);
+            answer(&mut tx, &request, ip_id, &mut frame, &mut symbols).await;
+            continue;
+        }
+
         // The receiver never reached the rate the pairing depends on, so the second this clock is
         // built on may be wrong. Hold the link up — a dropped link is harder to diagnose than a
         // quiet one — and serve nothing. `main` has already said why on RTT.
@@ -378,7 +686,7 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>) {
         // Sleep towards the boundary, but **never past it**: the sleep is capped at the link-pulse
         // interval rather than being a fixed tick. Polling on a fixed 16 ms period with a 16 ms
         // threshold means any jitter either steps over the boundary (dropping that second) or lands
-        // short of it twice (sending it twice) — both were observed on hardware before this.
+        // short of it twice (sending it twice).
         if wait_ns > (nlp_us * 1000) as i64 {
             tx.link_pulse();
             Timer::after_micros(nlp_us).await;
@@ -549,7 +857,7 @@ async fn await_nmea(uart: &mut BufferedUart, timeout: Duration) -> bool {
 /// 1. **The rate survives a firmware reflash.** `PMTK251` reverts only on a full cold start or
 ///    standby (MT3333 NMEA specification §2.3.14), so after re-flashing the RP2040 the module is
 ///    still at whatever it was last set to. Assuming the power-on rate means finding silence and
-///    concluding the receiver is dead — which is exactly what happened before this probed.
+///    concluding the receiver is dead.
 /// 2. **The change cannot be acknowledged.** `PMTK251` has no ACK and could not have one: the reply
 ///    would have to be sent at a rate one end has not adopted yet. Nothing in the specification says
 ///    how long the switch takes, either.
@@ -611,16 +919,30 @@ async fn probe_gnss_baud(uart: &mut BufferedUart) -> Option<u32> {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    info!("pico-ntp: Stratum-1 NTP broadcast (NMEA UART0/GP1 @9600, PPS GP2, 10BASE-T GP16/GP17)");
+    info!(
+        "pico-ntp: Stratum-1 NTP broadcast (NMEA UART0/GP1 @9600, PPS in GP2, PPS out GP6, 10BASE-T GP16/GP17)"
+    );
 
     // PIO0: the 1PPS capture that disciplines the clock.
     let Pio {
-        mut common, sm0, ..
+        mut common,
+        sm0,
+        sm1,
+        ..
     } = Pio::new(p.PIO0, Irqs);
-    let capture = TimedPpsCapture::new(&mut common, sm0, p.PIN_2, clk_sys_freq());
+    // Stopped, and started later in the same write as the 1PPS output. The two counters are then
+    // one timebase, which is what lets the output be placed without reading a software clock.
+    let capture = TimedPpsCapture::new_stopped(
+        &mut common,
+        sm0,
+        p.PIN_2,
+        clk_sys_freq(),
+        &rp_pps::pps_capture_program(),
+    );
     // After the capture has claimed the pin, never before: assigning it to PIO rewrites the same
     // control register the inversion lives in, so an earlier setting is silently dropped. Found by
-    // measuring — the offset came back at −98 ms with the log still saying it had inverted.
+    // Without that ordering the inversion is silently dropped and the offset comes back at −98 ms
+    // while the log still says it inverted.
     set_capture_polarity(PPS_PIN, PPS_POLARITY);
     info!("PPS on GP{}: configured active low", PPS_PIN);
 
@@ -629,6 +951,7 @@ async fn main(spawner: Spawner) {
     let Pio {
         common: mut eth_common,
         sm0: eth_sm,
+        sm1: eth_sm1,
         ..
     } = Pio::new(p.PIO1, Irqs);
     let dma = embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs);
@@ -638,6 +961,19 @@ async fn main(spawner: Spawner) {
         p.PIN_16, // TX−
         p.PIN_17, // TX+
         dma,
+        clk_sys_freq(),
+    );
+
+    // The same block's second state machine reads the other pair, which is where a client's
+    // question arrives. The serialiser is loaded first and is pinned to offset zero (`out pc`
+    // indexes it by symbol value), so the deserialiser lands after it.
+    let eth_rx_dma = embassy_rp::dma::Channel::new(p.DMA_CH1, Irqs);
+    let eth_rx = Rx10BaseT::new(
+        &mut eth_common,
+        eth_sm1,
+        p.PIN_18, // TX− from the other board
+        p.PIN_19, // TX+
+        eth_rx_dma,
         clk_sys_freq(),
     );
 
@@ -700,9 +1036,48 @@ async fn main(spawner: Spawner) {
 
     let (_uart_tx, uart_rx) = uart.split();
 
+    // The 1PPS out on GP6, on the capture's block. Built here rather than with the capture, and the
+    // ordering is not cosmetic: the state machine starts running the moment it is enabled and wants
+    // a fresh period every second, but its task cannot run until this function stops. Enabling it
+    // before the baud negotiation above left it pulling an empty FIFO, which loads a spent counter
+    // rather than the last period - one ~34 s interval, and the output was gone for half a minute.
+    let pps_high = output_high_cycles(clk_sys_freq(), PPS_OUT_PULSE_NS);
+    let pps_initial = output_period_cycles(clk_sys_freq(), pps_high);
+    let pps_out = PpsOutput::new_stopped(&mut common, sm1, p.PIN_6, pps_high, pps_initial);
+    // Zero, not a clock reading. Both state machines are enabled by the write below, so the moment
+    // this schedule counts from is the moment the capture counter started, and the schedule's edges
+    // and the captured edges are on one scale. Reading a clock here instead put whatever that read
+    // cost onto every edge afterwards.
+    let pps_schedule = PpsSchedule::at_enable(
+        clk_sys_freq(),
+        pps_high,
+        PpsScheduleConfig::default(),
+        0,
+        pps_initial,
+    );
+    start_in_sync(
+        embassy_rp::pac::PIO0,
+        PpsCapture::<PIO0, 0>::sm_mask() | PpsOutput::<PIO0, 1>::sm_mask(),
+    );
+    // Next line, deliberately: see `COUNTER_ORIGIN_NS`.
+    COUNTER_ORIGIN_NS.lock(|o| o.set(now_ns() as i64));
+
+    // Neither `Common` may be dropped. embassy-rp releases a PIO block's pins - resets their
+    // FUNCSEL to NULL - once the `Common` and the state machines it handed out are all gone, and
+    // `main` returning is enough to start that. The state machines live on in their tasks and keep
+    // running; the pin they were driving quietly stops being connected to them.
+    //
+    // Nothing in the firmware's own telemetry sees it: the state machine stays enabled and keeps
+    // consuming a period every second. GP6 reads funcsel 7 at the last line of `main` and 31 two
+    // seconds later, driving a pad that is no longer listening.
+    core::mem::forget(common);
+    core::mem::forget(eth_common);
+
     spawner.spawn(pps_task(capture).unwrap());
     spawner.spawn(nmea_task(uart_rx).unwrap());
     spawner.spawn(ntp_task(tx).unwrap());
+    spawner.spawn(link_rx_task(eth_rx).unwrap());
+    spawner.spawn(pps_out_task(pps_out, pps_schedule).unwrap());
     // Debug only: a unicast exchange carried over the probe, so a real client can be measured
     // against a link that cannot receive. See `swd_rx`.
     #[cfg(feature = "swd-rx")]

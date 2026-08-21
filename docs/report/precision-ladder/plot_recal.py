@@ -2,11 +2,11 @@
 # requires-python = ">=3.10"
 # dependencies = ["matplotlib", "numpy"]
 # ///
-"""定期 K 再較正の効果を可視化する。
+"""定期 K 再校正の効果を可視化する。
 
 offset_wander のログ (elapsed_s, offset2_ns, hwphase_ns, raw_lag, ppb) を 2 本読み、
 gap = offset2 - hwphase を時間軸で並べる。gap は firmware に見えない実効 K 誤差で、
-再較正が無いと温度で creep し、再較正が入ると pin される (=ドリフト停止)。
+再校正が無いと温度で creep し、再校正が入ると pin される (=ドリフト停止)。
 gap の絶対値 ~50ns 分は ×1/×10 スコーププローブのスキュー等の計測セットアップ固有オフセットで、
 firmware の値でも実出力オフセットでもない (実際の出力 vs GPS は hwphase=~0 中心)。ここで見るのは傾き。
 

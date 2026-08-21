@@ -7,7 +7,7 @@
   - 共振ゲイン/@周期/coh   PRBS 注入と hwphase の Welch 閉ループ周波数応答 (受信非依存)
   - jit / 温度             受信条件と基板温度 (config 間で交絡してないかの点検)
 
-scope σ の対応づけは firmware の RTT 時計と scope の wall-time を **相互相関**で較正してから行う:
+scope σ の対応づけは firmware の RTT 時計と scope の wall-time を **相互相関**で校正してから行う:
 両者は同じ output-GPS を同じパルスで測っているので、相関ピークのラグが真の時計差、ピーク相関値が
 「同じパルスを見ている」証拠になる (ホスト NTP 同期前提。scope_logger.py 参照)。
 
@@ -68,7 +68,7 @@ except FileNotFoundError:
     pass
 scope = np.array(scope) if scope else np.empty((0, 2))
 
-# --- 相互相関でラグ自動較正: firmware hwphase vs scope offset ---
+# --- 相互相関でラグ自動校正: firmware hwphase vs scope offset ---
 lag = 0; xr = float("nan")
 if len(scope) > 50:
     fw = np.array([(r[0], r[1]) for r in rows if r[4] == 1 and abs(r[1]) < 5000])

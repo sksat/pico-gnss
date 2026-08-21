@@ -181,7 +181,7 @@ proptest! {
 /// PLL 積分ゲイン (calm 側 i_den) の掃引: 温度 curvature (slope が反転する過渡) 下で閉ループ位相の sd/peak が
 /// i_den でどう動くかを見る。実機で「offset② の瞬時 wander が温度ランプで増大、ループは発振せず低速 wander
 /// (autocorr~0.97)」と診断 → ゲイン headroom 仮説の host 検証。**特定 HW 値ではなく一般物理レンジ** (±2.5 ppb/s
-/// を 30s 毎に反転) を使い、再較正イベントを含む実ログ replay (corr 崩壊) を避けて閉ループで清潔に比較する。
+/// を 30s 毎に反転) を使い、再校正イベントを含む実ログ replay (corr 崩壊) を避けて閉ループで清潔に比較する。
 /// `cargo test -p gnssdo --test thermal_plant -- --ignored i_den_sweep --nocapture`
 ///
 /// **注意 (モデルの限界, 実機で確認)**: このモデルは i_den を下げるほど位相 sd が単調に下がり autocorr も発振
@@ -419,7 +419,7 @@ fn replay_real_log_matches_hwphase() {
         );
     }
 
-    // 起動収束 (最初の 10%) と、ログ側の K較正/holdover復帰の巨大スパイク (|hw|>5µs) を除外した窓で比較。
+    // 起動収束 (最初の 10%) と、ログ側の K校正/holdover復帰の巨大スパイク (|hw|>5µs) を除外した窓で比較。
     let (mut rr, mut mm) = (Vec::new(), Vec::new());
     for i in (n / 10)..n {
         if real_hw[i].abs() > 5_000 {
