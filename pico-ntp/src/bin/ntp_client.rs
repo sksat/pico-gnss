@@ -27,7 +27,11 @@
 #![no_std]
 #![no_main]
 
-use core::cell::RefCell;
+/// Shared with the master's firmware: the port, the identities, and the counter-to-UTC step.
+#[path = "../ptp.rs"]
+pub mod ptp;
+
+use core::cell::{Cell, RefCell};
 
 use defmt::{info, warn};
 use embassy_executor::Spawner;
@@ -37,7 +41,8 @@ use embassy_rp::peripherals::{PIO0, PIO1};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_sync::channel::Channel;
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 
 use pico_10base_t::embassy::{Rx10BaseT, Tx10BaseT};
 use pico_10base_t::frame::{
@@ -200,11 +205,52 @@ const ARRIVAL_GPIO: u8 = 18;
 ///
 /// Not by software. The counter is running before the bit arrives and is read out afterwards, so
 /// nothing between the pad and here is on the path — no DMA completion, no interrupt, no executor.
-/// What it costs is that it is a *tick* count with no origin, so it is only ever useful as a
-/// difference, and it has to be fed often enough to stay ahead of the counter's wrap.
-static ARRIVAL: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> = BlockingMutex::new(
-    RefCell::new(TickTimeline::with_toll(EVENT_CAPTURE_TOLL_TICKS)),
-);
+/// It has to be fed often enough to stay ahead of the counter's wrap.
+///
+/// Anchored at the counter's start rather than its first capture, so the ticks mean a moment and
+/// not just an interval: PTP has to say *when* a frame arrived, and [`COUNTER_ORIGIN_NS`] is what
+/// carries that moment onto this board's own clock.
+static ARRIVAL: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
+    BlockingMutex::new(RefCell::new(TickTimeline::from_counter_start_with_toll(
+        EVENT_CAPTURE_TOLL_TICKS,
+    )));
+
+/// The same, for the pin frames leave by.
+static EGRESS_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
+    BlockingMutex::new(RefCell::new(TickTimeline::from_counter_start_with_toll(
+        EVENT_CAPTURE_TOLL_TICKS,
+    )));
+
+/// Local time at the instant the counters were enabled.
+///
+/// The one software clock read on the whole PTP path, and it is read once: on the line after the
+/// write that starts the state machines, with no await between them. Everything a pin timestamps
+/// afterwards is converted through it, so a late read here would be a constant on every t2 and t3
+/// rather than a jitter on each.
+static COUNTER_ORIGIN_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
+    BlockingMutex::new(Cell::new(i64::MIN));
+
+/// A counter value from a pin, as this board's UTC.
+fn pin_utc_ns(
+    raw: u32,
+    timeline: &BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>>,
+) -> Option<i64> {
+    let origin = COUNTER_ORIGIN_NS.lock(|o| o.get());
+    if origin == i64::MIN {
+        return None;
+    }
+    let since_start = timeline.lock(|t| ptp::capture_ns(raw, &mut t.borrow_mut(), clk_sys_freq()));
+    CLOCK.lock(|c| c.borrow().utc_at(origin + since_start as i64))
+}
+
+/// A PTP message that arrived, and the counter value the pin saw its first bit at.
+#[derive(Clone, Copy)]
+struct PtpArrival {
+    message: tiny_ptp::Message,
+    arrived_raw: u32,
+}
+
+static PTP_IN: Channel<CriticalSectionRawMutex, PtpArrival, 4> = Channel::new();
 
 /// How long the line stays busy after a frame's first bit.
 ///
@@ -320,6 +366,28 @@ async fn link_task(
             note(&mut dropped, "not a UDP datagram", seen);
             continue;
         };
+        // PTP has its own port. All this task does with it is pass the message and the counter
+        // value the pin reported to the task that owns the transmitter — the conversion to UTC is
+        // a 64-bit division, and this task has a link to keep up with.
+        if datagram.dst_port == ptp::PTP_PORT {
+            match (tiny_ptp::decode(datagram.payload), hw_raw) {
+                (Some(message), Some(arrived_raw)) => {
+                    if PTP_IN
+                        .try_send(PtpArrival {
+                            message,
+                            arrived_raw,
+                        })
+                        .is_err()
+                    {
+                        note(&mut dropped, "PTP queue full", seen);
+                    }
+                }
+                (None, _) => note(&mut dropped, "not a PTP message", seen),
+                (_, None) => note(&mut dropped, "PTP without a hardware timestamp", seen),
+            }
+            continue;
+        }
+
         // The beacon goes to the service port; an answer comes back to the port the question left
         // from. Both are ours, and nothing else on this link is.
         if datagram.dst_port != NTP_PORT && datagram.dst_port != SRC_PORT {
@@ -452,6 +520,34 @@ async fn link_task(
 ///
 /// The transmit timestamp is the whole of the client's state for an exchange: the server echoes it
 /// back untouched and [`measure`] matches on it, so nothing else has to be remembered.
+/// Send one PTP message, and say in this board's UTC when its first bit left the pin.
+///
+/// The return value is t3, and it is measured rather than declared: what goes into the `Delay_Req`
+/// on the wire is a placeholder, because a departure written before the frame is encoded is a claim
+/// about a moment that has not happened.
+async fn send_ptp(
+    tx: &mut Tx10BaseT<'static, PIO0, 1>,
+    egress: &mut EventCapture<'static, PIO0, 3>,
+    msg: &tiny_ptp::Message,
+    ip_id: u16,
+    frame: &mut [u8; REQ_FRAME_LEN],
+    symbols: &mut [u32; REQ_SYMBOL_WORDS],
+) -> Option<i64> {
+    let peer = ptp::Peer {
+        src_mac: SRC_MAC,
+        dst_mac: SERVER_MAC,
+        src_ip: SRC_IP,
+        dst_ip: SERVER_IP,
+    };
+    let len = ptp::build(&peer, msg, ip_id, frame)?;
+    let words = encode_frame(&frame[..len], symbols)?;
+    egress.drain();
+    tx.send(&symbols[..words]).await;
+    let raw = egress.try_read()?;
+    egress.drain();
+    pin_utc_ns(raw, &EGRESS_TICKS)
+}
+
 #[embassy_executor::task]
 async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<'static, PIO0, 3>) {
     // A broadcast client listens and nothing else (RFC 5905 §9.1). With the questions still going
@@ -463,9 +559,51 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<
     let mut symbols = [0u32; REQ_SYMBOL_WORDS];
     let mut ip_id: u16 = 0;
     let mut asked: u32 = 0;
+    let mut slave = tiny_ptp::e2e::Slave::new(ptp::port_identity(SRC_MAC));
+    let mut measured: u32 = 0;
 
     loop {
-        Timer::after(Duration::from_secs(POLL_INTERVAL_S)).await;
+        // Serve PTP until the next question is due, rather than once a second alongside it. The
+        // exchange has to close while the two clocks are still where they were when it opened, and
+        // sleeping through a `Follow_Up` would put a whole second of this board's drift between t2
+        // and t3.
+        let deadline = Instant::now() + Duration::from_secs(POLL_INTERVAL_S);
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let Ok(arrival) = with_timeout(remaining, PTP_IN.receive()).await else {
+                break;
+            };
+            let Some(arrived_ns) = pin_utc_ns(arrival.arrived_raw, &ARRIVAL) else {
+                continue;
+            };
+            match slave.on_message(arrival.message, arrived_ns) {
+                tiny_ptp::e2e::Action::SendDelayReq(req) => {
+                    ip_id = ip_id.wrapping_add(1);
+                    if let Some(left_ns) =
+                        send_ptp(&mut tx, &mut egress, &req, ip_id, &mut frame, &mut symbols).await
+                    {
+                        slave.on_delay_req_sent(left_ns);
+                    }
+                }
+                tiny_ptp::e2e::Action::Complete(exchange) => match tiny_ptp::measure(&exchange) {
+                    Ok(m) => {
+                        measured = measured.wrapping_add(1);
+                        // Logged, not applied. What the discipline does with this is the next
+                        // step; what it is worth has to be readable before then, beside the
+                        // number NTP produces from the same link in the same second.
+                        info!(
+                            "PTP n={} seq={} offset_ns={} path_ns={} ntp_offset_ns={}",
+                            measured,
+                            m.sequence,
+                            m.offset_from_master_ns,
+                            m.mean_path_delay_ns,
+                            CLOCK.lock(|c| c.borrow().offset_ns()),
+                        );
+                    }
+                    Err(reason) => warn!("PTP refused: {}", defmt::Debug2Format(&reason)),
+                },
+                tiny_ptp::e2e::Action::Ignored(_) => {}
+            }
+        }
 
         let started = now_ns();
         // Before there is a clock, the departure time is a number with no meaning - but it is still
@@ -650,6 +788,9 @@ async fn main(spawner: Spawner) {
         embassy_rp::pac::PIO0,
         EventCapture::<PIO0, 2>::sm_mask() | EventCapture::<PIO0, 3>::sm_mask(),
     );
+    // Next line, deliberately: see `COUNTER_ORIGIN_NS`. The counters hold zero at the write above,
+    // and this is the one read that ties that instant to a time this board can name.
+    COUNTER_ORIGIN_NS.lock(|o| o.set(now_ns()));
     arrival.drain();
     egress.drain();
 

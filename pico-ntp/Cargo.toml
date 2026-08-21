@@ -68,6 +68,7 @@ swd-rx = []
 gnssdo = { version = "0.1.0", path = "../gnssdo" }
 rp-pps = { version = "0.1.0", path = "../rp-pps", features = ["embassy-rp", "gnssdo"] }
 tiny-ntp = { version = "0.1.0", path = "../tiny-ntp" }
+tiny-ptp = { version = "0.1.0", path = "../tiny-ptp" }
 pico-10base-t = { version = "0.1.0", path = "../pico-10base-t", features = ["embassy-rp"] }
 
 cortex-m = "0.7.7"

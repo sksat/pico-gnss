@@ -2101,6 +2101,7 @@ dependencies = [
  "rp-pps",
  "static_cell",
  "tiny-ntp",
+ "tiny-ptp",
 ]
 
 [[package]]

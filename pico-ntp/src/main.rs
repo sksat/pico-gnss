@@ -58,6 +58,8 @@
 #[cfg(feature = "swd-rx")]
 mod swd_rx;
 
+pub mod ptp;
+
 use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -389,10 +391,31 @@ const PPS_BLANK_NS: u32 = 200_000_000;
 /// without a software clock anywhere on the path. All three counters run the same program and were
 /// started by one write; a counter that ran a *different* program would tick at the same rate and
 /// pay a different toll at every capture, which is a drift and not an offset.
+/// Anchored at the counter's start, not at its first capture: PTP has to say *when* a frame
+/// arrived, in UTC, and only a timeline that shares the 1PPS capture's origin can be handed to
+/// `now_from_capture_ns`.
 static ARRIVAL_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
-    BlockingMutex::new(RefCell::new(TickTimeline::with_toll(
+    BlockingMutex::new(RefCell::new(TickTimeline::from_counter_start_with_toll(
         EVENT_CAPTURE_TOLL_TICKS,
     )));
+
+/// The same, for the pin frames leave by.
+static EGRESS_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
+    BlockingMutex::new(RefCell::new(TickTimeline::from_counter_start_with_toll(
+        EVENT_CAPTURE_TOLL_TICKS,
+    )));
+
+/// A `Delay_Req` that arrived, and the counter value the pin saw it at.
+///
+/// The raw value rather than a time: converting it costs a 64-bit division on a core without a
+/// divider, and the receive task is the one that also has to keep up with the link.
+#[derive(Clone, Copy)]
+struct PtpRequest {
+    message: tiny_ptp::Message,
+    arrived_raw: u32,
+}
+
+static PTP_REQUESTS: Channel<CriticalSectionRawMutex, PtpRequest, 2> = Channel::new();
 
 /// Words per capture on the receive side. See the client for the arithmetic; a request is smaller
 /// than a reply, and this covers either.
@@ -472,6 +495,21 @@ async fn link_rx_task(
         let Some(datagram) = parse_udp_frame(&frame[..len]) else {
             continue;
         };
+        // PTP travels on its own port, and the only thing the receiver does with it is hand the
+        // message and the pin's own counter value to the task that owns the transmitter.
+        if datagram.dst_port == ptp::PTP_PORT {
+            if let (Some(message), Some(arrived_raw)) = (tiny_ptp::decode(datagram.payload), hw_raw)
+                && PTP_REQUESTS
+                    .try_send(PtpRequest {
+                        message,
+                        arrived_raw,
+                    })
+                    .is_err()
+            {
+                warn!("PTP request dropped, still answering the last one");
+            }
+            continue;
+        }
         if datagram.dst_port != DST_PORT {
             continue;
         }
@@ -609,6 +647,102 @@ fn clock_state() -> (Option<i64>, ClockState) {
     })
 }
 
+/// Send one PTP message and say, in UTC, when its first bit actually left the pin.
+///
+/// The two halves of that sentence are the point. Everything this firmware does with NTP writes a
+/// departure into the frame *before* encoding it and then tries to make the frame leave when it
+/// said; here the frame says nothing about when it left, the pin does, and what the pin says is
+/// carried afterwards in a message of its own.
+async fn send_ptp(
+    tx: &mut Tx10BaseT<'static, PIO1, 0>,
+    egress: &mut EventCapture<'static, PIO0, 3>,
+    msg: &tiny_ptp::Message,
+    ip_id: u16,
+    frame: &mut [u8; FRAME_LEN],
+    symbols: &mut [u32; SYMBOL_WORDS],
+) -> Option<i64> {
+    let peer = ptp::Peer {
+        src_mac: SRC_MAC,
+        dst_mac: DST_MAC,
+        src_ip: SRC_IP,
+        dst_ip: DST_IP,
+    };
+    let len = ptp::build(&peer, msg, ip_id, frame)?;
+    let words = encode_frame(&frame[..len], symbols)?;
+    egress.drain();
+    tx.send(&symbols[..words]).await;
+    let raw = egress.try_read()?;
+    egress.drain();
+    let capture = EGRESS_TICKS.lock(|t| ptp::capture_ns(raw, &mut t.borrow_mut(), clk_sys_freq()));
+    CLOCK.lock(|g| g.borrow().now_from_capture_ns(capture))
+}
+
+/// One `Sync`, then the `Follow_Up` that says when it left.
+async fn ptp_sync(
+    tx: &mut Tx10BaseT<'static, PIO1, 0>,
+    egress: &mut EventCapture<'static, PIO0, 3>,
+    sequence: u16,
+    ip_id: &mut u16,
+    frame: &mut [u8; FRAME_LEN],
+    symbols: &mut [u32; SYMBOL_WORDS],
+) -> Option<i64> {
+    let us = ptp::port_identity(SRC_MAC);
+    let sync = tiny_ptp::Message {
+        domain: ptp::DOMAIN,
+        two_step: true,
+        correction_sub_ns: 0,
+        source: us,
+        sequence,
+        log_interval: ptp::LOG_SYNC_INTERVAL,
+        // A placeholder, and declared as one by `two_step`. What counts follows.
+        body: tiny_ptp::Body::Sync(tiny_ptp::Timestamp::default()),
+    };
+    *ip_id = ip_id.wrapping_add(1);
+    let t1 = send_ptp(tx, egress, &sync, *ip_id, frame, symbols).await?;
+
+    let follow_up = tiny_ptp::Message {
+        body: tiny_ptp::Body::FollowUp(tiny_ptp::Timestamp::from_ns(t1)),
+        two_step: false,
+        ..sync
+    };
+    *ip_id = ip_id.wrapping_add(1);
+    send_ptp(tx, egress, &follow_up, *ip_id, frame, symbols).await;
+    Some(t1)
+}
+
+/// Answer a `Delay_Req` with the UTC its first bit arrived at.
+async fn ptp_answer(
+    tx: &mut Tx10BaseT<'static, PIO1, 0>,
+    egress: &mut EventCapture<'static, PIO0, 3>,
+    request: &PtpRequest,
+    ip_id: &mut u16,
+    frame: &mut [u8; FRAME_LEN],
+    symbols: &mut [u32; SYMBOL_WORDS],
+) -> Option<i64> {
+    let tiny_ptp::Body::DelayReq(_) = request.message.body else {
+        return None;
+    };
+    let capture = ARRIVAL_TICKS
+        .lock(|t| ptp::capture_ns(request.arrived_raw, &mut t.borrow_mut(), clk_sys_freq()));
+    let t4 = CLOCK.lock(|g| g.borrow().now_from_capture_ns(capture))?;
+
+    let resp = tiny_ptp::Message {
+        domain: ptp::DOMAIN,
+        two_step: false,
+        correction_sub_ns: 0,
+        source: ptp::port_identity(SRC_MAC),
+        sequence: request.message.sequence,
+        log_interval: ptp::LOG_SYNC_INTERVAL,
+        body: tiny_ptp::Body::DelayResp {
+            receive: tiny_ptp::Timestamp::from_ns(t4),
+            requesting: request.message.source,
+        },
+    };
+    *ip_id = ip_id.wrapping_add(1);
+    send_ptp(tx, egress, &resp, *ip_id, frame, symbols).await;
+    Some(t4)
+}
+
 /// Build and send one reply.
 ///
 /// The transmit timestamp is written before the frame is encoded, so it is a claim about a moment
@@ -735,7 +869,28 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>, mut egress: EventCapture<
     // the boundary we aimed at, and would then aim at it again.
     let mut last_target_ns: i64 = i64::MIN;
 
+    let mut ptp_sequence: u16 = 0;
+    let mut ptp_sent: u32 = 0;
+
     loop {
+        // A `Delay_Req` outranks everything: the slave is holding an unfinished exchange, and the
+        // longer the answer takes the further its t4 is from the moment being measured.
+        if let Ok(request) = PTP_REQUESTS.try_receive() {
+            if let Some(t4) = ptp_answer(
+                &mut tx,
+                &mut egress,
+                &request,
+                &mut ip_id,
+                &mut frame,
+                &mut symbols,
+            )
+            .await
+            {
+                info!("PTPRESP seq={} t4={}", request.message.sequence, t4);
+            }
+            continue;
+        }
+
         // A question outranks the beacon. Answering is the whole point of having a receive path:
         // it is what lets a client measure the round trip instead of assuming it.
         if let Ok(request) = REQUESTS.try_receive() {
@@ -898,6 +1053,27 @@ async fn ntp_task(mut tx: Tx10BaseT<'static, PIO1, 0>, mut egress: EventCapture<
                     tiny_ntp::server::root_dispersion_ns(&CFG, state.holdover_ns),
                     state.holdover_ns,
                 );
+
+                // The beacon has gone out and the second boundary is behind us, which is the
+                // quietest part of the second: nothing else is queued, so the two PTP messages
+                // leave back to back and the slave's `Sync` and `Follow_Up` do not straddle
+                // anything.
+                if let Some(t1) = ptp_sync(
+                    &mut tx,
+                    &mut egress,
+                    ptp_sequence,
+                    &mut ip_id,
+                    &mut frame,
+                    &mut symbols,
+                )
+                .await
+                {
+                    ptp_sent = ptp_sent.wrapping_add(1);
+                    if ptp_sent.is_multiple_of(16) {
+                        info!("PTPSYNC n={} seq={} t1={}", ptp_sent, ptp_sequence, t1);
+                    }
+                }
+                ptp_sequence = ptp_sequence.wrapping_add(1);
             }
         }
     }
