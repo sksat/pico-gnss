@@ -117,7 +117,7 @@ def fig_broadcast_series():
 
 
 # 1 回の取り込みで両方の 1PPS を読んだ run。server の絶対位置がばらついているのは狙って
-# そうしたのではなく、UTC の錨を PIO が捉えたエッジではなく FIFO を汲み出した時刻で取っていて、
+# そうしたのではなく、UTC の基準を、PIO が捉えたエッジではなく FIFO から取り出した時刻で取っていて、
 # 起動ごとに executor の起床順が変わるためである。ここではそれを逆に使う。
 RUNS = [
     ("pair-series.csv", "broadcast"),
@@ -131,7 +131,7 @@ RUNS = [
     ("pair-boot3.csv", "unicast"),
     ("pair-boot4.csv", "unicast"),
     ("pair-boot5.csv", "unicast"),
-    ("pair-anchor-delay.csv", "unicast (錨を 100 µs 遅らせた)"),
+    ("pair-anchor-delay.csv", "unicast (時刻の基準を 100 µs 遅らせた)"),
 ]
 
 # 垂直の設定は `scope_pair.py` が固定している (1 V/div、offset −1.5 V)。バイト 0-255 が
