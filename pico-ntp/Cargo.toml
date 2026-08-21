@@ -25,6 +25,11 @@ path = "src/bin/link_rx.rs"
 name = "ntp_client"
 path = "src/bin/ntp_client.rs"
 
+# Bring-up: do several PIO counters in one block form a single timebase?
+[[bin]]
+name = "tsbase"
+path = "src/bin/tsbase.rs"
+
 # On-target transmit benchmark; not built by a normal build.
 # On hardware: cd pico-ntp && cargo run --release --features bench --bin bench_tx
 [[bin]]

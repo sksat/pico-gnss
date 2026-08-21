@@ -1,0 +1,17 @@
+[package]
+name = "tiny-ptp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "IEEE 1588 end-to-end two-step message encoding and delay-request arithmetic for no_std targets: Sync, Follow_Up, Delay_Req and Delay_Resp, with the offset and mean path delay they carry between them. A fixed pair of ports, not an ordinary clock — no BMCA, no Announce, no management. Integer-only, zero-dependency."
+keywords = ["ptp", "ieee1588", "timestamp", "no_std", "gpsdo"]
+categories = ["embedded", "no-std", "network-programming"]
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+
+[lib]
+name = "tiny_ptp"
+
+# No runtime dependencies, and no framing: the same boundary `tiny-ntp` keeps. Ethernet, UDP and the
+# PHY live in `pico-10base-t`; the timestamps come from whatever took them.
