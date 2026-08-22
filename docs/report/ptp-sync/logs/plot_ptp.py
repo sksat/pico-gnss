@@ -204,21 +204,24 @@ def read_trace(name):
                 continue  # 書き込み途中の最終行
             if len(b) < 100:
                 continue
-            frames.setdefault(int(head), {})[int(ch)] = b * VOLTS_PER_BYTE - CENTRE_VOLTS
+            # 生のバイトのまま持つ。電圧に直すのは描くときだけで、エッジは
+            # `measure_pair.py` と同じバイトのしきい値で取る — 別の取り方をすると、
+            # 図の矢印と本文の数値が食い違う。
+            frames.setdefault(int(head), {})[int(ch)] = b
     return frames, xinc
 
 
-def _cross(v, falling):
-    """しきい値はその波形の中点に取る。
+# バイト 0-255 が 10 division にあたるので、その真ん中がしきい値である。
+# **全チャネル共通**にする。チャネルごとに自分の min/max の中点を取ると、オーバーシュートの
+# 違いだけで交差点が数十 ns 動き、2 本の矢印の長さが互いに比べられなくなる。
+CROSS_LEVEL = 127.0
 
-    固定の 1.65 V にしない: 縦の設定は run ごとに効いたり効かなかったりして、バイトと電圧の
-    対応が変わる。信号は 3.3 V のロジックなので、自分の最小と最大の真ん中を渡る点が
-    そのままエッジである。
-    """
+
+def _cross(v, falling, level=CROSS_LEVEL):
+    """立ち上がり (または立ち下がり) が `level` を渡る点を、サンプル間で内挿して返す。"""
     lo, hi = float(np.min(v)), float(np.max(v))
-    if hi - lo < 0.5:  # 平ら: この channel にエッジは無い
+    if hi - lo < 20:  # 平ら: この channel にエッジは無い
         return None
-    level = (lo + hi) / 2
     for i in range(1, len(v)):
         if falling and v[i - 1] >= level > v[i]:
             return i - 1 + (v[i - 1] - level) / (v[i - 1] - v[i])
@@ -244,7 +247,7 @@ def _draw(ax, frame, xinc, ref, server_us, client_us):
     x = (np.arange(n) - ref) * xinc / 1000.0
     at = transforms.blended_transform_factory(ax.transAxes, ax.transData)
     for ch, base, colour, name, sub in LANES:
-        ax.plot(x, frame[ch] + base, lw=1.2, color=colour)
+        ax.plot(x, frame[ch] * VOLTS_PER_BYTE - CENTRE_VOLTS + base, lw=1.2, color=colour)
         ax.text(0.012, base + 4.3, name, fontsize=9, color=colour, va="top", transform=at)
         ax.text(0.012, base + 2.9, sub, fontsize=7.5, color="0.35", va="top", transform=at)
     ax.axvline(0, color="0.35", lw=1.0, ls="--")
@@ -271,6 +274,23 @@ def _draw(ax, frame, xinc, ref, server_us, client_us):
     ax.set_xlabel("秒境界からの時間 (µs)")
 
 
+def check_consistent(name, usable, series):
+    """図に出す数字が、同じ 1 つの取り込みから出ていることを確かめる。
+
+    一度やった間違いなので、繰り返さないように自動で見る: 上のパネルの矢印は
+    `usable[k]` から、下のパネルの折れ線は別に組み立てた列から描いているので、両者が同じ
+    取り込みを指しているかはコードを読まないと分からない。ずれても絵は破綻せず、値だけが
+    静かに食い違う。
+
+    `series` は `(名前, 列, usable から同じ値を取り出す関数)` の並び。
+    """
+    for label, seq, of in series:
+        assert len(seq) == len(usable), f"{name}: {label} の長さが取り込み数と違う"
+        for k in (0, len(usable) // 2, len(usable) - 1):
+            a, b = seq[k], of(usable[k])
+            assert abs(a - b) < 1e-9, f"{name}: {label} の {k} 番目が矢印と食い違う ({a} vs {b})"
+
+
 def gif_pair(label, name, colour, out_name):
     """1 コマ 1 取り込みで並べる。1 枚では見えない揺れが見える。"""
     frames, xinc = read_trace(name)
@@ -290,13 +310,24 @@ def gif_pair(label, name, colour, out_name):
     )
     ss = [s for _, _, s, _ in usable]
     cs = [c for _, _, _, c in usable]
+
+    check_consistent(
+        out_name,
+        usable,
+        [
+            ("server の矢印", ss, lambda u: u[2]),
+            ("client の矢印", cs, lambda u: u[3]),
+        ],
+    )
     diff = [c - s for s, c in zip(ss, cs)]
     seen = ss + cs
     lo, hi = min(seen), max(seen)
     pad = (hi - lo) * 0.25 + 0.2
     # コマごとに tight_layout を呼ぶと枠が揺れるので、一度だけ決める。
     fig.subplots_adjust(left=0.11, right=0.98, top=0.90, bottom=0.09, hspace=0.42)
-    lo_d, hi_d = min(diff) * 1000, max(diff) * 1000
+    # 下のパネルは上の矢印 2 本と同じ量を描くので、範囲も両方から取る。
+    both = ss + cs
+    lo_d, hi_d = min(both) * 1000, max(both) * 1000
     margin = (hi_d - lo_d) * 0.15 + 20
 
     def render(k):
@@ -311,11 +342,17 @@ def gif_pair(label, name, colour, out_name):
             fontsize=10,
         )
         tx.axhline(0, color="0.6", lw=0.8)
-        tx.plot(range(k + 1), [d * 1000 for d in diff[: k + 1]], ".-", ms=3, lw=0.8, color=colour)
+        # 上の 2 本の矢印と同じ量を描く。ここに client − server を描くと、画面の矢印
+        # (それぞれが GPS の秒からどれだけ離れているか) と数字が合わず、読み手が突き合わせられない。
+        tx.plot(range(k + 1), [v * 1000 for v in ss[: k + 1]], ".-", ms=3, lw=0.8,
+                color="tab:purple", label="server")
+        tx.plot(range(k + 1), [v * 1000 for v in cs[: k + 1]], ".-", ms=3, lw=0.8,
+                color="tab:blue", label="client")
         tx.set_xlim(-1, len(usable))
         # データの範囲から取る。0 を基準に取ると、offset が 0 から離れた run で推移が枠外に出る。
         tx.set_ylim(lo_d - margin, hi_d + margin)
-        tx.set_ylabel("client − server (ns)", fontsize=8)
+        tx.set_ylabel("受信機の秒からのずれ (ns)", fontsize=8)
+        tx.legend(fontsize=7, ncol=2, loc="upper right")
         tx.set_xlabel("取り込み", fontsize=8)
         tx.tick_params(labelsize=7)
         tx.grid(alpha=0.3)
@@ -345,7 +382,7 @@ def _draw_two(ax, frame, xinc, ref, diff_us):
         (3, 5.0, "tab:purple", "CH3  Pico server の GP6  (基準)"),
         (4, 0.0, "tab:blue", "CH4  Pico client の GP6"),
     ):
-        ax.plot(x, frame[ch] + base, lw=1.4, color=colour)
+        ax.plot(x, frame[ch] * VOLTS_PER_BYTE - CENTRE_VOLTS + base, lw=1.4, color=colour)
         ax.text(0.012, base + 4.3, name, fontsize=9.5, color=colour, va="top", transform=at)
     ax.axvline(0, color="tab:purple", lw=1.0, ls="--")
     ax.annotate(
@@ -387,6 +424,8 @@ def gif_two(label, name, colour, out_name):
     lo, hi = min(diff + [0.0]), max(diff + [0.0])
     pad = (hi - lo) * 0.35 + 0.15
     span = max(abs(min(diff)), abs(max(diff))) * 1000
+
+    check_consistent(out_name, usable, [("矢印", diff, lambda u: u[2])])
 
     fig, (ax, tx) = plt.subplots(
         2, 1, figsize=(8.4, 5.4), dpi=80, gridspec_kw={"height_ratios": [2.6, 1.1]}
