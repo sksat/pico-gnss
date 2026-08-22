@@ -245,6 +245,27 @@ const PPS_PIN: usize = 2;
 /// The pin the disciplined 1PPS comes out of.
 const PPS_OUT_PIN: u8 = 6;
 
+/// Why the phase loop is proportional and stops there.
+///
+/// The plant integrates: a period word sets an interval, and intervals accumulate into phase. A
+/// proportional correction on it is first order and settles without overshoot. The firmware used
+/// to put an integrator in front of that, and the pair rang — the two-state loop's eigenvalues
+/// come out complex at `0.875 +- 0.217i`, a period of about 26 s, and the pin error's
+/// autocorrelation alternated sign at that rate.
+///
+/// The dynamics have a fix that is not a matter of taste. For `z^2 - (2 - Kp) z + (1 - Kp + Ki)`
+/// a double root needs `Ki = Kp^2 / 4`, a sixteenth of what was shipped. It was tried on the
+/// board: the ringing went and the settled spread did not improve — 58 ns against 21 to 38 ns for
+/// the proportional loop alone. An integrator removes the standing error a rate leaves behind,
+/// which here is `1 / Kp` times whatever the frequency estimate is getting wrong (7 ppb, so
+/// 28 ns), and in exchange it integrates the measurement's own noise into the frequency, where it
+/// accumulates back into phase. In this noise that trade does not pay.
+///
+/// What decides it is where the reference's noise and the crystal's own wander cross, and that is
+/// a property of the board rather than of the design — so choosing the gain from it means
+/// estimating both at run time, not writing a number here. `rp-pps/tests/pin_loop.rs` holds the
+/// model the two topologies were compared in.
+///
 /// How far our own pulse was from the receiver's, measured at the pads (ns).
 ///
 /// The one number the output loop could not previously see. The schedule places edges by adding
@@ -262,8 +283,15 @@ static PIN_LATENESS_NS: BlockingMutex<CriticalSectionRawMutex, Cell<Option<i64>>
 /// moving the output does not move them: measured, the server's own pulse sat 66 ns from the
 /// receiver's second while the client following its `Sync` messages sat 2.8 µs away.
 ///
-/// So the correction goes on the map. Then the output and the served time are right together,
-/// because they are the same answer to the same question.
+/// So the correction goes on the map — and putting it there put the loop that drives it *inside*
+/// the loop that steers the output, because the output's own error is read through this map. Two
+/// correctors, each with a second of delay, driving one physical phase, on a plant that already
+/// integrates. The pin error came out oscillating rather than noisy: its autocorrelation
+/// alternates sign and decays (−0.82, +0.58, −0.41, +0.30 over 92 samples), which a random walk
+/// does not do, and the runs with the strongest alternation are the runs with the widest spread.
+///
+/// So the map is no longer in the output's path. [`OUT_CORRECTION_NS`] steers the pin, and this
+/// carries only what the served time needs.
 static MAP_CORRECTION_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
     BlockingMutex::new(Cell::new(0));
 
@@ -341,24 +369,22 @@ async fn pin_lateness_task(
             );
             continue;
         }
+        // Published, not accumulated.
+        //
+        // The plant already integrates: a period word sets an interval, and intervals accumulate
+        // into phase. Feeding this error to the schedule's proportional term is then a first-order
+        // loop — the next error is (1 - g) times this one, with no state of its own to ring
+        // against. An integrator here made it second order with no damping, and it rang: the
+        // eigenvalues come out complex at 0.875 +- 0.217i, which is a 26 s period, and the pin
+        // error's autocorrelation alternated sign with about that period.
         PIN_LATENESS_NS.lock(|p| p.set(Some(ns)));
-        // A quarter of the error each second, on the map. The same gain the output loop uses, and
-        // for the same reason: correcting all of it at once puts this measurement's own noise —
-        // two captures, each on a 16 ns grid — straight onto every timestamp the board serves.
-        let corrected = MAP_CORRECTION_NS.lock(|c| {
-            // Adding to the map makes a given capture read as a *later* UTC, so the edge that
-            // satisfies "this second" comes earlier. A late pulse therefore wants the correction
-            // to go up, not down — the other way round is positive feedback, and it ran away at
-            // 20 µs in under a minute.
-            let next = c.get() + ns / 4;
-            c.set(next);
-            next
-        });
         seen = seen.wrapping_add(1);
         if seen <= 8 || seen.is_multiple_of(16) {
             info!(
                 "PPSPIN n={} out_minus_gps_ns={} map_correction_ns={}",
-                seen, ns, corrected
+                seen,
+                ns,
+                MAP_CORRECTION_NS.lock(|c| c.get()),
             );
         }
     }
@@ -499,6 +525,20 @@ async fn pps_task(mut capture: TimedPpsCapture<'static, PIO0, 0>) {
             }))
         });
         captures = captures.wrapping_add(1);
+        // The receiver's second, timed against this board's crystal and nothing else.
+        //
+        // A second of crystal wanders by about a nanosecond, so what this interval scatters by is
+        // the receiver's own jitter. That number is what says how fast the output loop may be
+        // allowed to follow it: a loop faster than the crystal's own stability copies the
+        // receiver's noise onto the pin instead of filtering it.
+        if captures > 2 && captures.is_multiple_of(8) {
+            info!(
+                "PPSIN n={=u64} interval_ns={=u64} from_nominal_ns={}",
+                captures,
+                edge.interval_ns,
+                edge.interval_ns as i64 - 1_000_000_000,
+            );
+        }
         CLOCK.lock(|g| g.borrow_mut().on_pps_edge(edge, now_ns()));
     }
 }
@@ -783,7 +823,9 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
         let predicted = schedule.predicted_edge_ns();
         // The estimate and the time it implies, read together so they describe the same moment.
         let steering_mppb = CLOCK.lock(|g| g.borrow().steering_freq_mppb());
-        let utc = utc_from_capture_ns(predicted as u64);
+        // Deliberately not `utc_from_capture_ns`: what steers the pin must not be read through
+        // the map the board serves, or the two loops are one loop with two delays in it.
+        let utc = CLOCK.lock(|g| g.borrow().now_from_capture_ns(predicted as u64));
         let trusted = SOURCE_TRUSTED.load(Ordering::Relaxed);
 
         let measured = PIN_LATENESS_NS.lock(|p| p.get());
@@ -796,7 +838,15 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
             // sit 800 ns off the second, permanently, and the firmware's own `landed_late_ns`
             // reported exactly that. Feeding the rate forward leaves the phase term to correct
             // phase.
-            Some(utc) if trusted => schedule.advance(steering_mppb, pps_lateness_ns(utc)),
+            // The pin's own error where the pin has been seen, and the map's where it has not.
+            //
+            // What is being placed is the pad, not the schedule's idea of it, and the pad is what
+            // the state machine watching GP6 reports. Until it has reported once there is nothing
+            // to steer by but the map, which is where the output starts from anyway.
+            Some(utc) if trusted => schedule.advance(
+                steering_mppb,
+                measured.unwrap_or_else(|| pps_lateness_ns(utc)),
+            ),
             // Nothing to steer by yet: free-run at the nominal second so the FIFO stays fed.
             _ => schedule.step(0, 0),
         };

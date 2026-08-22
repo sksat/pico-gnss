@@ -916,7 +916,16 @@ async fn pps_task(
         // the prediction leaves the real edge off by however much it moved. On this board the
         // crystal is 1.86 ppm out, and the firmware's own `late_ns` sat at +1847 ns while its
         // corrections were single-digit: the loop had converged, on the wrong point.
-        let target = committed.unwrap_or_else(|| schedule.predicted_edge_ns());
+        // The pad, not the schedule's idea of it.
+        //
+        // What has to land on the second is the edge on GP6, and that comes out of the state
+        // machine and through the pad some fixed time after the schedule's own count reaches it.
+        // The board measures that time — it watches its own pin from the block that drives it —
+        // and until now it only reported it. Steering the schedule's edge onto the second leaves
+        // the pad that much off it, on both boards, and the two do not cancel because the far side
+        // closes its loop on a pin and this one did not.
+        let target = committed.unwrap_or_else(|| schedule.predicted_edge_ns())
+            + PIN_LATENESS_NS.lock(|p| p.get()).unwrap_or(0);
         let state = CLOCK.lock(|c| {
             let c = c.borrow();
             c.utc_at(target)
