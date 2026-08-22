@@ -32,9 +32,7 @@ use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_time::{Duration, Timer};
 
 use rp_pps::embassy::{EventCapture, PpsCapture, set_capture_polarity, start_in_sync};
-#[cfg(not(feature = "event-program"))]
-use rp_pps::pps_capture_program_wrap_balanced;
-use rp_pps::{PpsPolarity, TickTimeline, ticks_to_ns};
+use rp_pps::{PpsPolarity, TickTimeline, pps_capture_program_wrap_balanced, ticks_to_ns};
 
 use defmt_rtt as _;
 use panic_probe as _;
@@ -67,16 +65,18 @@ async fn main(_spawner: Spawner) {
         sm3,
         ..
     } = Pio::new(p.PIO0, Irqs);
-    // Which program the three counters run.
-    //
-    // The balanced 1PPS program is the default and is what the original question was about. The
-    // link's counters run `event_capture_program` instead, and it is *those two* whose difference
-    // lands in every PTP path delay — so being able to point the same test at them is what turns
-    // "the counters ought to agree" into a number for the pair that matters.
-    #[cfg(feature = "event-program")]
-    let program = rp_pps::event_capture_program();
-    #[cfg(not(feature = "event-program"))]
+    // The reference always runs the 1PPS program: it claims the pin, and what is wanted from it is
+    // an edge to compare the other two against.
     let program = pps_capture_program_wrap_balanced();
+
+    // The other two can run the link's own program instead. They are the pair whose difference
+    // lands in every PTP path delay, and the two-board measurement cannot separate that from the
+    // wire — but one board watching one edge can. `b - c` is the number; `b - a` and `c - a` mix in
+    // the two programs' different tolls and are not comparable across the variants.
+    #[cfg(feature = "event-program")]
+    let watcher_program = rp_pps::event_capture_program();
+    #[cfg(not(feature = "event-program"))]
+    let watcher_program = pps_capture_program_wrap_balanced();
 
     // One claims the pin, two watch it by number. All three stopped.
     let mut a = PpsCapture::<PIO0, 0>::new_stopped(&mut common, sm0, p.PIN_2, &program);
@@ -86,14 +86,14 @@ async fn main(_spawner: Spawner) {
         sm2,
         embassy_rp::pac::PIO0,
         WATCHED_GPIO,
-        &program,
+        &watcher_program,
     );
     let mut c = EventCapture::<PIO0, 3>::new_stopped(
         &mut common,
         sm3,
         embassy_rp::pac::PIO0,
         WATCHED_GPIO,
-        &program,
+        &watcher_program,
     );
 
     // The event program watches for an edge, then declines to look again for a fixed time. A 1PPS
