@@ -336,6 +336,28 @@ static NEXT_EDGE_LOCAL_NS: BlockingMutex<CriticalSectionRawMutex, Cell<Option<i6
 static PIN_LATENESS_NS: BlockingMutex<CriticalSectionRawMutex, Cell<Option<i64>>> =
     BlockingMutex::new(Cell::new(None));
 
+/// The frequency this board asks for on top of what its own estimate says (milli-ppb).
+///
+/// A proportional phase loop on an integrating plant has no standing error against a step, but it
+/// does against a rate: to make a correction at all it must hold a phase error of `rate / Kp`.
+/// The rate here is whatever the clock estimate is getting wrong, and this board's own numbers
+/// show the result directly — the pin sits at a fixed distance from the edge it was asked for
+/// while the loop's error sits at +52 to +79 ns and moves between runs.
+///
+/// The gain is not a choice. For `z^2 - (2 - Kp) z + (1 - Kp + Ki)` a double root — critical
+/// damping — needs `Ki = Kp^2 / 4`, with `Kp = 1 / phase_gain_inv`.
+///
+/// The server does not do this. There the same term costs more than it removes, because what it
+/// integrates is the receiver's second seen through two captures. Here what it integrates is an
+/// exchange that has already been averaged into a clock, and the pin follows that clock to about a
+/// dozen nanoseconds, so the trade is not the same one.
+static FREQ_TRIM_MPPB: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
+    BlockingMutex::new(Cell::new(0));
+
+/// A correction to an estimate, not an estimate. Beyond a few parts per million the crystal, not
+/// the loop, is what has gone wrong.
+const FREQ_TRIM_LIMIT_MPPB: i64 = 5_000_000;
+
 /// How far past our own second to send the `Delay_Req`.
 ///
 /// It is a lever, not a preference. Between the `Sync` arriving and this leaving, the slave sits
@@ -937,7 +959,32 @@ async fn pps_task(
             None => schedule.step(0, 0),
             // Something has, but not enough of it to steer by.
             Some((_, freq_mppb, false)) => schedule.step(freq_mppb, 0),
-            Some((late, freq_mppb, true)) => schedule.advance(freq_mppb, late),
+            Some((late, freq_mppb, true)) => {
+                // The proportional half is the schedule's own; the integral half is a frequency,
+                // because that is what a standing phase error is made of. A nanosecond of phase
+                // held for a second is a part per billion, which is a thousand milli-ppb.
+                //
+                // Only while the proportional half can still act: an error the schedule cannot
+                // correct in one step is one the integral would charge for without the output
+                // moving, and the charge has to come back out afterwards.
+                let cfg = PpsScheduleConfig::default();
+                let saturated = late.abs() > cfg.max_correction_ns * cfg.phase_gain_inv;
+                let trim = FREQ_TRIM_MPPB.lock(|c| {
+                    if !saturated {
+                        let g = cfg.phase_gain_inv;
+                        let next = (c.get() - late * 1_000 / (4 * g * g))
+                            .clamp(-FREQ_TRIM_LIMIT_MPPB, FREQ_TRIM_LIMIT_MPPB);
+                        c.set(next);
+                    }
+                    c.get()
+                });
+                let step = schedule.advance(freq_mppb + trim, late);
+                // Placing the edge outright discards the phase the integral was holding.
+                if step.acquired {
+                    FREQ_TRIM_MPPB.lock(|c| c.set(0));
+                }
+                step
+            }
         };
         if step.acquired {
             info!("PPS placed, corr_ns={}", step.correction_ns);
@@ -982,12 +1029,13 @@ async fn pps_task(
         if edges.is_multiple_of(16) {
             let late = CLOCK.lock(|c| c.borrow().utc_at(step.edge_ns).map(lateness_ns));
             info!(
-                "PPS edges={} word={} corr_ns={} late_ns={} pin_late_ns={}",
+                "PPS edges={} word={} corr_ns={} late_ns={} pin_late_ns={} trim_mppb={}",
                 edges,
                 step.period_word,
                 step.correction_ns,
                 late.unwrap_or(0),
                 PIN_LATENESS_NS.lock(|p| p.get()).unwrap_or(0),
+                FREQ_TRIM_MPPB.lock(|c| c.get()),
             );
         }
     }
