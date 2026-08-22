@@ -74,8 +74,30 @@ pub struct Measurement {
     pub sequence: u16,
 }
 
-/// Turn an exchange into an offset and a path delay.
+/// Turn an exchange into an offset and a path delay, on the assumption that the slave's counter
+/// keeps the master's rate.
+///
+/// It does not, and the assumption has a price that is easy to miss because it is a constant while
+/// the exchange keeps its shape. See [`measure_with_rate`], which is this with the rate given.
 pub fn measure(exchange: &Exchange) -> Result<Measurement, Reject> {
+    measure_with_rate(exchange, 0)
+}
+
+/// The same, told how many parts per billion the slave's counter gains on the master's.
+///
+/// Between `t2` and `t3` the slave is waiting, and it times that wait on its own counter. A
+/// counter that gains reads the wait as longer than it was, and the two-step arithmetic has no way
+/// to tell that apart from the wire: half of the stretch comes out of the path delay and half goes
+/// into the offset. Two hundred milliseconds of turnaround on a crystal two parts per million out
+/// is a couple of hundred nanoseconds of standing error, which is more than everything else the
+/// exchange is trying to measure.
+///
+/// A negative `mean_path_delay_ns` is this, seen: a one-way delay cannot be less than nothing, so
+/// a link short enough for the stretch to overtake it reports one.
+///
+/// The rate is undone over the slave's own wait and nowhere else. `t2` and `t4` are each read once,
+/// by whichever clock owns them, and no interval on either side of them belongs to this.
+pub fn measure_with_rate(exchange: &Exchange, slave_rate_ppb: i64) -> Result<Measurement, Reject> {
     // Every slot has to hold the kind of message it is named for. A `Follow_Up` in the `Sync` slot
     // would still have a timestamp in it, and the arithmetic would produce a number.
     let Body::Sync(_) = exchange.sync.body else {
@@ -122,8 +144,10 @@ pub fn measure(exchange: &Exchange) -> Result<Measurement, Reject> {
     const SCALE: i128 = 65_536;
     let t1 = origin.to_ns() as i128;
     let t2 = exchange.sync_arrived_ns as i128;
-    let t3 = exchange.delay_req_left_ns as i128;
     let t4 = receive.to_ns() as i128;
+    // The slave's wait, as the master's counter would have read it.
+    let waited = exchange.delay_req_left_ns as i128 - exchange.sync_arrived_ns as i128;
+    let t3 = t2 + waited * 1_000_000_000 / (1_000_000_000 + slave_rate_ppb as i128);
 
     // The master's residence and any transparent clock's, as declared on each leg.
     let to_slave = (t2 - t1) * SCALE
@@ -366,6 +390,57 @@ mod tests {
         let m = measure(&exchange(0, 24_000, 16_000)).expect("measures");
         assert_eq!(m.offset_from_master_ns, 4_000);
         assert_eq!(m.mean_path_delay_ns, 20_000);
+    }
+
+    /// An exchange as a slave whose counter gains `rate_ppb` on the master's would time it.
+    ///
+    /// The two scales are set to agree, but for `offset`, at the moment the `Sync` leaves; from
+    /// there the slave's own reading of any elapsed time is stretched by the rate. `path` is the
+    /// one-way delay and `turnaround` is how long the slave holds before asking back, both in the
+    /// master's time.
+    fn drifting_exchange(offset: i64, path: i64, turnaround: i64, rate_ppb: i64) -> Exchange {
+        let t1 = 1_787_180_000_000_000_000i64;
+        let slave_reads = |elapsed: i64| t1 + offset + elapsed + elapsed * rate_ppb / 1_000_000_000;
+        let mut e = exchange(0, 0, 0);
+        e.sync_arrived_ns = slave_reads(path);
+        e.delay_req_left_ns = slave_reads(path + turnaround);
+        e.follow_up = msg(master(), 7, Body::FollowUp(Timestamp::from_ns(t1)));
+        e.delay_resp = msg(
+            master(),
+            9,
+            Body::DelayResp {
+                receive: Timestamp::from_ns(t1 + turnaround + 2 * path),
+                requesting: slave(),
+            },
+        );
+        e
+    }
+
+    #[test]
+    fn a_slave_that_gains_leaves_half_its_turnaround_in_the_offset() {
+        // Two hundred milliseconds of turnaround on a counter 1830 parts per billion fast is 366 ns
+        // of stretch, and the arithmetic splits it: half comes out of the path and half goes into
+        // the offset. The path is what shows it - a one-way delay cannot be shorter than it is, and
+        // with a jumper for a path it goes negative.
+        let e = drifting_exchange(0, 1_000, 200_000_000, 1_830);
+        let m = measure(&e).expect("measures");
+        assert_eq!(m.mean_path_delay_ns, 1_000 - 183, "half out of the path");
+        assert_eq!(m.offset_from_master_ns, 183, "and half into the offset");
+
+        // Told what the slave's counter does, the same four moments give back what they were built
+        // from. Nothing else changes: the rate is undone over the slave's own wait and nowhere else.
+        let m = measure_with_rate(&e, 1_830).expect("measures");
+        assert_eq!(m.mean_path_delay_ns, 1_000);
+        assert_eq!(m.offset_from_master_ns, 0);
+    }
+
+    #[test]
+    fn the_bias_is_proportional_to_the_turnaround() {
+        // Which is what tells it apart from a fixed skew, on the board as well as here.
+        for (turnaround, expected) in [(50_000_000, 45), (200_000_000, 183), (500_000_000, 457)] {
+            let m = measure(&drifting_exchange(0, 1_000, turnaround, 1_830)).expect("measures");
+            assert_eq!(m.offset_from_master_ns, expected, "turnaround {turnaround}");
+        }
     }
 
     #[test]

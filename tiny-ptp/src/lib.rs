@@ -24,7 +24,7 @@
 pub mod e2e;
 pub mod message;
 
-pub use e2e::{Exchange, Measurement, Reject, measure};
+pub use e2e::{Exchange, Measurement, Reject, measure, measure_with_rate};
 pub use message::{
     Body, ClockIdentity, HEADER_LEN, MAX_MESSAGE_LEN, Message, MessageType, PortIdentity,
     Timestamp, VERSION, decode, encode,

@@ -337,7 +337,42 @@ static PIN_LATENESS_NS: BlockingMutex<CriticalSectionRawMutex, Cell<Option<i64>>
     BlockingMutex::new(Cell::new(None));
 
 /// How far past our own second to send the `Delay_Req`.
-const DELAY_REQ_PHASE_NS: i64 = 200_000_000;
+///
+/// It is a lever, not a preference. Between the `Sync` arriving and this leaving, the slave sits
+/// on its own counter, and a counter that differs from the master's by `d` parts stretches that
+/// wait by `d` times its length. The two-step arithmetic splits what that adds: half comes out of
+/// the path delay and half goes into the offset. So the bias is proportional to this number, and
+/// sweeping it is how the mechanism is told apart from a fixed skew.
+///
+/// ```sh
+/// DELAY_REQ_PHASE_MS=50 cargo build --release --bin ntp_client --features ptp-client
+/// ```
+const DELAY_REQ_PHASE_NS: i64 = match option_env!("DELAY_REQ_PHASE_MS") {
+    Some(s) => parse_phase_ms(s) as i64 * 1_000_000,
+    None => 200_000_000,
+};
+
+/// Decimal `&str` to `u32` at compile time, so a typo fails the build.
+const fn parse_phase_ms(s: &str) -> u32 {
+    let bytes = s.as_bytes();
+    assert!(!bytes.is_empty(), "DELAY_REQ_PHASE_MS is empty");
+    let mut value: u32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let digit = bytes[i];
+        assert!(
+            digit >= b'0' && digit <= b'9',
+            "DELAY_REQ_PHASE_MS must be decimal"
+        );
+        value = value * 10 + (digit - b'0') as u32;
+        assert!(
+            value < 1_000,
+            "DELAY_REQ_PHASE_MS must be inside the second"
+        );
+        i += 1;
+    }
+    value
+}
 
 /// The estimate. The link task writes it, the 1PPS task reads it.
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<NtpDiscipline>> =
@@ -709,50 +744,61 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO1, 1>, mut egress: EventCapture<
                         None => warn!("PTP request left without a timestamp"),
                     }
                 }
-                tiny_ptp::e2e::Action::Complete(exchange) => match tiny_ptp::measure(&exchange) {
-                    Ok(m) => {
-                        measured = measured.wrapping_add(1);
-                        // The four moments as well as what they came to. `offset` and `path` are
-                        // sums, and a sum that drifts says nothing about which of its terms did.
-                        let t1 = match exchange.follow_up.body {
-                            tiny_ptp::Body::FollowUp(ts) => ts.to_ns(),
-                            _ => 0,
-                        };
-                        let t4 = match exchange.delay_resp.body {
-                            tiny_ptp::Body::DelayResp { receive, .. } => receive.to_ns(),
-                            _ => 0,
-                        };
-                        info!(
-                            "PTPRAW n={} to_slave={} to_master={} gap={}",
-                            measured,
-                            exchange.sync_arrived_ns - t1,
-                            t4 - exchange.delay_req_left_ns,
-                            exchange.delay_req_left_ns - exchange.sync_arrived_ns,
-                        );
-                        // The sign is the standard's, and it is the opposite of the
-                        // discipline's. `offset_from_master_ns` is how far the slave is *ahead*;
-                        // `observe` is told how far UTC is ahead of local. Since t2 and t3 went in
-                        // as local time, what comes back is exactly local minus the master's UTC,
-                        // and negating it is the whole of the conversion.
-                        let correction_ns = -m.offset_from_master_ns;
-                        // Halfway through the exchange, in the timescale the two moments were
-                        // measured on. Both are local, so the midpoint needs no clock to find.
-                        let at_local_ns =
-                            (exchange.sync_arrived_ns + exchange.delay_req_left_ns) / 2;
-                        if cfg!(feature = "ptp-client") {
-                            CLOCK.lock(|c| c.borrow_mut().observe(at_local_ns, correction_ns));
+                tiny_ptp::e2e::Action::Complete(exchange) => {
+                    // What this board's counter does, handed to the arithmetic that would otherwise
+                    // assume it does nothing. `t2` and `t3` are read on it either side of the wait
+                    // at `DELAY_REQ_PHASE_NS`, so a crystal two parts per million out stretches
+                    // that wait by a few hundred nanoseconds -- half of which the exchange cannot
+                    // tell from the wire, and puts in the offset. The estimate is the one the
+                    // output already steers by, and it is a rate, so the offset's own bias does
+                    // not enter it.
+                    let rate_ppb = CLOCK.lock(|c| c.borrow().drift_ppb());
+                    match tiny_ptp::measure_with_rate(&exchange, rate_ppb) {
+                        Ok(m) => {
+                            measured = measured.wrapping_add(1);
+                            // The four moments as well as what they came to. `offset` and `path` are
+                            // sums, and a sum that drifts says nothing about which of its terms did.
+                            let t1 = match exchange.follow_up.body {
+                                tiny_ptp::Body::FollowUp(ts) => ts.to_ns(),
+                                _ => 0,
+                            };
+                            let t4 = match exchange.delay_resp.body {
+                                tiny_ptp::Body::DelayResp { receive, .. } => receive.to_ns(),
+                                _ => 0,
+                            };
+                            info!(
+                                "PTPRAW n={} to_slave={} to_master={} gap={}",
+                                measured,
+                                exchange.sync_arrived_ns - t1,
+                                t4 - exchange.delay_req_left_ns,
+                                exchange.delay_req_left_ns - exchange.sync_arrived_ns,
+                            );
+                            // The sign is the standard's, and it is the opposite of the
+                            // discipline's. `offset_from_master_ns` is how far the slave is *ahead*;
+                            // `observe` is told how far UTC is ahead of local. Since t2 and t3 went in
+                            // as local time, what comes back is exactly local minus the master's UTC,
+                            // and negating it is the whole of the conversion.
+                            let correction_ns = -m.offset_from_master_ns;
+                            // Halfway through the exchange, in the timescale the two moments were
+                            // measured on. Both are local, so the midpoint needs no clock to find.
+                            let at_local_ns =
+                                (exchange.sync_arrived_ns + exchange.delay_req_left_ns) / 2;
+                            if cfg!(feature = "ptp-client") {
+                                CLOCK.lock(|c| c.borrow_mut().observe(at_local_ns, correction_ns));
+                            }
+                            info!(
+                                "PTP n={} seq={} offset_ns={} path_ns={} rate_ppb={} applied={}",
+                                measured,
+                                m.sequence,
+                                m.offset_from_master_ns,
+                                m.mean_path_delay_ns,
+                                rate_ppb,
+                                cfg!(feature = "ptp-client"),
+                            );
                         }
-                        info!(
-                            "PTP n={} seq={} offset_ns={} path_ns={} applied={}",
-                            measured,
-                            m.sequence,
-                            m.offset_from_master_ns,
-                            m.mean_path_delay_ns,
-                            cfg!(feature = "ptp-client"),
-                        );
+                        Err(reason) => warn!("PTP refused: {}", defmt::Debug2Format(&reason)),
                     }
-                    Err(reason) => warn!("PTP refused: {}", defmt::Debug2Format(&reason)),
-                },
+                }
                 tiny_ptp::e2e::Action::Ignored(reason) => {
                     // A Sync always lands here — its own timestamp is a placeholder, so there is
                     // nothing to do until the Follow_Up. Anything else is a message that did not
@@ -945,6 +991,24 @@ async fn main(spawner: Spawner) {
     info!(
         "ntp_client: asks on GP16/GP17, listens on GP18/GP19, 1PPS on GP6, clk {} Hz",
         clk
+    );
+    // Which measurement is allowed to move the clock, said once and in one place.
+    //
+    // Both keep running whichever way this goes, and both are logged, so a run tells you nothing
+    // about which one it was unless you read the flag on every line. An oscilloscope shows even
+    // less: a client disciplined by the wrong source looks like a client, and hours went into
+    // measuring one that way. The default build is not the one under test, which is the part that
+    // is easy to forget, so it is declared rather than implied.
+    info!(
+        "CLOCK_SOURCE={} (delay_req phase {} ms)",
+        if cfg!(feature = "ptp-client") {
+            "PTP"
+        } else if cfg!(feature = "broadcast-client") {
+            "NTP-broadcast"
+        } else {
+            "NTP-unicast"
+        },
+        DELAY_REQ_PHASE_NS / 1_000_000,
     );
 
     // PIO1: the link, both directions. The serialiser is loaded first because it is pinned to
