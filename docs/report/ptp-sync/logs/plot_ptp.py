@@ -171,8 +171,8 @@ def fig_gap(runs):
 
 # 波形を連続で取った回。1 コマが 1 取り込みで、GIF はこれを並べる。
 TRACES = [
-    ("NTP 駆動", "pair-gif-ntp-trace.csv", "tab:red"),
-    ("PTP 駆動", "pair-gif-ptp-trace.csv", "tab:green"),
+    ("NTP 駆動", "pair-gif2-ntp-trace.csv", "tab:red"),
+    ("PTP 駆動", "pair-gif2-ptp-trace.csv", "tab:green"),
 ]
 
 # `measure_pair.py` が固定している垂直の設定。バイト 0-255 が 10 division にあたる。
@@ -295,8 +295,9 @@ def gif_pair(label, name, colour, out_name):
     lo, hi = min(seen), max(seen)
     pad = (hi - lo) * 0.25 + 0.2
     # コマごとに tight_layout を呼ぶと枠が揺れるので、一度だけ決める。
-    fig.subplots_adjust(left=0.1, right=0.98, top=0.90, bottom=0.09, hspace=0.42)
-    span = max(abs(min(diff)), abs(max(diff))) * 1000
+    fig.subplots_adjust(left=0.11, right=0.98, top=0.90, bottom=0.09, hspace=0.42)
+    lo_d, hi_d = min(diff) * 1000, max(diff) * 1000
+    margin = (hi_d - lo_d) * 0.15 + 20
 
     def render(k):
         ax.clear()
@@ -312,7 +313,8 @@ def gif_pair(label, name, colour, out_name):
         tx.axhline(0, color="0.6", lw=0.8)
         tx.plot(range(k + 1), [d * 1000 for d in diff[: k + 1]], ".-", ms=3, lw=0.8, color=colour)
         tx.set_xlim(-1, len(usable))
-        tx.set_ylim(-span * 0.3, span * 1.25)
+        # データの範囲から取る。0 を基準に取ると、offset が 0 から離れた run で推移が枠外に出る。
+        tx.set_ylim(lo_d - margin, hi_d + margin)
         tx.set_ylabel("client − server (ns)", fontsize=8)
         tx.set_xlabel("取り込み", fontsize=8)
         tx.tick_params(labelsize=7)
