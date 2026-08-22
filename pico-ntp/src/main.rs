@@ -242,6 +242,95 @@ const FRAME_DUMPS: u32 = 3;
 /// Which GPIO carries the receiver's 1PPS.
 const PPS_PIN: usize = 2;
 
+/// The pin the disciplined 1PPS comes out of.
+const PPS_OUT_PIN: u8 = 6;
+
+/// How far our own pulse was from the receiver's, measured at the pads (ns).
+///
+/// The one number the output loop could not previously see. The schedule places edges by adding
+/// period words and has no way to know where they actually came out; a constant between the two —
+/// the output program's own pipeline, the pad, and whatever the capture side adds — is invisible
+/// from inside and stays wherever it is. Two state machines watching the two pins on one counter
+/// measure it directly.
+static PIN_LATENESS_NS: BlockingMutex<CriticalSectionRawMutex, Cell<Option<i64>>> =
+    BlockingMutex::new(Cell::new(None));
+
+/// The most recent value a counter pushed, and the tolls paid before it.
+///
+/// Returns `None` if nothing is queued. Everything older is discarded: an edge from a previous
+/// second is not a measurement of this one.
+fn newest_capture<const SM: usize>(c: &mut EventCapture<'static, PIO1, SM>) -> Option<(u32, u64)> {
+    let mut newest = None;
+    while let Some(raw) = c.try_read() {
+        // `captures()` counts the read that just happened; what `ticks_between` wants is the
+        // tally from before this value was pushed.
+        newest = Some((raw, c.captures().saturating_sub(1)));
+    }
+    newest
+}
+
+/// Pair each of our pulses with the receiver's second and publish the difference.
+///
+/// Both values come from state machines in one block that were started by one write, so the
+/// difference is a time and not two times with different origins. `ticks_between` takes out the
+/// counters' different capture tallies — they fire once a second each, but not the same once.
+#[embassy_executor::task]
+async fn pin_lateness_task(
+    mut gps: EventCapture<'static, PIO1, 2>,
+    mut out: EventCapture<'static, PIO1, 3>,
+) {
+    let mut seen: u32 = 0;
+    loop {
+        // The receiver's second is the reference: wait for it, then let ours settle.
+        //
+        // Keep what the wait returned. It *is* a capture, and taking it leaves the queue empty —
+        // asking for the newest afterwards then finds nothing at all.
+        let waited = gps.wait_edge().await;
+        let mut gps_pair = Some((waited, gps.captures().saturating_sub(1)));
+        Timer::after_millis(20).await;
+        if let Some(newer) = newest_capture(&mut gps) {
+            gps_pair = Some(newer);
+        }
+
+        // The *newest* of each, not the oldest.
+        //
+        // `try_read` takes the front of the FIFO, and the two machines do not start capturing at
+        // the same moment — the output has to be running before there is anything on GP6 at all.
+        // Reading the front pairs this second's reference with an edge from several seconds ago,
+        // and the answer looks like a perfectly steady two-thirds of a second. Measured: `gps` at
+        // capture 4, 5, 6 against `out` at 1, 2, 3.
+        let (Some((gps_raw, gps_captures)), Some((out_raw, out_captures))) =
+            (gps_pair, newest_capture(&mut out))
+        else {
+            // Before the schedule has been fed there is nothing on GP6 to pair with.
+            continue;
+        };
+
+        let ticks = ticks_between(
+            gps_raw,
+            gps_captures,
+            out_raw,
+            out_captures,
+            EVENT_CAPTURE_TOLL_TICKS,
+        );
+        let ns = ticks_to_ns(ticks.unsigned_abs(), clk_sys_freq()) as i64 * ticks.signum();
+        // Ours belongs near the receiver's second, not near the next one. Anything further out is
+        // a pairing that went wrong, and a wrong answer here steers the output.
+        if ns.abs() > 100_000_000 {
+            warn!(
+                "PPSPIN pairing {} ns out, ignored (gps raw={=u32} n={=u64}, out raw={=u32} n={=u64})",
+                ns, gps_raw, gps_captures, out_raw, out_captures
+            );
+            continue;
+        }
+        PIN_LATENESS_NS.lock(|p| p.set(Some(ns)));
+        seen = seen.wrapping_add(1);
+        if seen <= 8 || seen.is_multiple_of(16) {
+            info!("PPSPIN n={} out_minus_gps_ns={}", seen, ns);
+        }
+    }
+}
+
 /// Diagnostic only: ask the receiver for this 1PPS pulse width (ms) at boot, to find out which
 /// excursion at the pin is the pulse.
 ///
@@ -669,6 +758,15 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
         });
         let trusted = SOURCE_TRUSTED.load(Ordering::Relaxed);
 
+        // How late the pulse actually was, if a pin has said so.
+        //
+        // This is the whole difference between placing an edge and controlling one. The computed
+        // figure below is where the schedule *believes* the edge goes, and it drives that to zero
+        // perfectly while the pin sits microseconds away — the constant between belief and pin is
+        // outside the loop, so the loop cannot know it is there. Steering on the measurement puts
+        // it inside.
+        let measured = PIN_LATENESS_NS.lock(|p| p.get());
+
         let step = match utc {
             // The crystal's rate, handed forward rather than left to the phase loop.
             //
@@ -677,6 +775,12 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
             // sit 800 ns off the second, permanently, and the firmware's own `landed_late_ns`
             // reported exactly that. Feeding the rate forward leaves the phase term to correct
             // phase.
+            Some(_) if trusted && measured.is_some() => {
+                schedule.advance(steering_mppb, measured.unwrap())
+            }
+            // Until a pulse has been seen on the pin there is nothing measured to steer by, so
+            // fall back to where the arithmetic says the edge will be. That is enough to get an
+            // output going, which is what the pin watcher needs in order to see anything.
             Some(utc) if trusted => schedule.advance(steering_mppb, pps_lateness_ns(utc)),
             // Nothing to steer by yet: free-run at the nominal second so the FIFO stays fed.
             _ => schedule.step(0, 0),
@@ -695,12 +799,13 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
                 .map(pps_lateness_ns)
                 .unwrap_or(0);
             info!(
-                "PPSOUT edges={} word={} corr_ns={} asked_late_ns={} landed_late_ns={}",
+                "PPSOUT edges={} word={} corr_ns={} asked_late_ns={} landed_late_ns={} pin_late_ns={}",
                 edges,
                 step.period_word,
                 step.correction_ns,
                 utc.map(pps_lateness_ns).unwrap_or(0),
-                landed
+                landed,
+                measured.unwrap_or(i64::MIN)
             );
         }
     }
@@ -1404,6 +1509,8 @@ async fn main(spawner: Spawner) {
         common: mut eth_common,
         sm0: eth_sm,
         sm1: eth_sm1,
+        sm2: watch_sm2,
+        sm3: watch_sm3,
         ..
     } = Pio::new(p.PIO1, Irqs);
     let dma = embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs);
@@ -1427,6 +1534,44 @@ async fn main(spawner: Spawner) {
         p.PIN_19, // TX+
         eth_rx_dma,
         clk_sys_freq(),
+    );
+
+    // The other two state machines in this block watch two pins neither of them drives: the
+    // receiver's 1PPS and our own output.
+    //
+    // This is what closes the loop. Everything else about the output is computed — the schedule
+    // adds period words and believes the edges land where the arithmetic says — and a constant
+    // between that belief and the pin is invisible from inside. Timestamping both pulses on one
+    // counter measures the thing itself: how far our second is from the receiver's, at the pads.
+    //
+    // They go in PIO1 rather than PIO0 because PIO0's four are taken, and they go in the *same*
+    // block as each other because only machines started by one write share an origin. The pins are
+    // driven and claimed elsewhere; reading is not driving, and the input path belongs to the pad.
+    let watcher = eth_common.load_program(&event_capture_program());
+    let mut gps_watch = EventCapture::<PIO1, 2>::new_stopped_shared(
+        watch_sm2,
+        embassy_rp::pac::PIO1,
+        PPS_PIN as u8,
+        &watcher,
+    );
+    let mut out_watch = EventCapture::<PIO1, 3>::new_stopped_shared(
+        watch_sm3,
+        embassy_rp::pac::PIO1,
+        PPS_OUT_PIN,
+        &watcher,
+    );
+    let pulse_blank = event_blank_counts(PPS_BLANK_NS, clk_sys_freq());
+    gps_watch.arm(pulse_blank);
+    out_watch.arm(pulse_blank);
+    start_in_sync(
+        embassy_rp::pac::PIO1,
+        EventCapture::<PIO1, 2>::sm_mask() | EventCapture::<PIO1, 3>::sm_mask(),
+    );
+    gps_watch.drain();
+    out_watch.drain();
+    info!(
+        "watching GP{} and GP{} from PIO1 for the output's own lateness",
+        PPS_PIN, PPS_OUT_PIN
     );
 
     // UART0: the receiver's NMEA.
@@ -1536,6 +1681,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(ntp_task(tx, egress).unwrap());
     spawner.spawn(link_rx_task(eth_rx, arrival).unwrap());
     spawner.spawn(pps_out_task(pps_out, pps_schedule).unwrap());
+    spawner.spawn(pin_lateness_task(gps_watch, out_watch).unwrap());
     // Debug only: a unicast exchange carried over the probe, so a real client can be measured
     // against a link that cannot receive. See `swd_rx`.
     #[cfg(feature = "swd-rx")]
