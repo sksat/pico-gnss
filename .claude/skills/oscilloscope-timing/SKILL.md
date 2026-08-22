@@ -170,6 +170,33 @@ CLI の `phase` は現在の s/div で測る。
   オシロが得意なのは「2 信号の**差**(output−ref)を 1 ショットで ns」まで。第3時計アトリビューション
   (出力の真の揺れ vs 基準の揺れの分離)が要るなら、TIC か 2 台目基準を使う。オシロ単独では差分止まり。
 
+### 11. 波形 block だけが死ぬ。text query は生きているので「繋がっている」と誤読しない
+
+raw socket の session を並行して 2 つ開く (前の run のスクリプトを kill し損ねたまま次を走らせる) と、
+その後 **text query は答えるのに `:WAVeform:DATA?` の block だけが返らなくなる**ことがある。
+症状は `_block()` の先頭 `#` 待ちが timeout。`scope_pair.py` からは全 shot が
+`link lost (TimeoutError)` に見え、信号が消えたのと区別がつかない。
+
+- **切り分け**: `*IDN?` を lazy-flush の作法 (コマンド → pusher → read) で投げる。答えが返るなら
+  instrument は生きていて、壊れているのは block 転送のほうである。
+- **`*RST` では戻らない**。むしろ `:TRIGger:SWEep` が `AUTO` に戻り (罠 #7)、応答パイプラインが
+  1 つでなく 2 つ遅れる状態になって悪化した。長い `drain()`、`:STOP`、`:WAVeform:*` の再設定、
+  session の張り直しをすべて試して戻らなかった。
+- **復帰は VXI-11 の device clear**。`scripts/rigol_vxi11.py` の `RigolVxi11.clear()` を呼べば
+  SCPI の入出力バッファとパーサがプロトコルの層でリセットされ、波形ブロックがまた読める。
+  raw socket 側にこれに当たるものはなく、`scripts/scope_recover.py` は text の整合までは戻せるが
+  ブロックは戻せない (「RECOVERED」と出ても block だけ死んだままのことがある)。
+  **つまり raw socket が block で死んだら VXI-11 に切り替える。** 罠 #10 と向きが逆になる。
+- **予防**: scope を使うスクリプトは同時に 1 つだけ走らせる。次の run の前に
+  `pgrep -f "scope_pai[r]" | xargs -r kill` で確実に落とす (bracket は自分の shell を巻き込まないため)。
+
+### 12. probe-rs が終了すると基板が止まる。scope の測定はその内側で回す
+
+`timeout N probe-rs run` で基板を動かしている場合、N が切れた瞬間に core が止まり、1PPS が消える。
+オシロ側は「no reading」を返すだけなので、原因が scope に見える。
+**測定に必要な時間 (落ち着き + shot 数 × 1 shot の秒数) より N を十分長く取る。**
+`no reading` が出たら、まず `pgrep -f "probe-r[s] run" | wc -l` で基板が生きているかを確かめる。
+
 ## 結果の読み方
 
 - **mean**: 平均オフセット。物理オフセット + 固定スキュー(落とし穴2)。符号は `sig - ref`(負 = sig が先行)。

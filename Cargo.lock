@@ -2101,6 +2101,7 @@ dependencies = [
  "rp-pps",
  "static_cell",
  "tiny-ntp",
+ "tiny-ptp",
 ]
 
 [[package]]
@@ -2520,6 +2521,7 @@ dependencies = [
  "heapless 0.9.3",
  "nmea",
  "pio",
+ "proptest",
  "rp2040-hal",
 ]
 

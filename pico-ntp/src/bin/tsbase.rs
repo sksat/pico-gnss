@@ -65,7 +65,18 @@ async fn main(_spawner: Spawner) {
         sm3,
         ..
     } = Pio::new(p.PIO0, Irqs);
+    // The reference always runs the 1PPS program: it claims the pin, and what is wanted from it is
+    // an edge to compare the other two against.
     let program = pps_capture_program_wrap_balanced();
+
+    // The other two can run the link's own program instead. They are the pair whose difference
+    // lands in every PTP path delay, and the two-board measurement cannot separate that from the
+    // wire — but one board watching one edge can. `b - c` is the number; `b - a` and `c - a` mix in
+    // the two programs' different tolls and are not comparable across the variants.
+    #[cfg(feature = "event-program")]
+    let watcher_program = rp_pps::event_capture_program();
+    #[cfg(not(feature = "event-program"))]
+    let watcher_program = pps_capture_program_wrap_balanced();
 
     // One claims the pin, two watch it by number. All three stopped.
     let mut a = PpsCapture::<PIO0, 0>::new_stopped(&mut common, sm0, p.PIN_2, &program);
@@ -75,15 +86,25 @@ async fn main(_spawner: Spawner) {
         sm2,
         embassy_rp::pac::PIO0,
         WATCHED_GPIO,
-        &program,
+        &watcher_program,
     );
     let mut c = EventCapture::<PIO0, 3>::new_stopped(
         &mut common,
         sm3,
         embassy_rp::pac::PIO0,
         WATCHED_GPIO,
-        &program,
+        &watcher_program,
     );
+
+    // The event program watches for an edge, then declines to look again for a fixed time. A 1PPS
+    // is 100 ms wide, so the blank has to outlast the pulse — a shorter one comes back to a pin
+    // that is still high and captures it a second time.
+    #[cfg(feature = "event-program")]
+    {
+        let blank = rp_pps::event_blank_counts(clk, 200_000_000);
+        b.arm(blank);
+        c.arm(blank);
+    }
 
     // One write: enable all three and restart their dividers on the same cycle.
     let mask = PpsCapture::<PIO0, 0>::sm_mask()

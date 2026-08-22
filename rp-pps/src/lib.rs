@@ -244,9 +244,18 @@ pub fn zero_x_instruction() -> u16 {
 /// Cycles a capture costs [`event_capture_program`], as a whole number of ticks.
 ///
 /// The counter cannot decrement while it is pushing, so every capture loses time. This program is
-/// padded so that what it loses is exactly two ticks, which is a number the caller can add back —
+/// padded so that what it loses is exactly three ticks, which is a number the caller can add back —
 /// see [`crate::TickTimeline::with_toll`].
-pub const EVENT_CAPTURE_TOLL_TICKS: u64 = 2;
+///
+/// Six cycles, and only five of them are in the capture path. The sixth is the one the blanking
+/// spends leaving: its loop is `jmp x--` then `jmp y--`, two cycles to the decrement, and when `Y`
+/// runs out the `jmp y--` falls through and the pin test after it runs before the next `jmp x--`.
+/// Three cycles, one decrement. Counting only the capture path put the constant at two ticks, and
+/// the missing eight nanoseconds a capture went unnoticed for as long as every comparison was
+/// between two counters capturing at the same rate — where it cancels. It stops cancelling against
+/// a schedule, which captures nothing: the 1PPS output loop then reads its own pin as eight
+/// nanoseconds early every second and steers it, for ever.
+pub const EVENT_CAPTURE_TOLL_TICKS: u64 = 3;
 
 /// Blanking counts for a line that stays busy for `ns` after its first edge.
 ///
@@ -296,7 +305,8 @@ pub fn event_capture_program() -> Program<32> {
         "    in x, 32",
         "    push noblock",
         "    mov y, osr", // Y = blanking length
-        "    nop",        // pads the capture to exactly EVENT_CAPTURE_TOLL_TICKS
+        "    nop",        // two of these: see EVENT_CAPTURE_TOLL_TICKS for the cycle they pay for
+        "    nop",
         "blank:",
         "    jmp x-- blank1", // X keeps counting through the blanking
         "    jmp blank1",     // X wrapped: same toll as the low loop
@@ -397,6 +407,12 @@ pub struct PpsEdgeTimeline {
     clk_hz: u32,
     last: Option<u32>,
     edge_ns: u64,
+    /// Whether the next observation is the first since the counter was enabled.
+    ///
+    /// A capture pays its toll *after* pushing its value, so the interval from the counter's start
+    /// to its first capture has no toll in it. Charging one there puts a constant on every edge
+    /// afterwards.
+    at_counter_start: bool,
     /// Ticks the counter loses each time it captures, added back to every interval.
     ///
     /// [`pps_capture_program`] cannot decrement while it is pushing, and neither can
@@ -420,6 +436,7 @@ impl PpsEdgeTimeline {
             clk_hz,
             last: None,
             edge_ns: 0,
+            at_counter_start: false,
             toll,
         }
     }
@@ -447,9 +464,11 @@ impl PpsEdgeTimeline {
         Self {
             clk_hz,
             // Zero is not "no reading yet" here, it is the reading the counter had when it was
-            // enabled. The first capture then measures an interval like any other.
+            // enabled. The first capture then measures an interval like any other — except for the
+            // toll, which that capture has not paid yet at the moment it pushes.
             last: Some(0),
             edge_ns: 0,
+            at_counter_start: true,
             toll,
         }
     }
@@ -460,6 +479,12 @@ impl PpsEdgeTimeline {
         // Ticks first, then nanoseconds: the toll is a tick count, and adding it after the
         // conversion would round it twice.
         let interval_ns = match self.last {
+            // The first interval after the counter's start is the one exception: that capture has
+            // not paid its toll at the moment it pushes.
+            Some(prev) if self.at_counter_start => {
+                self.at_counter_start = false;
+                ticks_to_ns(interval_ticks(prev, raw) as u64, self.clk_hz)
+            }
             Some(prev) => ticks_to_ns(interval_ticks(prev, raw) as u64 + self.toll, self.clk_hz),
             None => 0,
         };
@@ -764,21 +789,117 @@ mod tests {
         probe
     }
 
+    /// Run the assembled capture program and report what one capture really costs the counter.
+    ///
+    /// The counter is `X`, and the only instructions that move it are the two `jmp x--`. Every
+    /// other cycle is one it stands still for. Over a whole number of periods, the difference
+    /// between the cycles that passed and twice the decrements that happened is what the captures
+    /// took, and dividing by the captures gives the toll.
+    ///
+    /// Counting only the instructions of the capture path is what missed a cycle: the blank ends
+    /// on a fall-through, and the fall-through and the pin test after it are two cycles with no
+    /// decrement between them where a loop iteration has one.
+    fn capture_toll_cycles(prog: &Program<32>, blank: u32, high: u32, low: u32) -> u32 {
+        let code: Vec<u16> = prog.code.iter().copied().collect();
+        let (wrap_target, wrap_source) = (prog.wrap.target as usize, prog.wrap.source as usize);
+
+        let (mut pc, mut x, mut y, osr) = (wrap_target, 0u32, 0u32, blank);
+        let (mut cycles, mut decrements, mut captures) = (0u64, 0u64, 0u64);
+        // Measured between captures, not between cycles: the window has to hold whole passes of
+        // the program or the leftover is mistaken for the toll.
+        const SKIP: u64 = 2;
+        const SPAN: u64 = 8;
+        let (mut at_skip, mut at_span) = (None, None);
+
+        while at_span.is_none() {
+            assert!(
+                cycles < 100_000_000,
+                "the pattern never reached {SPAN} captures"
+            );
+            let pin_high = cycles % ((high + low) as u64) < high as u64;
+            let word = code[pc];
+            let next = pc + 1;
+            let mut jumped = None;
+            match word >> 13 {
+                // JMP: condition in 7:5, address in 4:0.
+                0b000 => {
+                    let addr = (word & 0x1f) as usize;
+                    let taken = match (word >> 5) & 0b111 {
+                        0b000 => true,
+                        0b010 => {
+                            let was = x != 0;
+                            x = x.wrapping_sub(1);
+                            decrements += 1;
+                            was
+                        }
+                        0b100 => {
+                            let was = y != 0;
+                            y = y.wrapping_sub(1);
+                            was
+                        }
+                        0b110 => pin_high,
+                        other => panic!("the program grew a jmp condition {other:03b}"),
+                    };
+                    if taken {
+                        jumped = Some(addr);
+                    }
+                }
+                // PUSH/PULL: bit 7 tells them apart. Only the push is reached from the loop.
+                0b100 => {
+                    if word & 0x80 == 0 {
+                        captures += 1;
+                        if captures == SKIP {
+                            at_skip = Some((cycles, decrements));
+                        }
+                        if captures == SKIP + SPAN {
+                            at_span = Some((cycles, decrements));
+                        }
+                    }
+                }
+                // MOV: destination in 7:5, source in 2:0. `nop` assembles to `mov y, y`.
+                0b101 => {
+                    if (word >> 5) & 0b111 == 0b010 && word & 0b111 == 0b111 {
+                        y = osr;
+                    }
+                }
+                // IN, and anything else the program uses, leaves X and Y alone.
+                _ => {}
+            }
+            cycles += 1;
+            pc = match jumped {
+                Some(addr) => addr,
+                None if pc == wrap_source => wrap_target,
+                None => next,
+            };
+        }
+
+        let (c0, d0) = at_skip.expect("fewer captures than the skip");
+        let (c1, d1) = at_span.unwrap();
+        let stood_still = (c1 - c0) - (d1 - d0) * CAPTURE_CYCLES_PER_TICK as u64;
+        assert_eq!(
+            stood_still % SPAN,
+            0,
+            "the toll is not the same at every capture"
+        );
+        (stood_still / SPAN) as u32
+    }
+
     #[test]
     fn the_event_program_pays_a_whole_number_of_ticks_per_capture() {
-        // The capture path is `in`, `push`, `mov` and a `nop`: four cycles in which the counter
-        // does not decrement. At two cycles to the tick that is exactly two ticks, which is a
-        // number the caller can add back. Three would not be.
+        // Derived from the program rather than read off it: the count that was read off it missed
+        // the cycle the blank spends leaving. On the board that cycle was 8 ns a capture, and it
+        // reached the output because the pin loop that steers it compares a counter against a
+        // schedule that never captures, so it never cancelled.
         let p = event_capture_program();
+        // Two patterns, so a toll that depended on how long the line stayed busy would show.
         assert_eq!(
-            EVENT_CAPTURE_TOLL_TICKS * CAPTURE_CYCLES_PER_TICK as u64,
-            4,
-            "the capture path is four cycles"
+            capture_toll_cycles(&p, 20, 10, 200),
+            capture_toll_cycles(&p, 60, 40, 500)
         );
         assert_eq!(
-            p.code.len(),
-            11,
-            "pull, three for the low loop, four for the capture, three for the blank"
+            capture_toll_cycles(&p, 20, 10, 200) as u64,
+            EVENT_CAPTURE_TOLL_TICKS * CAPTURE_CYCLES_PER_TICK as u64,
+            "the toll the caller adds back is the one the program pays"
         );
     }
 
@@ -800,8 +921,10 @@ mod tests {
 
     #[test]
     fn a_timeline_adds_back_what_the_capture_cost() {
-        // One second of ticks at 125 MHz, less the two the capture stopped for. Without the toll
-        // this reads 32 ns short every second, which is a bias and not noise.
+        // One second of ticks at 125 MHz, less the ones the capture stopped for. Without the toll
+        // this reads short every second, which is a bias and not noise. The shortfall comes from
+        // the constants rather than being written out, so a change to the program moves it here
+        // too instead of leaving a number that used to be right.
         let per_second = 125_000_000 / CAPTURE_CYCLES_PER_TICK;
         let mut plain = PpsEdgeTimeline::new(125_000_000);
         let mut tolled = PpsEdgeTimeline::with_toll(125_000_000, EVENT_CAPTURE_TOLL_TICKS);
@@ -809,7 +932,9 @@ mod tests {
         plain.observe(raw);
         tolled.observe(raw);
         let next = raw.wrapping_sub(per_second - EVENT_CAPTURE_TOLL_TICKS as u32);
-        assert_eq!(plain.observe(next).interval_ns, 1_000_000_000 - 32);
+        let toll_ns = (EVENT_CAPTURE_TOLL_TICKS * CAPTURE_CYCLES_PER_TICK as u64 * 1_000_000_000
+            / 125_000_000);
+        assert_eq!(plain.observe(next).interval_ns, 1_000_000_000 - toll_ns);
         assert_eq!(tolled.observe(next).interval_ns, 1_000_000_000);
     }
 

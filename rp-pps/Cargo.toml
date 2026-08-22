@@ -59,3 +59,6 @@ gnssdo = { version = "0.1.0", optional = true }
 # UART read trait. Versions pinned to embassy-rp 0.10's (so the firmware's types unify).
 embassy-sync = { version = "0.7.2", optional = true }
 embedded-io-async = { version = "0.7.0", optional = true }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

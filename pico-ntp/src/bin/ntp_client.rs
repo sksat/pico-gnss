@@ -27,7 +27,11 @@
 #![no_std]
 #![no_main]
 
-use core::cell::RefCell;
+/// Shared with the master's firmware: the port, the identities, and the counter-to-UTC step.
+#[path = "../ptp.rs"]
+pub mod ptp;
+
+use core::cell::{Cell, RefCell};
 
 use defmt::{info, warn};
 use embassy_executor::Spawner;
@@ -37,7 +41,8 @@ use embassy_rp::peripherals::{PIO0, PIO1};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_sync::channel::Channel;
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 
 use pico_10base_t::embassy::{Rx10BaseT, Tx10BaseT};
 use pico_10base_t::frame::{
@@ -51,7 +56,7 @@ use rp_pps::{
     event_capture_program, output_high_cycles, output_period_cycles, ticks_between, ticks_to_ns,
 };
 use tiny_ntp::client::{accept_broadcast, measure, request};
-use tiny_ntp::discipline::{DisciplineConfig, NtpDiscipline};
+use tiny_ntp::discipline::{DisciplineConfig, DisciplineUpdate, NtpDiscipline};
 use tiny_ntp::packet::{Mode, NtpPacket, PACKET_LEN};
 
 use defmt_rtt as _;
@@ -167,7 +172,15 @@ const REQ_LAG_NS: i64 = 1_000_000;
 /// state machine at the same clock, so it is the same number.
 const WIRE_LAG_NS: i64 = 117_800;
 
-const REQ_FRAME_LEN: usize = frame_len(PACKET_LEN);
+/// The longest payload this board sends. A `Delay_Req` is shorter than an NTP packet, but sizing
+/// on the largest of the two keeps the buffers from depending on which protocol happens to be
+/// bigger this week — and a frame that does not fit is refused silently, not loudly.
+const MAX_PAYLOAD: usize = if tiny_ptp::MAX_MESSAGE_LEN > PACKET_LEN {
+    tiny_ptp::MAX_MESSAGE_LEN
+} else {
+    PACKET_LEN
+};
+const REQ_FRAME_LEN: usize = frame_len(MAX_PAYLOAD);
 const REQ_SYMBOL_WORDS: usize = encoded_words(REQ_FRAME_LEN);
 
 /// The question currently outstanding, and when it left.
@@ -193,6 +206,10 @@ struct Outstanding {
 }
 
 /// The pins the two monitors watch: what we send on, and what arrives.
+/// The 1PPS this board puts out, by number: the watcher reads the pin without claiming it, so it
+/// takes the number rather than the peripheral the output machine already holds.
+const PPS_OUT_GPIO: u8 = 6;
+
 const EGRESS_GPIO: u8 = 16;
 const ARRIVAL_GPIO: u8 = 18;
 
@@ -200,11 +217,89 @@ const ARRIVAL_GPIO: u8 = 18;
 ///
 /// Not by software. The counter is running before the bit arrives and is read out afterwards, so
 /// nothing between the pad and here is on the path — no DMA completion, no interrupt, no executor.
-/// What it costs is that it is a *tick* count with no origin, so it is only ever useful as a
-/// difference, and it has to be fed often enough to stay ahead of the counter's wrap.
-static ARRIVAL: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> = BlockingMutex::new(
-    RefCell::new(TickTimeline::with_toll(EVENT_CAPTURE_TOLL_TICKS)),
-);
+/// It has to be fed often enough to stay ahead of the counter's wrap.
+///
+/// Anchored at the counter's start rather than its first capture, so the ticks mean a moment and
+/// not just an interval: PTP has to say *when* a frame arrived, and the counter's own start is
+/// what that moment is measured from.
+static ARRIVAL: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
+    BlockingMutex::new(RefCell::new(TickTimeline::from_counter_start_with_toll(
+        EVENT_CAPTURE_TOLL_TICKS,
+    )));
+
+/// The same, for the pin frames leave by.
+static EGRESS_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
+    BlockingMutex::new(RefCell::new(TickTimeline::from_counter_start_with_toll(
+        EVENT_CAPTURE_TOLL_TICKS,
+    )));
+
+/// A counter value from a pin, as this board's UTC.
+/// The same, for this board's own 1PPS pin.
+static PIN_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
+    BlockingMutex::new(RefCell::new(TickTimeline::from_counter_start_with_toll(
+        EVENT_CAPTURE_TOLL_TICKS,
+    )));
+
+/// How long GP6 stays high, and so how long the watcher must stop looking after an edge.
+const PPS_BLANK_NS: u32 = 200_000_000;
+
+/// A pin's counter value as **local** time, not as UTC.
+///
+/// Deliberately not disciplined. PTP's own arithmetic is what turns the difference between this
+/// board's timescale and the master's into a number, so putting a clock model in front of it would
+/// only mean measuring the model. It would also make the exchange fragile: t2 is converted when a
+/// `Sync` arrives and t3 when the `Delay_Req` leaves, and a step between the two would land in the
+/// path delay as though the wire had got longer.
+///
+/// What comes back is the counter, offset by the one software read this board makes.
+fn ticks_local_ns(ticks: u64) -> Option<i64> {
+    Some(ticks_to_ns(ticks, clk_sys_freq()) as i64)
+}
+
+/// A value from the pin frames leave by, as local time.
+fn egress_local_ns(raw: u32, captures: u64) -> Option<i64> {
+    let ticks = EGRESS_TICKS.lock(|t| t.borrow_mut().observe_with_captures(raw, captures));
+    ticks_local_ns(ticks)
+}
+
+/// The newest value queued on a counter, not the oldest.
+///
+/// `try_read` takes the front of the FIFO. A watcher that has been running longer than the reader
+/// has been asking hands back an edge from several seconds ago, and the difference then looks
+/// steady and wrong rather than noisy and wrong.
+fn newest_capture<const SM: usize>(c: &mut EventCapture<'static, PIO0, SM>) -> Option<(u32, u64)> {
+    let mut newest = None;
+    while let Some(raw) = c.try_read() {
+        newest = Some((raw, c.captures().saturating_sub(1)));
+    }
+    newest
+}
+
+/// A software clock reading on the counters' scale.
+///
+/// [`CLOCK`] is asked about moments and told about them, and every one of those moments has to be
+/// on one scale or the model is built from one and read with another. The 1PPS is placed at
+/// `schedule.edge_ns`, which counts from the write that started the block, so that is the scale —
+/// and [`now_ns`] counts from boot, which is earlier by however long the board spent getting to
+/// that write. Three milliseconds of UART negotiation, measured, and it landed whole on the
+/// output whenever NTP rather than PTP was the source: the clock was built on boot time and read
+/// on counter time.
+///
+/// Granular to a microsecond, like the reading it comes from. What can be timestamped at the pin
+/// should be — [`ticks_local_ns`] is already on this scale — and this is for what cannot.
+fn local_ns() -> i64 {
+    now_ns() - SCHEDULE_ORIGIN_NS.lock(|o| o.get())
+}
+
+/// A PTP message that arrived, and the counter value the pin saw its first bit at.
+#[derive(Clone, Copy)]
+struct PtpArrival {
+    message: tiny_ptp::Message,
+    /// Already on the timeline: the receive task advanced it once, in arrival order.
+    arrived_ticks: u64,
+}
+
+static PTP_IN: Channel<CriticalSectionRawMutex, PtpArrival, 4> = Channel::new();
 
 /// How long the line stays busy after a frame's first bit.
 ///
@@ -212,6 +307,104 @@ static ARRIVAL: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> = 
 /// stops looking for this long, so it timestamps the frame's first bit and not the eight hundred
 /// edges behind it.
 const FRAME_BLANK_NS: u32 = 95_000;
+
+/// Local time at the instant the counters started — for waiting, and nothing else.
+///
+/// The output schedule counts from that write and the executor counts from boot, so waking at the
+/// right moment needs the two related. What must *not* go through here is anything measured: this
+/// is a `now_ns()` read and it is granular to a microsecond, and a microsecond in the wrong place
+/// is where the client's output used to sit.
+static SCHEDULE_ORIGIN_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
+    BlockingMutex::new(Cell::new(0));
+
+/// Local time of the next 1PPS edge the schedule has committed to.
+///
+/// Published so the `Delay_Req` can be sent at a fixed phase of *this board's* second. The far
+/// side timestamps its arrival against a clock disciplined by GPS, so the phase it arrives at is
+/// this board's clock error — the one quantity neither firmware can see about itself.
+///
+/// Only the *wait* uses this, so a microsecond of granularity costs nothing: what is timestamped
+/// is the pin, whenever the frame actually leaves.
+static NEXT_EDGE_LOCAL_NS: BlockingMutex<CriticalSectionRawMutex, Cell<Option<i64>>> =
+    BlockingMutex::new(Cell::new(None));
+
+/// How late GP6 actually rose, against the edge the schedule asked for (ns).
+///
+/// `None` until the pin has been seen once. This is the client's counterpart of the server's own
+/// pin loop: the server watches GP6 against the receiver's second, and this board has no second to
+/// watch against, but it can still ask whether the pulse came out where it was ordered.
+static PIN_LATENESS_NS: BlockingMutex<CriticalSectionRawMutex, Cell<Option<i64>>> =
+    BlockingMutex::new(Cell::new(None));
+
+/// The frequency this board asks for on top of what its own estimate says (milli-ppb).
+///
+/// A proportional phase loop on an integrating plant has no standing error against a step, but it
+/// does against a rate: to make a correction at all it must hold a phase error of `rate / Kp`.
+/// The rate here is whatever the clock estimate is getting wrong, and this board's own numbers
+/// show the result directly — the pin sits at a fixed distance from the edge it was asked for
+/// while the loop's error sits at +52 to +79 ns and moves between runs.
+///
+/// The gain is not a choice. For `z^2 - (2 - Kp) z + (1 - Kp + Ki)` a double root — critical
+/// damping — needs `Ki = Kp^2 / 4`, with `Kp = 1 / phase_gain_inv`.
+///
+/// The server does not do this. There the same term costs more than it removes, because what it
+/// integrates is the receiver's second seen through two captures. Here what it integrates is an
+/// exchange that has already been averaged into a clock, and the pin follows that clock to about a
+/// dozen nanoseconds, so the trade is not the same one.
+static FREQ_TRIM_MPPB: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
+    BlockingMutex::new(Cell::new(0));
+
+/// A correction to an estimate, not an estimate. Beyond a few parts per million the crystal, not
+/// the loop, is what has gone wrong.
+const FREQ_TRIM_LIMIT_MPPB: i64 = 5_000_000;
+
+/// How far past our own second to send the `Delay_Req`.
+///
+/// **As short as the link allows, and for a reason.** Between the `Sync` arriving and this leaving,
+/// the slave sits on its own counter, and a counter that differs from the master's by `d` parts
+/// reads that wait as `d` times its length too long. The two-step arithmetic cannot tell that from
+/// the wire: half of it comes out of the path delay and half goes into the offset, which is what
+/// the slave's clock is set from. Everything about the wait scales with its length, so the wait
+/// should be no longer than something else requires.
+///
+/// What requires anything is the far side's receiver, which decodes one frame before it can look
+/// for the next — the same constraint `PTP_GAP_MS` is set from. Twenty milliseconds is past it.
+///
+/// Measured on the pins, changing only this: at 179 ms of turnaround the two boards' 1PPS sat
+/// 124 ns apart, and at 22 ms they sat 17, 3 and 7 ns apart over three runs. The 200 ms this
+/// started at was chosen to make a diagnostic legible and had nothing else behind it.
+///
+/// Still a lever, because sweeping it is how the mechanism is told apart from a fixed skew:
+///
+/// ```sh
+/// DELAY_REQ_PHASE_MS=200 cargo build --release --bin ntp_client --features ptp-client
+/// ```
+const DELAY_REQ_PHASE_NS: i64 = match option_env!("DELAY_REQ_PHASE_MS") {
+    Some(s) => parse_phase_ms(s) as i64 * 1_000_000,
+    None => 20_000_000,
+};
+
+/// Decimal `&str` to `u32` at compile time, so a typo fails the build.
+const fn parse_phase_ms(s: &str) -> u32 {
+    let bytes = s.as_bytes();
+    assert!(!bytes.is_empty(), "DELAY_REQ_PHASE_MS is empty");
+    let mut value: u32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let digit = bytes[i];
+        assert!(
+            digit >= b'0' && digit <= b'9',
+            "DELAY_REQ_PHASE_MS must be decimal"
+        );
+        value = value * 10 + (digit - b'0') as u32;
+        assert!(
+            value < 1_000,
+            "DELAY_REQ_PHASE_MS must be inside the second"
+        );
+        i += 1;
+    }
+    value
+}
 
 /// The estimate. The link task writes it, the 1PPS task reads it.
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<NtpDiscipline>> =
@@ -271,7 +464,7 @@ fn note(dropped: &mut u32, why: &str, seen: u32) {
 /// Read the link, and hand every NTP packet on it to the estimate.
 #[embassy_executor::task]
 async fn link_task(
-    mut rx: Rx10BaseT<'static, PIO0, 0>,
+    mut rx: Rx10BaseT<'static, PIO1, 0>,
     mut arrival: EventCapture<'static, PIO0, 2>,
 ) {
     let mut words = [0u32; CAPTURE_WORDS];
@@ -291,12 +484,23 @@ async fn link_task(
         // a state machine that was already running. The first value the monitor queued is the first
         // rising edge of the preamble - the frame's first bit - and everything after it is the rest
         // of the frame, which is why the rest is thrown away.
-        let arrived_ns = now_ns() - CAPTURE_NS - RX_LAG_NS;
         // Before the read, for the reason the counter's own documentation gives.
         let arrival_captures = arrival.captures();
         let hw_raw = arrival.try_read();
         let surplus = arrival.drain();
-        let hw_ticks = hw_raw.map(|raw| ARRIVAL.lock(|a| a.borrow_mut().observe(raw)));
+        // One advance per frame, here, in arrival order. The PTP path used to advance the
+        // same timeline again from the other task, which put two observations of one value
+        // on it and let the order depend on which task ran first.
+        let hw_ticks = hw_raw.map(|raw| {
+            ARRIVAL.lock(|a| a.borrow_mut().observe_with_captures(raw, arrival_captures))
+        });
+        // The pin's own value where there is one, which is every frame the monitor kept up with.
+        // The software route works backwards from the DMA completion through two constants and is
+        // what is left when the monitor missed the frame; it is on the same scale, which is the
+        // part that used to be wrong.
+        let arrived_ns = hw_ticks
+            .and_then(ticks_local_ns)
+            .unwrap_or_else(|| local_ns() - CAPTURE_NS - RX_LAG_NS);
         let mut hw_rtt_ticks: Option<i64> = None;
         seen = seen.wrapping_add(1);
 
@@ -320,6 +524,28 @@ async fn link_task(
             note(&mut dropped, "not a UDP datagram", seen);
             continue;
         };
+        // PTP has its own port. All this task does with it is pass the message and the counter
+        // value the pin reported to the task that owns the transmitter — the conversion to UTC is
+        // a 64-bit division, and this task has a link to keep up with.
+        if datagram.dst_port == ptp::PTP_PORT {
+            match (tiny_ptp::decode(datagram.payload), hw_ticks) {
+                (Some(message), Some(arrived_ticks)) => {
+                    if PTP_IN
+                        .try_send(PtpArrival {
+                            message,
+                            arrived_ticks,
+                        })
+                        .is_err()
+                    {
+                        note(&mut dropped, "PTP queue full", seen);
+                    }
+                }
+                (None, _) => note(&mut dropped, "not a PTP message", seen),
+                (_, None) => note(&mut dropped, "PTP without a hardware timestamp", seen),
+            }
+            continue;
+        }
+
         // The beacon goes to the service port; an answer comes back to the port the question left
         // from. Both are ours, and nothing else on this link is.
         if datagram.dst_port != NTP_PORT && datagram.dst_port != SRC_PORT {
@@ -402,7 +628,25 @@ async fn link_task(
         // `measure` worked against the hint we handed it as our own receive time; what the estimate
         // wants is the offset against local time, which is the same number shifted by the hint.
         let offset_ns = measurement.offset_ns + (hint - arrived_ns);
-        let update = CLOCK.lock(|c| c.borrow_mut().observe(arrived_ns, offset_ns));
+        // One source at a time. Both measurements keep being taken and logged whichever way this
+        // is built — what the flag decides is only which of them the clock is allowed to believe,
+        // because two sources steering one estimate is neither of them.
+        let update = if cfg!(feature = "ptp-client") {
+            // Measured and reported, but not believed: the offset is what NTP would have set the
+            // clock to, held against the clock PTP is actually setting.
+            CLOCK.lock(|c| {
+                let c = c.borrow();
+                DisciplineUpdate {
+                    stepped: false,
+                    residual_ns: offset_ns
+                        - (c.utc_at(arrived_ns).unwrap_or(arrived_ns) - arrived_ns),
+                    offset_ns,
+                    drift_ppb: c.drift_ppb(),
+                }
+            })
+        } else {
+            CLOCK.lock(|c| c.borrow_mut().observe(arrived_ns, offset_ns))
+        };
         used = used.wrapping_add(1);
 
         if let Some(ticks) = hw_ticks {
@@ -452,8 +696,37 @@ async fn link_task(
 ///
 /// The transmit timestamp is the whole of the client's state for an exchange: the server echoes it
 /// back untouched and [`measure`] matches on it, so nothing else has to be remembered.
+/// Send one PTP message, and say in this board's UTC when its first bit left the pin.
+///
+/// The return value is t3, and it is measured rather than declared: what goes into the `Delay_Req`
+/// on the wire is a placeholder, because a departure written before the frame is encoded is a claim
+/// about a moment that has not happened.
+async fn send_ptp(
+    tx: &mut Tx10BaseT<'static, PIO1, 1>,
+    egress: &mut EventCapture<'static, PIO0, 3>,
+    msg: &tiny_ptp::Message,
+    ip_id: u16,
+    frame: &mut [u8; REQ_FRAME_LEN],
+    symbols: &mut [u32; REQ_SYMBOL_WORDS],
+) -> Option<i64> {
+    let peer = ptp::Peer {
+        src_mac: SRC_MAC,
+        dst_mac: SERVER_MAC,
+        src_ip: SRC_IP,
+        dst_ip: SERVER_IP,
+    };
+    let len = ptp::build(&peer, msg, ip_id, frame)?;
+    let words = encode_frame(&frame[..len], symbols)?;
+    egress.drain();
+    tx.send(&symbols[..words]).await;
+    let captures = egress.captures();
+    let raw = egress.try_read()?;
+    egress.drain();
+    egress_local_ns(raw, captures)
+}
+
 #[embassy_executor::task]
-async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<'static, PIO0, 3>) {
+async fn ask_task(mut tx: Tx10BaseT<'static, PIO1, 1>, mut egress: EventCapture<'static, PIO0, 3>) {
     // A broadcast client listens and nothing else (RFC 5905 §9.1). With the questions still going
     // out, the clock would be disciplined from both sources and neither could be told apart.
     if cfg!(feature = "broadcast-client") {
@@ -463,17 +736,119 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<
     let mut symbols = [0u32; REQ_SYMBOL_WORDS];
     let mut ip_id: u16 = 0;
     let mut asked: u32 = 0;
+    let mut slave = tiny_ptp::e2e::Slave::new(ptp::port_identity(SRC_MAC));
+    let mut measured: u32 = 0;
 
     loop {
-        Timer::after(Duration::from_secs(POLL_INTERVAL_S)).await;
+        // Serve PTP until the next question is due, rather than once a second alongside it. The
+        // exchange has to close while the two clocks are still where they were when it opened, and
+        // sleeping through a `Follow_Up` would put a whole second of this board's drift between t2
+        // and t3.
+        let deadline = Instant::now() + Duration::from_secs(POLL_INTERVAL_S);
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let Ok(arrival) = with_timeout(remaining, PTP_IN.receive()).await else {
+                break;
+            };
+            let Some(arrived_ns) = ticks_local_ns(arrival.arrived_ticks) else {
+                warn!("PTP arrival before the counters had an origin");
+                continue;
+            };
+            match slave.on_message(arrival.message, arrived_ns) {
+                tiny_ptp::e2e::Action::SendDelayReq(req) => {
+                    // Wait for a fixed phase of our own second before sending.
+                    //
+                    // The moment the frame leaves is timestamped at the pin either way; what this
+                    // buys is that the *far* side, whose clock is disciplined by GPS, sees the
+                    // arrival at a phase that is our clock error plus a constant. That is the one
+                    // number neither board can measure about itself.
+                    if let Some(edge) = NEXT_EDGE_LOCAL_NS.lock(|e| e.get()) {
+                        let target = edge - 1_000_000_000 + DELAY_REQ_PHASE_NS;
+                        let wait = target - now_ns();
+                        if (0..500_000_000).contains(&wait) {
+                            Timer::after(Duration::from_micros((wait / 1000) as u64)).await;
+                        }
+                    }
+                    ip_id = ip_id.wrapping_add(1);
+                    match send_ptp(&mut tx, &mut egress, &req, ip_id, &mut frame, &mut symbols)
+                        .await
+                    {
+                        Some(left_ns) => slave.on_delay_req_sent(left_ns),
+                        None => warn!("PTP request left without a timestamp"),
+                    }
+                }
+                tiny_ptp::e2e::Action::Complete(exchange) => {
+                    // What this board's counter does, handed to the arithmetic that would otherwise
+                    // assume it does nothing. `t2` and `t3` are read on it either side of the wait
+                    // at `DELAY_REQ_PHASE_NS`, so a crystal two parts per million out stretches
+                    // that wait by a few hundred nanoseconds -- half of which the exchange cannot
+                    // tell from the wire, and puts in the offset. The estimate is the one the
+                    // output already steers by, and it is a rate, so the offset's own bias does
+                    // not enter it.
+                    let rate_ppb = CLOCK.lock(|c| c.borrow().drift_ppb());
+                    match tiny_ptp::measure_with_rate(&exchange, rate_ppb) {
+                        Ok(m) => {
+                            measured = measured.wrapping_add(1);
+                            // The four moments as well as what they came to. `offset` and `path` are
+                            // sums, and a sum that drifts says nothing about which of its terms did.
+                            let t1 = match exchange.follow_up.body {
+                                tiny_ptp::Body::FollowUp(ts) => ts.to_ns(),
+                                _ => 0,
+                            };
+                            let t4 = match exchange.delay_resp.body {
+                                tiny_ptp::Body::DelayResp { receive, .. } => receive.to_ns(),
+                                _ => 0,
+                            };
+                            info!(
+                                "PTPRAW n={} to_slave={} to_master={} gap={}",
+                                measured,
+                                exchange.sync_arrived_ns - t1,
+                                t4 - exchange.delay_req_left_ns,
+                                exchange.delay_req_left_ns - exchange.sync_arrived_ns,
+                            );
+                            // The sign is the standard's, and it is the opposite of the
+                            // discipline's. `offset_from_master_ns` is how far the slave is *ahead*;
+                            // `observe` is told how far UTC is ahead of local. Since t2 and t3 went in
+                            // as local time, what comes back is exactly local minus the master's UTC,
+                            // and negating it is the whole of the conversion.
+                            let correction_ns = -m.offset_from_master_ns;
+                            // Halfway through the exchange, in the timescale the two moments were
+                            // measured on. Both are local, so the midpoint needs no clock to find.
+                            let at_local_ns =
+                                (exchange.sync_arrived_ns + exchange.delay_req_left_ns) / 2;
+                            if cfg!(feature = "ptp-client") {
+                                CLOCK.lock(|c| c.borrow_mut().observe(at_local_ns, correction_ns));
+                            }
+                            info!(
+                                "PTP n={} seq={} offset_ns={} path_ns={} rate_ppb={} applied={}",
+                                measured,
+                                m.sequence,
+                                m.offset_from_master_ns,
+                                m.mean_path_delay_ns,
+                                rate_ppb,
+                                cfg!(feature = "ptp-client"),
+                            );
+                        }
+                        Err(reason) => warn!("PTP refused: {}", defmt::Debug2Format(&reason)),
+                    }
+                }
+                tiny_ptp::e2e::Action::Ignored(reason) => {
+                    // A Sync always lands here — its own timestamp is a placeholder, so there is
+                    // nothing to do until the Follow_Up. Anything else is a message that did not
+                    // belong to the exchange it arrived in, and the reason is worth seeing.
+                    if !matches!(arrival.message.body, tiny_ptp::Body::Sync(_)) {
+                        warn!("PTP ignored: {}", defmt::Debug2Format(&reason));
+                    }
+                }
+            }
+        }
 
         let started = now_ns();
         // Before there is a clock, the departure time is a number with no meaning - but it is still
         // the tag the reply is matched on, so a monotonic one does the job and the offset it
         // produces is discarded by the step on the first measurement.
         let departure = CLOCK
-            .lock(|c| c.borrow().utc_at(now_ns()))
-            .unwrap_or_else(now_ns)
+            .lock(|c| c.borrow().utc_at(local_ns()))
+            .unwrap_or_else(local_ns)
             + REQ_LAG_NS;
         let packet = request(departure, POLL_LOG2);
 
@@ -542,22 +917,50 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<
 
 /// Keep GP6 on the second.
 #[embassy_executor::task]
-async fn pps_task(mut out: PpsOutput<'static, PIO1, 0>, mut schedule: PpsSchedule) {
+async fn pps_task(
+    mut out: PpsOutput<'static, PIO0, 0>,
+    mut schedule: PpsSchedule,
+    mut pin: EventCapture<'static, PIO0, 1>,
+) {
     let mut edges: u32 = 0;
+    // The last edge the schedule committed to. `None` until there is one.
+    let mut committed: Option<i64> = None;
+    // The last few edges asked for, so a captured one can be matched to the request that placed
+    // it. The pin is read once per pass and the pass runs a little before the edge it pushes for,
+    // so what has already happened is one or two edges back.
+    let mut asked: [Option<i64>; 4] = [None; 4];
+    let mut asked_at: usize = 0;
 
     loop {
         // Wake in time to have the next word in the FIFO before the state machine reaches for it,
         // which is one edge before the edge that word positions.
-        let push_at = schedule.edge_ns() - PUSH_LEAD_NS;
+        let push_at = SCHEDULE_ORIGIN_NS.lock(|o| o.get()) + schedule.edge_ns() - PUSH_LEAD_NS;
         let now = now_ns();
         if push_at > now {
             Timer::after(Duration::from_micros(((push_at - now) / 1000) as u64)).await;
         }
 
-        let predicted = schedule.predicted_edge_ns();
+        // Steer on the edge that was *committed*, not the one that would happen if nothing were
+        // done about it.
+        //
+        // `predicted_edge_ns` is the nominal second from the last edge. The word actually pushed
+        // moves it — by the phase correction and, far larger, by the frequency term — so nulling
+        // the prediction leaves the real edge off by however much it moved. On this board the
+        // crystal is 1.86 ppm out, and the firmware's own `late_ns` sat at +1847 ns while its
+        // corrections were single-digit: the loop had converged, on the wrong point.
+        // The pad, not the schedule's idea of it.
+        //
+        // What has to land on the second is the edge on GP6, and that comes out of the state
+        // machine and through the pad some fixed time after the schedule's own count reaches it.
+        // The board measures that time — it watches its own pin from the block that drives it —
+        // and until now it only reported it. Steering the schedule's edge onto the second leaves
+        // the pad that much off it, on both boards, and the two do not cancel because the far side
+        // closes its loop on a pin and this one did not.
+        let target = committed.unwrap_or_else(|| schedule.predicted_edge_ns())
+            + PIN_LATENESS_NS.lock(|p| p.get()).unwrap_or(0);
         let state = CLOCK.lock(|c| {
             let c = c.borrow();
-            c.utc_at(predicted)
+            c.utc_at(target)
                 .map(|utc| (lateness_ns(utc), c.drift_ppb() * 1000, c.locked()))
         });
 
@@ -566,12 +969,66 @@ async fn pps_task(mut out: PpsOutput<'static, PIO1, 0>, mut schedule: PpsSchedul
             None => schedule.step(0, 0),
             // Something has, but not enough of it to steer by.
             Some((_, freq_mppb, false)) => schedule.step(freq_mppb, 0),
-            Some((late, freq_mppb, true)) => schedule.advance(freq_mppb, late),
+            Some((late, freq_mppb, true)) => {
+                // The proportional half is the schedule's own; the integral half is a frequency,
+                // because that is what a standing phase error is made of. A nanosecond of phase
+                // held for a second is a part per billion, which is a thousand milli-ppb.
+                //
+                // Only while the proportional half can still act: an error the schedule cannot
+                // correct in one step is one the integral would charge for without the output
+                // moving, and the charge has to come back out afterwards.
+                let cfg = PpsScheduleConfig::default();
+                let saturated = late.abs() > cfg.max_correction_ns * cfg.phase_gain_inv;
+                let trim = FREQ_TRIM_MPPB.lock(|c| {
+                    if !saturated {
+                        let g = cfg.phase_gain_inv;
+                        let next = (c.get() - late * 1_000 / (4 * g * g))
+                            .clamp(-FREQ_TRIM_LIMIT_MPPB, FREQ_TRIM_LIMIT_MPPB);
+                        c.set(next);
+                    }
+                    c.get()
+                });
+                let step = schedule.advance(freq_mppb + trim, late);
+                // Placing the edge outright discards the phase the integral was holding.
+                if step.acquired {
+                    FREQ_TRIM_MPPB.lock(|c| c.set(0));
+                }
+                step
+            }
         };
         if step.acquired {
             info!("PPS placed, corr_ns={}", step.correction_ns);
         }
 
+        // What the pin did with the last request, against what the request was.
+        //
+        // Both numbers count from the write that started this block, so the difference is the
+        // output chain alone: the cycles the state machine spends between reaching its edge and
+        // driving the pad, plus the pad. The client used to carry this as a constant measured on a
+        // rig; here the board measures its own.
+        if let Some((raw, captures)) = newest_capture(&mut pin) {
+            let ticks =
+                PIN_TICKS.lock(|t| t.borrow_mut().observe_with_captures(raw, captures)) as i64;
+            if let Some(at) = ticks_local_ns(ticks as u64) {
+                let nearest = asked
+                    .iter()
+                    .flatten()
+                    .min_by_key(|e| (at - **e).abs())
+                    .copied();
+                if let Some(e) = nearest {
+                    let late = at - e;
+                    if late.abs() < 100_000_000 {
+                        PIN_LATENESS_NS.lock(|p| p.set(Some(late)));
+                    }
+                }
+            }
+        }
+
+        committed = Some(step.edge_ns);
+        asked[asked_at] = Some(step.edge_ns);
+        asked_at = (asked_at + 1) % asked.len();
+        NEXT_EDGE_LOCAL_NS
+            .lock(|e| e.set(Some(SCHEDULE_ORIGIN_NS.lock(|o| o.get()) + step.edge_ns)));
         if !out.set_period(step.period_word) {
             // The output program does not hold the last period on an empty pull, so a dropped push
             // is a dropped pulse rather than a glitch. Say so: it means this task ran late.
@@ -582,11 +1039,13 @@ async fn pps_task(mut out: PpsOutput<'static, PIO1, 0>, mut schedule: PpsSchedul
         if edges.is_multiple_of(16) {
             let late = CLOCK.lock(|c| c.borrow().utc_at(step.edge_ns).map(lateness_ns));
             info!(
-                "PPS edges={} word={} corr_ns={} late_ns={}",
+                "PPS edges={} word={} corr_ns={} late_ns={} pin_late_ns={} trim_mppb={}",
                 edges,
                 step.period_word,
                 step.correction_ns,
-                late.unwrap_or(0)
+                late.unwrap_or(0),
+                PIN_LATENESS_NS.lock(|p| p.get()).unwrap_or(0),
+                FREQ_TRIM_MPPB.lock(|c| c.get()),
             );
         }
     }
@@ -600,33 +1059,73 @@ async fn main(spawner: Spawner) {
         "ntp_client: asks on GP16/GP17, listens on GP18/GP19, 1PPS on GP6, clk {} Hz",
         clk
     );
+    // Which measurement is allowed to move the clock, said once and in one place.
+    //
+    // Both keep running whichever way this goes, and both are logged, so a run tells you nothing
+    // about which one it was unless you read the flag on every line. An oscilloscope shows even
+    // less: a client disciplined by the wrong source looks like a client, and hours went into
+    // measuring one that way. The default build is not the one under test, which is the part that
+    // is easy to forget, so it is declared rather than implied.
+    info!(
+        "CLOCK_SOURCE={} (delay_req phase {} ms)",
+        if cfg!(feature = "ptp-client") {
+            "PTP"
+        } else if cfg!(feature = "broadcast-client") {
+            "NTP-broadcast"
+        } else {
+            "NTP-unicast"
+        },
+        DELAY_REQ_PHASE_NS / 1_000_000,
+    );
 
-    // PIO0: the link, both directions. The serialiser is loaded first because it is pinned to
+    // PIO1: the link, both directions. The serialiser is loaded first because it is pinned to
     // offset zero - `out pc` indexes it by symbol value - so the deserialiser has to land after it.
+    //
+    // The link is here and the *time* is in PIO0, which is the opposite of where they started.
+    // Counters only share an origin inside one block, and the two things that have to share one
+    // are the timestamps PTP takes and the edges the 1PPS puts out. Anything else can go in the
+    // other block; the link does not care what its own counter's origin is.
     let Pio {
-        mut common,
-        sm0,
-        sm1,
-        sm2,
-        sm3,
+        common: mut link_common,
+        sm0: link_rx_sm,
+        sm1: link_tx_sm,
         ..
-    } = Pio::new(p.PIO0, Irqs);
+    } = Pio::new(p.PIO1, Irqs);
     let tx_dma = embassy_rp::dma::Channel::new(p.DMA_CH1, Irqs);
     let tx = Tx10BaseT::new(
-        &mut common,
-        sm1,
+        &mut link_common,
+        link_tx_sm,
         p.PIN_16, // TX−
         p.PIN_17, // TX+
         tx_dma,
         clk,
     );
     let dma = embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs);
-    let rx = Rx10BaseT::new(&mut common, sm0, p.PIN_18, p.PIN_19, dma, clk);
+    let rx = Rx10BaseT::new(&mut link_common, link_rx_sm, p.PIN_18, p.PIN_19, dma, clk);
 
-    // Two counters on the same block, watching the pins the link already uses. They claim nothing:
-    // the serialiser drives GP16 and the deserialiser reads GP18, and both stay theirs.
-    // Loaded once. Two eleven-instruction copies plus the serialiser and deserialiser would not
-    // leave room in the block's 32 instructions.
+    // PIO0: everything that has to agree about when things happened.
+    //
+    // The 1PPS output, and two counters watching the pins the link uses. The counters claim
+    // nothing — the serialiser in the other block drives GP16 and the deserialiser reads GP18, and
+    // both stay theirs — but they are started by the same write as the output, so a frame's
+    // timestamp and an output edge are two points on one scale.
+    //
+    // That is what removes the software clock from the path. It used to sit between the two
+    // blocks: the link's counters were read against `now_ns()` and the output schedule was
+    // anchored on another `now_ns()`, and the microsecond that read is granular to went into the
+    // offset PTP learned — where it does not cancel, unlike in the path delay.
+    let Pio {
+        mut common,
+        sm0: pps_sm,
+        sm1,
+        sm2,
+        sm3,
+        ..
+    } = Pio::new(p.PIO0, Irqs);
+    let high_cycles = output_high_cycles(clk, PPS_PULSE_NS);
+    let initial_period = output_period_cycles(clk, high_cycles);
+    let out = PpsOutput::new_stopped(&mut common, pps_sm, p.PIN_6, high_cycles, initial_period);
+    // Loaded once. Two eleven-instruction copies would not leave room beside the output program.
     let counter = common.load_program(&event_capture_program());
     let mut arrival = EventCapture::<PIO0, 2>::new_stopped_shared(
         sm2,
@@ -640,43 +1139,45 @@ async fn main(spawner: Spawner) {
         EGRESS_GPIO,
         &counter,
     );
+    // GP6 is driven by the output machine and claimed by it. Reading a pin is not driving it, and
+    // the input path belongs to the pad, so a second machine in the same block can watch it — and
+    // has to be in the same block, because only machines started by one write share an origin.
+    let mut pin = EventCapture::<PIO0, 1>::new_stopped_shared(
+        sm1,
+        embassy_rp::pac::PIO0,
+        PPS_OUT_GPIO,
+        &counter,
+    );
     // The program blocks on its first instruction until it has this, so arm before starting.
     let blank = event_blank_counts(FRAME_BLANK_NS, clk);
     arrival.arm(blank);
     egress.arm(blank);
-    // One write, so the two counters are one timebase. Verified on the board: three of these
-    // watching the same edge report the same value for minutes across the counter's wrap.
+    pin.arm(event_blank_counts(PPS_BLANK_NS, clk));
+    // One write: the output and both counters start together, and zero is the same instant for
+    // all three.
     start_in_sync(
         embassy_rp::pac::PIO0,
-        EventCapture::<PIO0, 2>::sm_mask() | EventCapture::<PIO0, 3>::sm_mask(),
+        PpsOutput::<PIO0, 0>::sm_mask()
+            | EventCapture::<PIO0, 1>::sm_mask()
+            | EventCapture::<PIO0, 2>::sm_mask()
+            | EventCapture::<PIO0, 3>::sm_mask(),
     );
-    arrival.drain();
-    egress.drain();
-
-    // PIO1: the 1PPS. The enable is the schedule's one tie to local time, so it is timestamped as
-    // close to the call as this can be written.
-    let Pio {
-        common: mut pps_common,
-        sm0: pps_sm,
-        ..
-    } = Pio::new(p.PIO1, Irqs);
-    let high_cycles = output_high_cycles(clk, PPS_PULSE_NS);
-    let initial_period = output_period_cycles(clk, high_cycles);
-    let out = PpsOutput::new(
-        &mut pps_common,
-        pps_sm,
-        p.PIN_6,
-        high_cycles,
-        initial_period,
-    );
-    let enabled_ns = now_ns();
+    // Zero, not a clock read. The schedule and the timestamps now count from the same write, so
+    // there is nothing to tie them together with and nothing to be wrong by.
     let schedule = PpsSchedule::at_enable(
         clk,
         high_cycles,
         PpsScheduleConfig::default(),
-        enabled_ns,
+        0,
         initial_period,
     );
+    arrival.drain();
+    egress.drain();
+
+    // Only for deciding when to wake up. The schedule counts from the counter's start and the
+    // executor counts from boot, so the two need relating — but a wake-up that is a microsecond
+    // early or late costs nothing, and nothing measured passes through here.
+    SCHEDULE_ORIGIN_NS.lock(|o| o.set(now_ns()));
 
     // Neither `Common` may be dropped. embassy-rp releases a PIO block's pins - resets their
     // FUNCSEL to NULL - once the `Common` and the state machines it handed out are all gone, and
@@ -687,10 +1188,10 @@ async fn main(spawner: Spawner) {
     // consuming a period every second. GP6 reads funcsel 7 at the last line of `main` and 31 two
     // seconds later, driving a pad that is no longer listening.
     core::mem::forget(common);
-    core::mem::forget(pps_common);
+    core::mem::forget(link_common);
 
     spawner.spawn(link_task(rx, arrival).unwrap());
     spawner.spawn(ask_task(tx, egress).unwrap());
-    spawner.spawn(pps_task(out, schedule).unwrap());
+    spawner.spawn(pps_task(out, schedule, pin).unwrap());
     spawner.spawn(pin_watch_task().unwrap());
 }

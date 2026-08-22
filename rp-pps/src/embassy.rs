@@ -180,6 +180,14 @@ impl<'d, PIO: Instance, const SM: usize> EventCapture<'d, PIO, SM> {
         sm.set_config(&cfg);
         // After `set_config`, which writes the whole of `EXECCTRL`.
         set_jmp_pin_unclaimed(pio_regs, SM, gpio);
+        // The program counts `X` down and never loads it, so it starts wherever the block left it.
+        // A counter that is compared against another's has to start where that one does, and
+        // "PIO was just reset so X is zero" is an assumption about the caller's init order rather
+        // than something this code establishes — one tick of difference between two link counters
+        // is eight nanoseconds on every path delay they produce. `SMx_INSTR` executes whether or
+        // not the machine is enabled, which is the only way to set a register the program never
+        // writes.
+        unsafe { sm.exec_instr(crate::zero_x_instruction()) };
         Self {
             sm,
             prog: None,
@@ -432,6 +440,17 @@ impl<'d, PIO: Instance, const SM: usize> TimedPpsCapture<'d, PIO, SM> {
     pub async fn next_edge(&mut self) -> crate::TimedEdge {
         let raw = self.capture.wait_edge().await;
         self.timeline.observe(raw)
+    }
+
+    /// The same, and the raw counter value it came from.
+    ///
+    /// The timed edge is on this counter's own scale. Another state machine's value is not — each
+    /// counter stops for its own captures, so two that started together drift apart in proportion
+    /// to how often each fires. [`crate::ticks_between`] closes that gap, and it needs the raw
+    /// value this edge was made from as its reference point.
+    pub async fn next_edge_with_raw(&mut self) -> (crate::TimedEdge, u32) {
+        let raw = self.capture.wait_edge().await;
+        (self.timeline.observe(raw), raw)
     }
 
     /// Borrow the underlying raw capture (the fine tier) — e.g. for [`PpsCapture::jmp_pin`].

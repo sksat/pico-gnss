@@ -27,6 +27,9 @@ pub struct TickTimeline {
     last_raw: u32,
     /// Ticks since the first observation.
     ticks: u64,
+    /// The state machine's capture tally at the last observation, so the tolls paid by captures
+    /// that were drained rather than read can still be charged.
+    last_captures: u64,
     /// Ticks the counter loses each time it captures, added back on every observation.
     ///
     /// A counter cannot decrement while it is pushing. For a 1PPS that is one capture a second and
@@ -47,6 +50,27 @@ impl TickTimeline {
             started: false,
             last_raw: 0,
             ticks: 0,
+            last_captures: 0,
+            toll,
+        }
+    }
+
+    /// A timeline whose origin is the moment the counter was enabled, not its first capture.
+    ///
+    /// [`with_toll`](Self::with_toll) makes the first observation the origin, which is right when
+    /// the only thing wanted is intervals. It is wrong when the ticks have to mean the same as
+    /// another counter's: state machines started by one [`crate::embassy::start_in_sync`] write all
+    /// hold zero at that instant, so a timeline anchored there is on the same scale as
+    /// [`crate::PpsEdgeTimeline::from_counter_start`] — and that is the scale a capture has to be on
+    /// for `now_from_capture_ns` to turn it into UTC.
+    pub const fn from_counter_start_with_toll(toll: u64) -> Self {
+        Self {
+            // Zero is not "nothing seen yet" here, it is the value the counter held when the write
+            // enabled it. The first capture is an interval from that, like every one after it.
+            started: true,
+            last_raw: 0,
+            ticks: 0,
+            last_captures: 0,
             toll,
         }
     }
@@ -67,6 +91,30 @@ impl TickTimeline {
         // half a wrap: past that, falling a long way and rising a short way look the same.
         self.ticks += self.last_raw.wrapping_sub(raw) as u64 + self.toll;
         self.last_raw = raw;
+        self.ticks
+    }
+
+    /// Take one raw value, knowing how many times the counter has stopped to capture.
+    ///
+    /// [`observe`](Self::observe) charges one toll per call, which is right only when the caller
+    /// reads every capture. A caller that reads one value and drains the rest — which is what
+    /// watching a *frame* means, since every edge in it stops the counter — has skipped tolls that
+    /// were nonetheless paid, and the timeline falls behind by that much every frame. It does not
+    /// look like error: it looks like a clock running slow.
+    ///
+    /// `captures` is the state machine's own tally at the moment `raw` was pushed. What is charged
+    /// is the number of stops since the last observation, however many of them were read.
+    pub fn observe_with_captures(&mut self, raw: u32, captures: u64) -> u64 {
+        if !self.started {
+            self.started = true;
+            self.last_raw = raw;
+            self.last_captures = captures;
+            return 0;
+        }
+        let stops = captures.saturating_sub(self.last_captures);
+        self.ticks += self.last_raw.wrapping_sub(raw) as u64 + self.toll * stops;
+        self.last_raw = raw;
+        self.last_captures = captures;
         self.ticks
     }
 
@@ -101,7 +149,12 @@ pub fn ticks_between(
     later_captures: u64,
     toll: u64,
 ) -> i64 {
-    let counted = earlier.wrapping_sub(later) as i64;
+    // Sign-extended, not widened. `wrapping_sub` on a `u32` widened straight to `i64` is always in
+    // `[0, 2³²)`, so an event that turns out to be *before* the reference comes back as a whole
+    // wrap minus the gap — 68.7 seconds instead of a few hundred nanoseconds. That is not
+    // hypothetical: it happened twice in 164 exchanges on the link, whenever a `Delay_Req` was
+    // captured just before the 1PPS edge it was later measured against.
+    let counted = earlier.wrapping_sub(later) as i32 as i64;
     counted - toll as i64 * (earlier_captures as i64 - later_captures as i64)
 }
 
@@ -183,6 +236,27 @@ mod tests {
     }
 
     #[test]
+    fn an_event_before_the_reference_comes_back_negative() {
+        // The reference is the most recent 1PPS edge; a frame captured just before it is earlier,
+        // not 68 seconds later. Widening a `u32` wrapping subtraction straight to `i64` gave the
+        // latter, and it reached the link: two exchanges in 164 reported a 67.7 s turnaround.
+        let reference: u32 = 1_000_000;
+        let a_microsecond_earlier = reference.wrapping_add(ns_to_ticks(1_000, CLK) as u32);
+        assert_eq!(
+            ticks_between(reference, 5, a_microsecond_earlier, 5, 2),
+            -(ns_to_ticks(1_000, CLK) as i64)
+        );
+    }
+
+    #[test]
+    fn a_reference_and_an_event_either_side_of_a_wrap_still_differ_by_the_gap() {
+        let earlier: u32 = 4;
+        let later: u32 = earlier.wrapping_sub(10);
+        assert_eq!(ticks_between(earlier, 3, later, 3, 2), 10);
+        assert_eq!(ticks_between(later, 3, earlier, 3, 2), -10);
+    }
+
+    #[test]
     fn two_counters_that_have_captured_equally_need_no_correction() {
         // 1000 ticks apart, and each has stopped the same number of times.
         assert_eq!(ticks_between(10_000, 7, 9_000, 7, 2), 1_000);
@@ -230,5 +304,94 @@ mod tests {
         t.observe(raw);
         let ticks = t.observe(raw.wrapping_sub(ns_to_ticks(102_400, CLK) as u32));
         assert_eq!(ticks_to_ns(ticks, CLK), 102_400);
+    }
+
+    #[test]
+    fn a_timeline_anchored_at_the_counter_start_measures_from_the_start() {
+        // Started by one `start_in_sync` write, the counter holds zero at that instant. The very
+        // first capture is therefore already an interval — 0.5 ms after the start, here — and not
+        // an origin that reads zero.
+        let mut t = TickTimeline::from_counter_start_with_toll(0);
+        let elapsed = ns_to_ticks(500_000, CLK);
+        assert_eq!(t.observe(0u32.wrapping_sub(elapsed as u32)), elapsed);
+    }
+
+    #[test]
+    fn a_frame_and_a_pps_on_the_same_start_agree_on_when_they_were() {
+        // The point of anchoring at the start: a frame's counter value has to mean the same thing
+        // as the 1PPS counter's, because it is `now_from_capture_ns` — fed from the 1PPS timeline —
+        // that turns it into UTC. Two counters, same program, same start, same instant.
+        let at_ns = 3_000_000_000; // 3 s in, well past one 68 s wrap of neither
+        let raw = 0u32.wrapping_sub(ns_to_ticks(at_ns, CLK) as u32);
+
+        let mut pps = crate::PpsEdgeTimeline::from_counter_start(CLK);
+        let mut frame = TickTimeline::from_counter_start_with_toll(0);
+
+        assert_eq!(pps.observe(raw).edge_ns, at_ns);
+        assert_eq!(ticks_to_ns(frame.observe(raw), CLK), at_ns);
+    }
+
+    #[test]
+    fn tolls_paid_by_captures_that_were_drained_are_still_charged() {
+        // A frame stops the counter once per edge in it, and the caller reads the first and drains
+        // the rest. Charging one toll per read loses the others, every frame, for as long as the
+        // link is up — which does not read as error, it reads as a clock running slow.
+        let mut t = TickTimeline::from_counter_start_with_toll(2);
+        let elapsed = ns_to_ticks(1_000_000, CLK);
+        // Eight captures went by; one of them is the value being read.
+        assert_eq!(
+            t.observe_with_captures(0u32.wrapping_sub(elapsed as u32), 8),
+            elapsed + 2 * 8
+        );
+    }
+
+    #[test]
+    fn only_the_stops_since_the_last_reading_are_charged() {
+        let mut t = TickTimeline::from_counter_start_with_toll(2);
+        let first = ns_to_ticks(1_000_000, CLK);
+        t.observe_with_captures(0u32.wrapping_sub(first as u32), 4);
+        let second = ns_to_ticks(2_000_000, CLK);
+        assert_eq!(
+            t.observe_with_captures(0u32.wrapping_sub(second as u32), 7),
+            second + 2 * 7
+        );
+    }
+
+    #[test]
+    fn a_capture_tally_that_goes_backwards_charges_nothing_rather_than_wrapping() {
+        // The tally is the state machine's, read across a lock. It should only ever grow, but a
+        // wrapping subtraction on a `u64` that did go backwards would add several thousand years.
+        let mut t = TickTimeline::from_counter_start_with_toll(2);
+        let elapsed = ns_to_ticks(1_000_000, CLK);
+        t.observe_with_captures(0u32.wrapping_sub(elapsed as u32), 9);
+        let later = ns_to_ticks(2_000_000, CLK);
+        assert_eq!(
+            t.observe_with_captures(0u32.wrapping_sub(later as u32), 3),
+            later + 2 * 9
+        );
+    }
+
+    #[test]
+    fn the_first_capture_after_the_start_has_not_paid_its_toll_yet() {
+        // A capture pays its toll *after* pushing, so the interval from the counter's start to the
+        // first capture has none in it. Charging one there is a constant on every edge afterwards,
+        // and it hid behind an equal and opposite off-by-one in the caller.
+        let mut t = TickTimeline::from_counter_start_with_toll(2);
+        let elapsed = ns_to_ticks(1_000_000, CLK);
+        assert_eq!(
+            t.observe_with_captures(0u32.wrapping_sub(elapsed as u32), 0),
+            elapsed
+        );
+    }
+
+    #[test]
+    fn a_capture_that_follows_others_is_charged_for_them() {
+        let mut t = TickTimeline::from_counter_start_with_toll(2);
+        let elapsed = ns_to_ticks(1_000_000, CLK);
+        // Three captures completed before this value was pushed.
+        assert_eq!(
+            t.observe_with_captures(0u32.wrapping_sub(elapsed as u32), 3),
+            elapsed + 6
+        );
     }
 }
