@@ -206,6 +206,10 @@ struct Outstanding {
 }
 
 /// The pins the two monitors watch: what we send on, and what arrives.
+/// The 1PPS this board puts out, by number: the watcher reads the pin without claiming it, so it
+/// takes the number rather than the peripheral the output machine already holds.
+const PPS_OUT_GPIO: u8 = 6;
+
 const EGRESS_GPIO: u8 = 16;
 const ARRIVAL_GPIO: u8 = 18;
 
@@ -230,6 +234,15 @@ static EGRESS_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline
     )));
 
 /// A counter value from a pin, as this board's UTC.
+/// The same, for this board's own 1PPS pin.
+static PIN_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
+    BlockingMutex::new(RefCell::new(TickTimeline::from_counter_start_with_toll(
+        EVENT_CAPTURE_TOLL_TICKS,
+    )));
+
+/// How long GP6 stays high, and so how long the watcher must stop looking after an edge.
+const PPS_BLANK_NS: u32 = 200_000_000;
+
 /// A pin's counter value as **local** time, not as UTC.
 ///
 /// Deliberately not disciplined. PTP's own arithmetic is what turns the difference between this
@@ -247,6 +260,19 @@ fn ticks_local_ns(ticks: u64) -> Option<i64> {
 fn egress_local_ns(raw: u32, captures: u64) -> Option<i64> {
     let ticks = EGRESS_TICKS.lock(|t| t.borrow_mut().observe_with_captures(raw, captures));
     ticks_local_ns(ticks)
+}
+
+/// The newest value queued on a counter, not the oldest.
+///
+/// `try_read` takes the front of the FIFO. A watcher that has been running longer than the reader
+/// has been asking hands back an edge from several seconds ago, and the difference then looks
+/// steady and wrong rather than noisy and wrong.
+fn newest_capture<const SM: usize>(c: &mut EventCapture<'static, PIO0, SM>) -> Option<(u32, u64)> {
+    let mut newest = None;
+    while let Some(raw) = c.try_read() {
+        newest = Some((raw, c.captures().saturating_sub(1)));
+    }
+    newest
 }
 
 /// A PTP message that arrived, and the counter value the pin saw its first bit at.
@@ -274,6 +300,28 @@ const FRAME_BLANK_NS: u32 = 95_000;
 /// is where the client's output used to sit.
 static SCHEDULE_ORIGIN_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
     BlockingMutex::new(Cell::new(0));
+
+/// Local time of the next 1PPS edge the schedule has committed to.
+///
+/// Published so the `Delay_Req` can be sent at a fixed phase of *this board's* second. The far
+/// side timestamps its arrival against a clock disciplined by GPS, so the phase it arrives at is
+/// this board's clock error — the one quantity neither firmware can see about itself.
+///
+/// Only the *wait* uses this, so a microsecond of granularity costs nothing: what is timestamped
+/// is the pin, whenever the frame actually leaves.
+static NEXT_EDGE_LOCAL_NS: BlockingMutex<CriticalSectionRawMutex, Cell<Option<i64>>> =
+    BlockingMutex::new(Cell::new(None));
+
+/// How late GP6 actually rose, against the edge the schedule asked for (ns).
+///
+/// `None` until the pin has been seen once. This is the client's counterpart of the server's own
+/// pin loop: the server watches GP6 against the receiver's second, and this board has no second to
+/// watch against, but it can still ask whether the pulse came out where it was ordered.
+static PIN_LATENESS_NS: BlockingMutex<CriticalSectionRawMutex, Cell<Option<i64>>> =
+    BlockingMutex::new(Cell::new(None));
+
+/// How far past our own second to send the `Delay_Req`.
+const DELAY_REQ_PHASE_NS: i64 = 200_000_000;
 
 /// The estimate. The link task writes it, the 1PPS task reads it.
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<NtpDiscipline>> =
@@ -618,6 +666,19 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO1, 1>, mut egress: EventCapture<
             };
             match slave.on_message(arrival.message, arrived_ns) {
                 tiny_ptp::e2e::Action::SendDelayReq(req) => {
+                    // Wait for a fixed phase of our own second before sending.
+                    //
+                    // The moment the frame leaves is timestamped at the pin either way; what this
+                    // buys is that the *far* side, whose clock is disciplined by GPS, sees the
+                    // arrival at a phase that is our clock error plus a constant. That is the one
+                    // number neither board can measure about itself.
+                    if let Some(edge) = NEXT_EDGE_LOCAL_NS.lock(|e| e.get()) {
+                        let target = edge - 1_000_000_000 + DELAY_REQ_PHASE_NS;
+                        let wait = target - now_ns();
+                        if (0..500_000_000).contains(&wait) {
+                            Timer::after(Duration::from_micros((wait / 1000) as u64)).await;
+                        }
+                    }
                     ip_id = ip_id.wrapping_add(1);
                     match send_ptp(&mut tx, &mut egress, &req, ip_id, &mut frame, &mut symbols)
                         .await
@@ -756,10 +817,19 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO1, 1>, mut egress: EventCapture<
 
 /// Keep GP6 on the second.
 #[embassy_executor::task]
-async fn pps_task(mut out: PpsOutput<'static, PIO0, 0>, mut schedule: PpsSchedule) {
+async fn pps_task(
+    mut out: PpsOutput<'static, PIO0, 0>,
+    mut schedule: PpsSchedule,
+    mut pin: EventCapture<'static, PIO0, 1>,
+) {
     let mut edges: u32 = 0;
     // The last edge the schedule committed to. `None` until there is one.
     let mut committed: Option<i64> = None;
+    // The last few edges asked for, so a captured one can be matched to the request that placed
+    // it. The pin is read once per pass and the pass runs a little before the edge it pushes for,
+    // so what has already happened is one or two edges back.
+    let mut asked: [Option<i64>; 4] = [None; 4];
+    let mut asked_at: usize = 0;
 
     loop {
         // Wake in time to have the next word in the FIFO before the state machine reaches for it,
@@ -796,7 +866,35 @@ async fn pps_task(mut out: PpsOutput<'static, PIO0, 0>, mut schedule: PpsSchedul
             info!("PPS placed, corr_ns={}", step.correction_ns);
         }
 
+        // What the pin did with the last request, against what the request was.
+        //
+        // Both numbers count from the write that started this block, so the difference is the
+        // output chain alone: the cycles the state machine spends between reaching its edge and
+        // driving the pad, plus the pad. The client used to carry this as a constant measured on a
+        // rig; here the board measures its own.
+        if let Some((raw, captures)) = newest_capture(&mut pin) {
+            let ticks =
+                PIN_TICKS.lock(|t| t.borrow_mut().observe_with_captures(raw, captures)) as i64;
+            if let Some(at) = ticks_local_ns(ticks as u64) {
+                let nearest = asked
+                    .iter()
+                    .flatten()
+                    .min_by_key(|e| (at - **e).abs())
+                    .copied();
+                if let Some(e) = nearest {
+                    let late = at - e;
+                    if late.abs() < 100_000_000 {
+                        PIN_LATENESS_NS.lock(|p| p.set(Some(late)));
+                    }
+                }
+            }
+        }
+
         committed = Some(step.edge_ns);
+        asked[asked_at] = Some(step.edge_ns);
+        asked_at = (asked_at + 1) % asked.len();
+        NEXT_EDGE_LOCAL_NS
+            .lock(|e| e.set(Some(SCHEDULE_ORIGIN_NS.lock(|o| o.get()) + step.edge_ns)));
         if !out.set_period(step.period_word) {
             // The output program does not hold the last period on an empty pull, so a dropped push
             // is a dropped pulse rather than a glitch. Say so: it means this task ran late.
@@ -807,11 +905,12 @@ async fn pps_task(mut out: PpsOutput<'static, PIO0, 0>, mut schedule: PpsSchedul
         if edges.is_multiple_of(16) {
             let late = CLOCK.lock(|c| c.borrow().utc_at(step.edge_ns).map(lateness_ns));
             info!(
-                "PPS edges={} word={} corr_ns={} late_ns={}",
+                "PPS edges={} word={} corr_ns={} late_ns={} pin_late_ns={}",
                 edges,
                 step.period_word,
                 step.correction_ns,
-                late.unwrap_or(0)
+                late.unwrap_or(0),
+                PIN_LATENESS_NS.lock(|p| p.get()).unwrap_or(0),
             );
         }
     }
@@ -865,6 +964,7 @@ async fn main(spawner: Spawner) {
     let Pio {
         mut common,
         sm0: pps_sm,
+        sm1,
         sm2,
         sm3,
         ..
@@ -886,15 +986,26 @@ async fn main(spawner: Spawner) {
         EGRESS_GPIO,
         &counter,
     );
+    // GP6 is driven by the output machine and claimed by it. Reading a pin is not driving it, and
+    // the input path belongs to the pad, so a second machine in the same block can watch it — and
+    // has to be in the same block, because only machines started by one write share an origin.
+    let mut pin = EventCapture::<PIO0, 1>::new_stopped_shared(
+        sm1,
+        embassy_rp::pac::PIO0,
+        PPS_OUT_GPIO,
+        &counter,
+    );
     // The program blocks on its first instruction until it has this, so arm before starting.
     let blank = event_blank_counts(FRAME_BLANK_NS, clk);
     arrival.arm(blank);
     egress.arm(blank);
+    pin.arm(event_blank_counts(PPS_BLANK_NS, clk));
     // One write: the output and both counters start together, and zero is the same instant for
     // all three.
     start_in_sync(
         embassy_rp::pac::PIO0,
         PpsOutput::<PIO0, 0>::sm_mask()
+            | EventCapture::<PIO0, 1>::sm_mask()
             | EventCapture::<PIO0, 2>::sm_mask()
             | EventCapture::<PIO0, 3>::sm_mask(),
     );
@@ -928,6 +1039,6 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(link_task(rx, arrival).unwrap());
     spawner.spawn(ask_task(tx, egress).unwrap());
-    spawner.spawn(pps_task(out, schedule).unwrap());
+    spawner.spawn(pps_task(out, schedule, pin).unwrap());
     spawner.spawn(pin_watch_task().unwrap());
 }
