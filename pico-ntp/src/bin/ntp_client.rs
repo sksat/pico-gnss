@@ -360,18 +360,28 @@ const FREQ_TRIM_LIMIT_MPPB: i64 = 5_000_000;
 
 /// How far past our own second to send the `Delay_Req`.
 ///
-/// It is a lever, not a preference. Between the `Sync` arriving and this leaving, the slave sits
-/// on its own counter, and a counter that differs from the master's by `d` parts stretches that
-/// wait by `d` times its length. The two-step arithmetic splits what that adds: half comes out of
-/// the path delay and half goes into the offset. So the bias is proportional to this number, and
-/// sweeping it is how the mechanism is told apart from a fixed skew.
+/// **As short as the link allows, and for a reason.** Between the `Sync` arriving and this leaving,
+/// the slave sits on its own counter, and a counter that differs from the master's by `d` parts
+/// reads that wait as `d` times its length too long. The two-step arithmetic cannot tell that from
+/// the wire: half of it comes out of the path delay and half goes into the offset, which is what
+/// the slave's clock is set from. Everything about the wait scales with its length, so the wait
+/// should be no longer than something else requires.
+///
+/// What requires anything is the far side's receiver, which decodes one frame before it can look
+/// for the next — the same constraint `PTP_GAP_MS` is set from. Twenty milliseconds is past it.
+///
+/// Measured on the pins, changing only this: at 179 ms of turnaround the two boards' 1PPS sat
+/// 124 ns apart, and at 22 ms they sat 17, 3 and 7 ns apart over three runs. The 200 ms this
+/// started at was chosen to make a diagnostic legible and had nothing else behind it.
+///
+/// Still a lever, because sweeping it is how the mechanism is told apart from a fixed skew:
 ///
 /// ```sh
-/// DELAY_REQ_PHASE_MS=50 cargo build --release --bin ntp_client --features ptp-client
+/// DELAY_REQ_PHASE_MS=200 cargo build --release --bin ntp_client --features ptp-client
 /// ```
 const DELAY_REQ_PHASE_NS: i64 = match option_env!("DELAY_REQ_PHASE_MS") {
     Some(s) => parse_phase_ms(s) as i64 * 1_000_000,
-    None => 200_000_000,
+    None => 20_000_000,
 };
 
 /// Decimal `&str` to `u32` at compile time, so a typo fails the build.
