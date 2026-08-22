@@ -83,6 +83,9 @@ pub fn measure(exchange: &Exchange) -> Result<Measurement, Reject> {
     measure_with_rate(exchange, 0)
 }
 
+/// The widest rate the correction will believe: ten percent, which no clock this is for is.
+const MAX_RATE_PPB: i128 = 100_000_000;
+
 /// The same, told how many parts per billion the slave's counter gains on the master's.
 ///
 /// Between `t2` and `t3` the slave is waiting, and it times that wait on its own counter. A
@@ -146,8 +149,13 @@ pub fn measure_with_rate(exchange: &Exchange, slave_rate_ppb: i64) -> Result<Mea
     let t2 = exchange.sync_arrived_ns as i128;
     let t4 = receive.to_ns() as i128;
     // The slave's wait, as the master's counter would have read it.
+    //
+    // The rate is bounded before it divides. A crystal is parts per million out and an estimate
+    // that says otherwise is a broken estimate, not a fast crystal — and at minus one part per one
+    // the divisor is zero, which is a panic on a board with nobody to catch it.
+    let rate = (slave_rate_ppb as i128).clamp(-MAX_RATE_PPB, MAX_RATE_PPB);
     let waited = exchange.delay_req_left_ns as i128 - exchange.sync_arrived_ns as i128;
-    let t3 = t2 + waited * 1_000_000_000 / (1_000_000_000 + slave_rate_ppb as i128);
+    let t3 = t2 + waited * 1_000_000_000 / (1_000_000_000 + rate);
 
     // The master's residence and any transparent clock's, as declared on each leg.
     let to_slave = (t2 - t1) * SCALE
@@ -432,6 +440,21 @@ mod tests {
         let m = measure_with_rate(&e, 1_830).expect("measures");
         assert_eq!(m.mean_path_delay_ns, 1_000);
         assert_eq!(m.offset_from_master_ns, 0);
+    }
+
+    #[test]
+    fn an_impossible_rate_is_bounded_rather_than_believed() {
+        // Minus one part per one would put a zero under the division. Nothing is expected to reach
+        // this; it is here so that a discipline that has come apart cannot take the board with it.
+        let e = drifting_exchange(0, 1_000, 200_000_000, 1_830);
+        for rate in [-1_000_000_000, i64::MIN, i64::MAX, 999_999_999_999] {
+            let m = measure_with_rate(&e, rate).expect("measures");
+            assert_eq!(
+                m,
+                measure_with_rate(&e, rate.signum() * 100_000_000).expect("measures"),
+                "rate {rate} is the bound"
+            );
+        }
     }
 
     #[test]
