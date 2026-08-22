@@ -54,6 +54,14 @@ broadcast-client = []
 # beside the one that is.
 ptp-client = []
 
+# Builds `tsbase` with the link's own capture program instead of the 1PPS one.
+#
+# The two link counters are the pair whose disagreement lands in every PTP path delay, and the
+# two-board measurement cannot separate that from the wire. Pointing both at one physical edge on
+# one board can, and needs no change to the wiring — a state machine may watch a pin it has not
+# claimed.
+event-program = []
+
 # Builds the on-target benchmark binary. It needs no extra dependencies — the flag exists so a
 # normal build does not produce a second firmware image that would be easy to flash by accident.
 bench = []

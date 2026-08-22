@@ -182,7 +182,11 @@ raw socket の session を並行して 2 つ開く (前の run のスクリプ�
 - **`*RST` では戻らない**。むしろ `:TRIGger:SWEep` が `AUTO` に戻り (罠 #7)、応答パイプラインが
   1 つでなく 2 つ遅れる状態になって悪化した。長い `drain()`、`:STOP`、`:WAVeform:*` の再設定、
   session の張り直しをすべて試して戻らなかった。
-- **復帰は電源の再投入**。ソフトから戻す手は見つかっていない。
+- **復帰は VXI-11 の device clear**。`scripts/rigol_vxi11.py` の `RigolVxi11.clear()` を呼べば
+  SCPI の入出力バッファとパーサがプロトコルの層でリセットされ、波形ブロックがまた読める。
+  raw socket 側にこれに当たるものはなく、`scripts/scope_recover.py` は text の整合までは戻せるが
+  ブロックは戻せない (「RECOVERED」と出ても block だけ死んだままのことがある)。
+  **つまり raw socket が block で死んだら VXI-11 に切り替える。** 罠 #10 と向きが逆になる。
 - **予防**: scope を使うスクリプトは同時に 1 つだけ走らせる。次の run の前に
   `pgrep -f "scope_pai[r]" | xargs -r kill` で確実に落とす (bracket は自分の shell を巻き込まないため)。
 

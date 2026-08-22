@@ -32,7 +32,9 @@ use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_time::{Duration, Timer};
 
 use rp_pps::embassy::{EventCapture, PpsCapture, set_capture_polarity, start_in_sync};
-use rp_pps::{PpsPolarity, TickTimeline, pps_capture_program_wrap_balanced, ticks_to_ns};
+#[cfg(not(feature = "event-program"))]
+use rp_pps::pps_capture_program_wrap_balanced;
+use rp_pps::{PpsPolarity, TickTimeline, ticks_to_ns};
 
 use defmt_rtt as _;
 use panic_probe as _;
@@ -65,6 +67,15 @@ async fn main(_spawner: Spawner) {
         sm3,
         ..
     } = Pio::new(p.PIO0, Irqs);
+    // Which program the three counters run.
+    //
+    // The balanced 1PPS program is the default and is what the original question was about. The
+    // link's counters run `event_capture_program` instead, and it is *those two* whose difference
+    // lands in every PTP path delay — so being able to point the same test at them is what turns
+    // "the counters ought to agree" into a number for the pair that matters.
+    #[cfg(feature = "event-program")]
+    let program = rp_pps::event_capture_program();
+    #[cfg(not(feature = "event-program"))]
     let program = pps_capture_program_wrap_balanced();
 
     // One claims the pin, two watch it by number. All three stopped.
@@ -84,6 +95,16 @@ async fn main(_spawner: Spawner) {
         WATCHED_GPIO,
         &program,
     );
+
+    // The event program watches for an edge, then declines to look again for a fixed time. A 1PPS
+    // is 100 ms wide, so the blank has to outlast the pulse — a shorter one comes back to a pin
+    // that is still high and captures it a second time.
+    #[cfg(feature = "event-program")]
+    {
+        let blank = rp_pps::event_blank_counts(clk, 200_000_000);
+        b.arm(blank);
+        c.arm(blank);
+    }
 
     // One write: enable all three and restart their dividers on the same cycle.
     let mask = PpsCapture::<PIO0, 0>::sm_mask()
