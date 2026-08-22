@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # /// script
-# dependencies = ["matplotlib", "numpy"]
+# dependencies = ["matplotlib", "numpy", "pillow"]
 # ///
 """レポート `docs/report/ptp-sync/` の図と数値を作る。
 
@@ -18,7 +18,9 @@ import sys
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.animation as animation  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.transforms as transforms  # noqa: E402
 import numpy as np  # noqa: E402
 
 matplotlib.rcParams["font.family"] = ["Noto Sans CJK JP", "DejaVu Sans"]
@@ -167,6 +169,165 @@ def fig_gap(runs):
     print(f"  residual d at each gap: {', '.join(f'{r:+.1f}' for r in residual)} ns")
 
 
+# 波形を連続で取った回。1 コマが 1 取り込みで、GIF はこれを並べる。
+TRACES = [
+    ("NTP 駆動", "pair-gif-ntp-trace.csv", "tab:red"),
+    ("PTP 駆動", "pair-gif-ptp-trace.csv", "tab:green"),
+]
+
+# `measure_pair.py` が固定している垂直の設定。バイト 0-255 が 10 division にあたる。
+VOLTS_PER_BYTE = 10.0 / 255.0
+CENTRE_VOLTS = 1.5
+
+# 画面に並べる 3 本。オシロと同じ順に、上から。
+LANES = [
+    (1, 10.0, "#b8860b", "CH1  GNSS 受信機の 1PPS", "active low なので秒は立ち下がり"),
+    (3, 5.0, "tab:purple", "CH3  Pico server の GP6", "GPS で規律した秒"),
+    (4, 0.0, "tab:blue", "CH4  Pico client の GP6", "リンク越しに渡された秒"),
+]
+
+
+def read_trace(name):
+    """`measure_pair.py trace` の CSV を frames[i][ch] = ボルトの配列 として読む。"""
+    frames, xinc = {}, None
+    with open(os.path.join(RAW, name)) as f:
+        for line in f:
+            if line.startswith("#"):
+                if "xinc_ns=" in line:
+                    xinc = float(line.split("xinc_ns=")[1].split()[0])
+                continue
+            head, _, rest = line.partition(",")
+            ch, _, samples = rest.partition(",")
+            try:
+                b = np.array([int(v) for v in samples.split(",")], dtype=float)
+            except ValueError:
+                continue  # 書き込み途中の最終行
+            if len(b) < 100:
+                continue
+            frames.setdefault(int(head), {})[int(ch)] = b * VOLTS_PER_BYTE - CENTRE_VOLTS
+    return frames, xinc
+
+
+def _cross(v, falling):
+    """しきい値はその波形の中点に取る。
+
+    固定の 1.65 V にしない: 縦の設定は run ごとに効いたり効かなかったりして、バイトと電圧の
+    対応が変わる。信号は 3.3 V のロジックなので、自分の最小と最大の真ん中を渡る点が
+    そのままエッジである。
+    """
+    lo, hi = float(np.min(v)), float(np.max(v))
+    if hi - lo < 0.5:  # 平ら: この channel にエッジは無い
+        return None
+    level = (lo + hi) / 2
+    for i in range(1, len(v)):
+        if falling and v[i - 1] >= level > v[i]:
+            return i - 1 + (v[i - 1] - level) / (v[i - 1] - v[i])
+        if not falling and v[i - 1] < level <= v[i]:
+            return i - 1 + (level - v[i - 1]) / (v[i] - v[i - 1])
+    return None
+
+
+def _edges(frame, xinc):
+    """受信機の秒 (CH1 の立ち下がり) を 0 とした、2 枚の GP6 の位置 (µs)。"""
+    ref = _cross(frame[1], True)
+    if ref is None:
+        return None, None, None
+    out = []
+    for ch in (3, 4):
+        e = _cross(frame[ch], False)
+        out.append(None if e is None else (e - ref) * xinc / 1000.0)
+    return ref, out[0], out[1]
+
+
+def _draw(ax, frame, xinc, ref, server_us, client_us):
+    n = len(frame[1])
+    x = (np.arange(n) - ref) * xinc / 1000.0
+    at = transforms.blended_transform_factory(ax.transAxes, ax.transData)
+    for ch, base, colour, name, sub in LANES:
+        ax.plot(x, frame[ch] + base, lw=1.2, color=colour)
+        ax.text(0.012, base + 4.3, name, fontsize=9, color=colour, va="top", transform=at)
+        ax.text(0.012, base + 2.9, sub, fontsize=7.5, color="0.35", va="top", transform=at)
+    ax.axvline(0, color="0.35", lw=1.0, ls="--")
+    ax.text(0, 14.6, "秒境界", fontsize=8.5, ha="center", color="0.25")
+    for value, base, colour in ((server_us, 5.0, "tab:purple"), (client_us, 0.0, "tab:blue")):
+        if value is None:
+            continue
+        ax.annotate(
+            "",
+            xy=(value, base + 1.6),
+            xytext=(0, base + 1.6),
+            arrowprops=dict(arrowstyle="<->", color=colour, lw=1.0),
+        )
+        ax.text(
+            value / 2,
+            base + 1.8,
+            f"{value * 1000:+.0f} ns",
+            fontsize=8.5,
+            color=colour,
+            ha="center",
+        )
+    ax.set_ylim(-1.2, 15.6)
+    ax.set_yticks([])
+    ax.set_xlabel("秒境界からの時間 (µs)")
+
+
+def gif_pair(label, name, colour, out_name):
+    """1 コマ 1 取り込みで並べる。1 枚では見えない揺れが見える。"""
+    frames, xinc = read_trace(name)
+    usable = []
+    for i in sorted(frames):
+        if len(frames[i]) < 3:
+            continue
+        ref, s, c = _edges(frames[i], xinc)
+        if ref is not None and s is not None and c is not None:
+            usable.append((frames[i], ref, s, c))
+    if not usable:
+        print(f"{name}: 使える取り込みが無い", file=sys.stderr)
+        return
+
+    fig, (ax, tx) = plt.subplots(
+        2, 1, figsize=(8.4, 6.0), dpi=80, gridspec_kw={"height_ratios": [3, 1.1]}
+    )
+    ss = [s for _, _, s, _ in usable]
+    cs = [c for _, _, _, c in usable]
+    diff = [c - s for s, c in zip(ss, cs)]
+    seen = ss + cs
+    lo, hi = min(seen), max(seen)
+    pad = (hi - lo) * 0.25 + 0.2
+    # コマごとに tight_layout を呼ぶと枠が揺れるので、一度だけ決める。
+    fig.subplots_adjust(left=0.1, right=0.98, top=0.90, bottom=0.09, hspace=0.42)
+    span = max(abs(min(diff)), abs(max(diff))) * 1000
+
+    def render(k):
+        ax.clear()
+        tx.clear()
+        frame, ref, s, c = usable[k]
+        _draw(ax, frame, xinc, ref, s, c)
+        ax.set_xlim(lo - pad, hi + pad)
+        ax.set_title(
+            f"{label}   取り込み {k + 1}/{len(usable)}   "
+            f"client − server {(c - s) * 1000:+.0f} ns",
+            fontsize=10,
+        )
+        tx.axhline(0, color="0.6", lw=0.8)
+        tx.plot(range(k + 1), [d * 1000 for d in diff[: k + 1]], ".-", ms=3, lw=0.8, color=colour)
+        tx.set_xlim(-1, len(usable))
+        tx.set_ylim(-span * 0.3, span * 1.25)
+        tx.set_ylabel("client − server (ns)", fontsize=8)
+        tx.set_xlabel("取り込み", fontsize=8)
+        tx.tick_params(labelsize=7)
+        tx.grid(alpha=0.3)
+
+    anim = animation.FuncAnimation(fig, render, frames=len(usable), interval=200)
+    path = os.path.join(OUT, out_name)
+    anim.save(path, writer=animation.PillowWriter(fps=5))
+    plt.close(fig)
+    print(
+        f"saved {path} ({len(usable)} frames, {os.path.getsize(path) / 1e6:.1f} MB)  "
+        f"mean {st.mean(diff) * 1000:+.1f} ns  sd {st.pstdev(diff) * 1000:.1f}"
+    )
+
+
 def main():
     if not os.path.isdir(RAW):
         print(f"生データが見つからない: {RAW}", file=sys.stderr)
@@ -189,6 +350,13 @@ def main():
         fig_quantisation(present)
         fig_gap(present)
     print(f"quantisation floor: sigma = {QUANTISATION_FLOOR_NS:.3f} ns (tick {TICK_NS:g} ns)")
+
+    for label, name, colour in TRACES:
+        if os.path.exists(os.path.join(RAW, name)):
+            gif_pair(label, name, colour,
+                     "fig-scope-" + ("ntp" if "ntp" in name else "ptp") + ".gif")
+        else:
+            print(f"{name} が無いので GIF は飛ばす", file=sys.stderr)
 
 
 if __name__ == "__main__":

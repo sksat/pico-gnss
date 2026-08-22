@@ -278,6 +278,31 @@ server 自身の GP6 は受信機に対して NTP 駆動で −2046.7 ± 7.3 ns�
 **2 枚の板の 1PPS の差は 71.5 µs から 0.50 µs へ、jitter は 1008 ns から 73 ns へ縮んだ。**
 offset で 143 倍、jitter で 14 倍である。
 
+同じ 3 本を、連続した 110 取り込みぶん並べたのが次の 2 つである。
+上段が波形と 2 本の矢印、下段がそのコマまでの client − server の推移で、1 コマが 1 取り込みに
+あたる。横軸の幅が 2 つで違うことに注意する — NTP のほうは 100 µs、PTP のほうは 4 µs である。
+
+![NTP 駆動](fig-scope-ntp.gif)
+
+![PTP 駆動](fig-scope-ptp.gif)
+
+同じ描き方で、client の青が受信機の秒からどれだけ離れたところに立つかが変わる。
+
+### offset は run をまたぐと動く。jitter は動かない
+
+GIF の 2 つは、上の表とは別の run である。
+PTP 駆動のこの run では client − server が **+1746 ± 71.3 ns** で、表の −499 ± 72.7 ns とは
+2.2 µs 違う。
+
+**jitter はどちらも 71〜73 ns で変わらない。**
+動いているのは offset のほうで、その出どころは server 自身の出力である。同じ server バイナリの
+GP6 が、受信機の秒に対して run ごとに −2046 / −2195 / −2440 / −2546 ns と 0.5 µs 動いている。
+client は PTP でその server に追随するので、2 枚の差にはそれぞれの出力チェーンの座り方の違いが
+そのまま出る。
+
+つまり **PTP が渡した時刻の再現性は jitter のほうに現れていて、offset のほうには両端の出力
+チェーンが乗っている。** 前者は 70 ns、後者は run をまたぐと µs で動く。
+
 時間軸が違うのは、NTP 駆動の 71 µs が 5 µs/div の窓 (50 µs) に入らないためである。
 50 µs/div は 1 sample が 500 ns なので、同じ PTP 駆動を両方で測って確かめた:
 50 µs/div では −979.8 ± 111.0 ns、5 µs/div では −499.3 ± 72.7 ns で、差はちょうど 1 sample ぶんに
@@ -445,6 +470,8 @@ uv run docs/report/ptp-sync/logs/plot_ptp.py
 
 `fig-quantisation.png` は 3 つの gap の報告値のヒストグラムで、8 ns 格子を細線で重ねてある。
 `fig-gap.png` は報告値と折り返し時間の関係、および `δ` の 2 通りの推定である。
+`fig-scope-ntp.gif` と `fig-scope-ptp.gif` は、連続した 110 取り込みを 1 コマずつ並べたもので、
+`measure_pair.py trace` が書き出した生サンプルから描いている。
 
 オシロの取り込みはこの回から `measure_pair.py` を使う。
 
