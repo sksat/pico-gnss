@@ -275,6 +275,22 @@ fn newest_capture<const SM: usize>(c: &mut EventCapture<'static, PIO0, SM>) -> O
     newest
 }
 
+/// A software clock reading on the counters' scale.
+///
+/// [`CLOCK`] is asked about moments and told about them, and every one of those moments has to be
+/// on one scale or the model is built from one and read with another. The 1PPS is placed at
+/// `schedule.edge_ns`, which counts from the write that started the block, so that is the scale —
+/// and [`now_ns`] counts from boot, which is earlier by however long the board spent getting to
+/// that write. Three milliseconds of UART negotiation, measured, and it landed whole on the
+/// output whenever NTP rather than PTP was the source: the clock was built on boot time and read
+/// on counter time.
+///
+/// Granular to a microsecond, like the reading it comes from. What can be timestamped at the pin
+/// should be — [`ticks_local_ns`] is already on this scale — and this is for what cannot.
+fn local_ns() -> i64 {
+    now_ns() - SCHEDULE_ORIGIN_NS.lock(|o| o.get())
+}
+
 /// A PTP message that arrived, and the counter value the pin saw its first bit at.
 #[derive(Clone, Copy)]
 struct PtpArrival {
@@ -401,7 +417,6 @@ async fn link_task(
         // a state machine that was already running. The first value the monitor queued is the first
         // rising edge of the preamble - the frame's first bit - and everything after it is the rest
         // of the frame, which is why the rest is thrown away.
-        let arrived_ns = now_ns() - CAPTURE_NS - RX_LAG_NS;
         // Before the read, for the reason the counter's own documentation gives.
         let arrival_captures = arrival.captures();
         let hw_raw = arrival.try_read();
@@ -412,6 +427,13 @@ async fn link_task(
         let hw_ticks = hw_raw.map(|raw| {
             ARRIVAL.lock(|a| a.borrow_mut().observe_with_captures(raw, arrival_captures))
         });
+        // The pin's own value where there is one, which is every frame the monitor kept up with.
+        // The software route works backwards from the DMA completion through two constants and is
+        // what is left when the monitor missed the frame; it is on the same scale, which is the
+        // part that used to be wrong.
+        let arrived_ns = hw_ticks
+            .and_then(ticks_local_ns)
+            .unwrap_or_else(|| local_ns() - CAPTURE_NS - RX_LAG_NS);
         let mut hw_rtt_ticks: Option<i64> = None;
         seen = seen.wrapping_add(1);
 
@@ -747,8 +769,8 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO1, 1>, mut egress: EventCapture<
         // the tag the reply is matched on, so a monotonic one does the job and the offset it
         // produces is discarded by the step on the first measurement.
         let departure = CLOCK
-            .lock(|c| c.borrow().utc_at(now_ns()))
-            .unwrap_or_else(now_ns)
+            .lock(|c| c.borrow().utc_at(local_ns()))
+            .unwrap_or_else(local_ns)
             + REQ_LAG_NS;
         let packet = request(departure, POLL_LOG2);
 
