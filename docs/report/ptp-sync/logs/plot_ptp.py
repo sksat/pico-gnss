@@ -328,6 +328,98 @@ def gif_pair(label, name, colour, out_name):
     )
 
 
+def _draw_two(ax, frame, xinc, ref, diff_us):
+    """server と client の GP6 だけを、server の立ち上がりを 0 にして描く。
+
+    受信機の 1PPS を外し、基準を server 側に置き換えたもの。3 本のほうは「それぞれが GPS の秒
+    からどれだけ離れているか」を見る図で、そこには両方の板の出力チェーンのオフセットが乗って
+    いる。ここで見たいのは **2 枚がどれだけ揃っているか** だけなので、共通に乗るものは基準ごと
+    落とす。
+    """
+    n = len(frame[3])
+    x = (np.arange(n) - ref) * xinc / 1000.0
+    at = transforms.blended_transform_factory(ax.transAxes, ax.transData)
+    for ch, base, colour, name in (
+        (3, 5.0, "tab:purple", "CH3  Pico server の GP6  (基準)"),
+        (4, 0.0, "tab:blue", "CH4  Pico client の GP6"),
+    ):
+        ax.plot(x, frame[ch] + base, lw=1.4, color=colour)
+        ax.text(0.012, base + 4.3, name, fontsize=9.5, color=colour, va="top", transform=at)
+    ax.axvline(0, color="tab:purple", lw=1.0, ls="--")
+    ax.annotate(
+        "",
+        xy=(diff_us, 1.6),
+        xytext=(0, 1.6),
+        arrowprops=dict(arrowstyle="<->", color="tab:blue", lw=1.2),
+    )
+    ax.text(
+        diff_us / 2,
+        1.9,
+        f"{diff_us * 1000:+.0f} ns",
+        fontsize=10,
+        color="tab:blue",
+        ha="center",
+    )
+    ax.set_ylim(-1.2, 10.6)
+    ax.set_yticks([])
+    ax.set_xlabel("Pico server の秒からの時間 (µs)")
+
+
+def gif_two(label, name, colour, out_name):
+    """server を基準にして client だけを見る。2 枚がどれだけ揃っているか。"""
+    frames, xinc = read_trace(name)
+    usable = []
+    for i in sorted(frames):
+        if len(frames[i]) < 3:
+            continue
+        ref = _cross(frames[i][3], False)
+        c = _cross(frames[i][4], False)
+        if ref is None or c is None:
+            continue
+        usable.append((frames[i], ref, (c - ref) * xinc / 1000.0))
+    if not usable:
+        print(f"{name}: 使える取り込みが無い", file=sys.stderr)
+        return
+
+    diff = [d for _, _, d in usable]
+    lo, hi = min(diff + [0.0]), max(diff + [0.0])
+    pad = (hi - lo) * 0.35 + 0.15
+    span = max(abs(min(diff)), abs(max(diff))) * 1000
+
+    fig, (ax, tx) = plt.subplots(
+        2, 1, figsize=(8.4, 5.4), dpi=80, gridspec_kw={"height_ratios": [2.6, 1.1]}
+    )
+    fig.subplots_adjust(left=0.11, right=0.98, top=0.90, bottom=0.10, hspace=0.45)
+
+    def render(k):
+        ax.clear()
+        tx.clear()
+        frame, ref, d = usable[k]
+        _draw_two(ax, frame, xinc, ref, d)
+        ax.set_xlim(lo - pad, hi + pad)
+        ax.set_title(
+            f"{label}   取り込み {k + 1}/{len(usable)}   client − server {d * 1000:+.0f} ns",
+            fontsize=10.5,
+        )
+        tx.axhline(st.mean(diff) * 1000, color="0.6", lw=0.8, ls="--")
+        tx.plot(range(k + 1), [v * 1000 for v in diff[: k + 1]], ".-", ms=3, lw=0.8, color=colour)
+        tx.set_xlim(-1, len(usable))
+        tx.set_ylim(min(diff) * 1000 - span * 0.12 - 20, max(diff) * 1000 + span * 0.12 + 20)
+        tx.set_ylabel("client − server (ns)", fontsize=8)
+        tx.set_xlabel("取り込み", fontsize=8)
+        tx.tick_params(labelsize=7)
+        tx.grid(alpha=0.3)
+
+    anim = animation.FuncAnimation(fig, render, frames=len(usable), interval=200)
+    path = os.path.join(OUT, out_name)
+    anim.save(path, writer=animation.PillowWriter(fps=5))
+    plt.close(fig)
+    print(
+        f"saved {path} ({len(usable)} frames, {os.path.getsize(path) / 1e6:.1f} MB)  "
+        f"mean {st.mean(diff) * 1000:+.1f} ns  sd {st.pstdev(diff) * 1000:.1f}"
+    )
+
+
 def main():
     if not os.path.isdir(RAW):
         print(f"生データが見つからない: {RAW}", file=sys.stderr)
@@ -353,8 +445,9 @@ def main():
 
     for label, name, colour in TRACES:
         if os.path.exists(os.path.join(RAW, name)):
-            gif_pair(label, name, colour,
-                     "fig-scope-" + ("ntp" if "ntp" in name else "ptp") + ".gif")
+            which = "ntp" if "ntp" in name else "ptp"
+            gif_pair(label, name, colour, f"fig-scope-{which}.gif")
+            gif_two(label, name, colour, f"fig-pair-{which}.gif")
         else:
             print(f"{name} が無いので GIF は飛ばす", file=sys.stderr)
 

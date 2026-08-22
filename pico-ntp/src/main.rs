@@ -659,11 +659,25 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
         }
 
         let predicted = schedule.predicted_edge_ns();
-        let utc = CLOCK.lock(|g| g.borrow().now_from_capture_ns(predicted as u64));
+        // The estimate and the time it implies, read together so they describe the same moment.
+        let (utc, steering_mppb) = CLOCK.lock(|g| {
+            let g = g.borrow();
+            (
+                g.now_from_capture_ns(predicted as u64),
+                g.steering_freq_mppb(),
+            )
+        });
         let trusted = SOURCE_TRUSTED.load(Ordering::Relaxed);
 
         let step = match utc {
-            Some(utc) if trusted => schedule.advance(0, pps_lateness_ns(utc)),
+            // The crystal's rate, handed forward rather than left to the phase loop.
+            //
+            // With zero here the loop has to hold a standing phase error to generate the whole
+            // rate correction: at a gain of one quarter, a crystal 200 ppb out needs the edge to
+            // sit 800 ns off the second, permanently, and the firmware's own `landed_late_ns`
+            // reported exactly that. Feeding the rate forward leaves the phase term to correct
+            // phase.
+            Some(utc) if trusted => schedule.advance(steering_mppb, pps_lateness_ns(utc)),
             // Nothing to steer by yet: free-run at the nominal second so the FIFO stays fed.
             _ => schedule.step(0, 0),
         };
