@@ -216,8 +216,8 @@ const ARRIVAL_GPIO: u8 = 18;
 /// It has to be fed often enough to stay ahead of the counter's wrap.
 ///
 /// Anchored at the counter's start rather than its first capture, so the ticks mean a moment and
-/// not just an interval: PTP has to say *when* a frame arrived, and [`COUNTER_ORIGIN_NS`] is what
-/// carries that moment onto this board's own clock.
+/// not just an interval: PTP has to say *when* a frame arrived, and the counter's own start is
+/// what that moment is measured from.
 static ARRIVAL: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline>> =
     BlockingMutex::new(RefCell::new(TickTimeline::from_counter_start_with_toll(
         EVENT_CAPTURE_TOLL_TICKS,
@@ -228,15 +228,6 @@ static EGRESS_TICKS: BlockingMutex<CriticalSectionRawMutex, RefCell<TickTimeline
     BlockingMutex::new(RefCell::new(TickTimeline::from_counter_start_with_toll(
         EVENT_CAPTURE_TOLL_TICKS,
     )));
-
-/// Local time at the instant the counters were enabled.
-///
-/// The one software clock read on the whole PTP path, and it is read once: on the line after the
-/// write that starts the state machines, with no await between them. Everything a pin timestamps
-/// afterwards is converted through it, so a late read here would be a constant on every t2 and t3
-/// rather than a jitter on each.
-static COUNTER_ORIGIN_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
-    BlockingMutex::new(Cell::new(i64::MIN));
 
 /// A counter value from a pin, as this board's UTC.
 /// A pin's counter value as **local** time, not as UTC.
@@ -249,8 +240,7 @@ static COUNTER_ORIGIN_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
 ///
 /// What comes back is the counter, offset by the one software read this board makes.
 fn ticks_local_ns(ticks: u64) -> Option<i64> {
-    let origin = COUNTER_ORIGIN_NS.lock(|o| o.get());
-    (origin != i64::MIN).then(|| origin + ticks_to_ns(ticks, clk_sys_freq()) as i64)
+    Some(ticks_to_ns(ticks, clk_sys_freq()) as i64)
 }
 
 /// A value from the pin frames leave by, as local time.
@@ -275,6 +265,15 @@ static PTP_IN: Channel<CriticalSectionRawMutex, PtpArrival, 4> = Channel::new();
 /// stops looking for this long, so it timestamps the frame's first bit and not the eight hundred
 /// edges behind it.
 const FRAME_BLANK_NS: u32 = 95_000;
+
+/// Local time at the instant the counters started — for waiting, and nothing else.
+///
+/// The output schedule counts from that write and the executor counts from boot, so waking at the
+/// right moment needs the two related. What must *not* go through here is anything measured: this
+/// is a `now_ns()` read and it is granular to a microsecond, and a microsecond in the wrong place
+/// is where the client's output used to sit.
+static SCHEDULE_ORIGIN_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
+    BlockingMutex::new(Cell::new(0));
 
 /// The estimate. The link task writes it, the 1PPS task reads it.
 static CLOCK: BlockingMutex<CriticalSectionRawMutex, RefCell<NtpDiscipline>> =
@@ -334,7 +333,7 @@ fn note(dropped: &mut u32, why: &str, seen: u32) {
 /// Read the link, and hand every NTP packet on it to the estimate.
 #[embassy_executor::task]
 async fn link_task(
-    mut rx: Rx10BaseT<'static, PIO0, 0>,
+    mut rx: Rx10BaseT<'static, PIO1, 0>,
     mut arrival: EventCapture<'static, PIO0, 2>,
 ) {
     let mut words = [0u32; CAPTURE_WORDS];
@@ -566,7 +565,7 @@ async fn link_task(
 /// on the wire is a placeholder, because a departure written before the frame is encoded is a claim
 /// about a moment that has not happened.
 async fn send_ptp(
-    tx: &mut Tx10BaseT<'static, PIO0, 1>,
+    tx: &mut Tx10BaseT<'static, PIO1, 1>,
     egress: &mut EventCapture<'static, PIO0, 3>,
     msg: &tiny_ptp::Message,
     ip_id: u16,
@@ -590,7 +589,7 @@ async fn send_ptp(
 }
 
 #[embassy_executor::task]
-async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<'static, PIO0, 3>) {
+async fn ask_task(mut tx: Tx10BaseT<'static, PIO1, 1>, mut egress: EventCapture<'static, PIO0, 3>) {
     // A broadcast client listens and nothing else (RFC 5905 §9.1). With the questions still going
     // out, the clock would be disciplined from both sources and neither could be told apart.
     if cfg!(feature = "broadcast-client") {
@@ -757,22 +756,32 @@ async fn ask_task(mut tx: Tx10BaseT<'static, PIO0, 1>, mut egress: EventCapture<
 
 /// Keep GP6 on the second.
 #[embassy_executor::task]
-async fn pps_task(mut out: PpsOutput<'static, PIO1, 0>, mut schedule: PpsSchedule) {
+async fn pps_task(mut out: PpsOutput<'static, PIO0, 0>, mut schedule: PpsSchedule) {
     let mut edges: u32 = 0;
+    // The last edge the schedule committed to. `None` until there is one.
+    let mut committed: Option<i64> = None;
 
     loop {
         // Wake in time to have the next word in the FIFO before the state machine reaches for it,
         // which is one edge before the edge that word positions.
-        let push_at = schedule.edge_ns() - PUSH_LEAD_NS;
+        let push_at = SCHEDULE_ORIGIN_NS.lock(|o| o.get()) + schedule.edge_ns() - PUSH_LEAD_NS;
         let now = now_ns();
         if push_at > now {
             Timer::after(Duration::from_micros(((push_at - now) / 1000) as u64)).await;
         }
 
-        let predicted = schedule.predicted_edge_ns();
+        // Steer on the edge that was *committed*, not the one that would happen if nothing were
+        // done about it.
+        //
+        // `predicted_edge_ns` is the nominal second from the last edge. The word actually pushed
+        // moves it — by the phase correction and, far larger, by the frequency term — so nulling
+        // the prediction leaves the real edge off by however much it moved. On this board the
+        // crystal is 1.86 ppm out, and the firmware's own `late_ns` sat at +1847 ns while its
+        // corrections were single-digit: the loop had converged, on the wrong point.
+        let target = committed.unwrap_or_else(|| schedule.predicted_edge_ns());
         let state = CLOCK.lock(|c| {
             let c = c.borrow();
-            c.utc_at(predicted)
+            c.utc_at(target)
                 .map(|utc| (lateness_ns(utc), c.drift_ppb() * 1000, c.locked()))
         });
 
@@ -787,6 +796,7 @@ async fn pps_task(mut out: PpsOutput<'static, PIO1, 0>, mut schedule: PpsSchedul
             info!("PPS placed, corr_ns={}", step.correction_ns);
         }
 
+        committed = Some(step.edge_ns);
         if !out.set_period(step.period_word) {
             // The output program does not hold the last period on an empty pull, so a dropped push
             // is a dropped pulse rather than a glitch. Say so: it means this task ran late.
@@ -816,32 +826,53 @@ async fn main(spawner: Spawner) {
         clk
     );
 
-    // PIO0: the link, both directions. The serialiser is loaded first because it is pinned to
+    // PIO1: the link, both directions. The serialiser is loaded first because it is pinned to
     // offset zero - `out pc` indexes it by symbol value - so the deserialiser has to land after it.
+    //
+    // The link is here and the *time* is in PIO0, which is the opposite of where they started.
+    // Counters only share an origin inside one block, and the two things that have to share one
+    // are the timestamps PTP takes and the edges the 1PPS puts out. Anything else can go in the
+    // other block; the link does not care what its own counter's origin is.
     let Pio {
-        mut common,
-        sm0,
-        sm1,
-        sm2,
-        sm3,
+        common: mut link_common,
+        sm0: link_rx_sm,
+        sm1: link_tx_sm,
         ..
-    } = Pio::new(p.PIO0, Irqs);
+    } = Pio::new(p.PIO1, Irqs);
     let tx_dma = embassy_rp::dma::Channel::new(p.DMA_CH1, Irqs);
     let tx = Tx10BaseT::new(
-        &mut common,
-        sm1,
+        &mut link_common,
+        link_tx_sm,
         p.PIN_16, // TX−
         p.PIN_17, // TX+
         tx_dma,
         clk,
     );
     let dma = embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs);
-    let rx = Rx10BaseT::new(&mut common, sm0, p.PIN_18, p.PIN_19, dma, clk);
+    let rx = Rx10BaseT::new(&mut link_common, link_rx_sm, p.PIN_18, p.PIN_19, dma, clk);
 
-    // Two counters on the same block, watching the pins the link already uses. They claim nothing:
-    // the serialiser drives GP16 and the deserialiser reads GP18, and both stay theirs.
-    // Loaded once. Two eleven-instruction copies plus the serialiser and deserialiser would not
-    // leave room in the block's 32 instructions.
+    // PIO0: everything that has to agree about when things happened.
+    //
+    // The 1PPS output, and two counters watching the pins the link uses. The counters claim
+    // nothing — the serialiser in the other block drives GP16 and the deserialiser reads GP18, and
+    // both stay theirs — but they are started by the same write as the output, so a frame's
+    // timestamp and an output edge are two points on one scale.
+    //
+    // That is what removes the software clock from the path. It used to sit between the two
+    // blocks: the link's counters were read against `now_ns()` and the output schedule was
+    // anchored on another `now_ns()`, and the microsecond that read is granular to went into the
+    // offset PTP learned — where it does not cancel, unlike in the path delay.
+    let Pio {
+        mut common,
+        sm0: pps_sm,
+        sm2,
+        sm3,
+        ..
+    } = Pio::new(p.PIO0, Irqs);
+    let high_cycles = output_high_cycles(clk, PPS_PULSE_NS);
+    let initial_period = output_period_cycles(clk, high_cycles);
+    let out = PpsOutput::new_stopped(&mut common, pps_sm, p.PIN_6, high_cycles, initial_period);
+    // Loaded once. Two eleven-instruction copies would not leave room beside the output program.
     let counter = common.load_program(&event_capture_program());
     let mut arrival = EventCapture::<PIO0, 2>::new_stopped_shared(
         sm2,
@@ -859,42 +890,30 @@ async fn main(spawner: Spawner) {
     let blank = event_blank_counts(FRAME_BLANK_NS, clk);
     arrival.arm(blank);
     egress.arm(blank);
-    // One write, so the two counters are one timebase. Verified on the board: three of these
-    // watching the same edge report the same value for minutes across the counter's wrap.
+    // One write: the output and both counters start together, and zero is the same instant for
+    // all three.
     start_in_sync(
         embassy_rp::pac::PIO0,
-        EventCapture::<PIO0, 2>::sm_mask() | EventCapture::<PIO0, 3>::sm_mask(),
+        PpsOutput::<PIO0, 0>::sm_mask()
+            | EventCapture::<PIO0, 2>::sm_mask()
+            | EventCapture::<PIO0, 3>::sm_mask(),
     );
-    // Next line, deliberately: see `COUNTER_ORIGIN_NS`. The counters hold zero at the write above,
-    // and this is the one read that ties that instant to a time this board can name.
-    COUNTER_ORIGIN_NS.lock(|o| o.set(now_ns()));
-    arrival.drain();
-    egress.drain();
-
-    // PIO1: the 1PPS. The enable is the schedule's one tie to local time, so it is timestamped as
-    // close to the call as this can be written.
-    let Pio {
-        common: mut pps_common,
-        sm0: pps_sm,
-        ..
-    } = Pio::new(p.PIO1, Irqs);
-    let high_cycles = output_high_cycles(clk, PPS_PULSE_NS);
-    let initial_period = output_period_cycles(clk, high_cycles);
-    let out = PpsOutput::new(
-        &mut pps_common,
-        pps_sm,
-        p.PIN_6,
-        high_cycles,
-        initial_period,
-    );
-    let enabled_ns = now_ns();
+    // Zero, not a clock read. The schedule and the timestamps now count from the same write, so
+    // there is nothing to tie them together with and nothing to be wrong by.
     let schedule = PpsSchedule::at_enable(
         clk,
         high_cycles,
         PpsScheduleConfig::default(),
-        enabled_ns,
+        0,
         initial_period,
     );
+    arrival.drain();
+    egress.drain();
+
+    // Only for deciding when to wake up. The schedule counts from the counter's start and the
+    // executor counts from boot, so the two need relating — but a wake-up that is a microsecond
+    // early or late costs nothing, and nothing measured passes through here.
+    SCHEDULE_ORIGIN_NS.lock(|o| o.set(now_ns()));
 
     // Neither `Common` may be dropped. embassy-rp releases a PIO block's pins - resets their
     // FUNCSEL to NULL - once the `Common` and the state machines it handed out are all gone, and
@@ -905,7 +924,7 @@ async fn main(spawner: Spawner) {
     // consuming a period every second. GP6 reads funcsel 7 at the last line of `main` and 31 two
     // seconds later, driving a pad that is no longer listening.
     core::mem::forget(common);
-    core::mem::forget(pps_common);
+    core::mem::forget(link_common);
 
     spawner.spawn(link_task(rx, arrival).unwrap());
     spawner.spawn(ask_task(tx, egress).unwrap());

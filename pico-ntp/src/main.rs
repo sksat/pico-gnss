@@ -255,6 +255,24 @@ const PPS_OUT_PIN: u8 = 6;
 static PIN_LATENESS_NS: BlockingMutex<CriticalSectionRawMutex, Cell<Option<i64>>> =
     BlockingMutex::new(Cell::new(None));
 
+/// What has to be added to the disciplined clock to make its seconds land on the receiver's.
+///
+/// The pin measurement could be used to steer the *output*, and that puts GP6 on the second — but
+/// only GP6. The timestamps this board serves come from the same map by a different path, and
+/// moving the output does not move them: measured, the server's own pulse sat 66 ns from the
+/// receiver's second while the client following its `Sync` messages sat 2.8 µs away.
+///
+/// So the correction goes on the map. Then the output and the served time are right together,
+/// because they are the same answer to the same question.
+static MAP_CORRECTION_NS: BlockingMutex<CriticalSectionRawMutex, Cell<i64>> =
+    BlockingMutex::new(Cell::new(0));
+
+/// Disciplined UTC for a capture-timebase moment, with the pin's correction in it.
+fn utc_from_capture_ns(capture_ns: u64) -> Option<i64> {
+    let base = CLOCK.lock(|g| g.borrow().now_from_capture_ns(capture_ns))?;
+    Some(base + MAP_CORRECTION_NS.lock(|c| c.get()))
+}
+
 /// The most recent value a counter pushed, and the tolls paid before it.
 ///
 /// Returns `None` if nothing is queued. Everything older is discarded: an edge from a previous
@@ -324,9 +342,24 @@ async fn pin_lateness_task(
             continue;
         }
         PIN_LATENESS_NS.lock(|p| p.set(Some(ns)));
+        // A quarter of the error each second, on the map. The same gain the output loop uses, and
+        // for the same reason: correcting all of it at once puts this measurement's own noise —
+        // two captures, each on a 16 ns grid — straight onto every timestamp the board serves.
+        let corrected = MAP_CORRECTION_NS.lock(|c| {
+            // Adding to the map makes a given capture read as a *later* UTC, so the edge that
+            // satisfies "this second" comes earlier. A late pulse therefore wants the correction
+            // to go up, not down — the other way round is positive feedback, and it ran away at
+            // 20 µs in under a minute.
+            let next = c.get() + ns / 4;
+            c.set(next);
+            next
+        });
         seen = seen.wrapping_add(1);
         if seen <= 8 || seen.is_multiple_of(16) {
-            info!("PPSPIN n={} out_minus_gps_ns={}", seen, ns);
+            info!(
+                "PPSPIN n={} out_minus_gps_ns={} map_correction_ns={}",
+                seen, ns, corrected
+            );
         }
     }
 }
@@ -749,22 +782,10 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
 
         let predicted = schedule.predicted_edge_ns();
         // The estimate and the time it implies, read together so they describe the same moment.
-        let (utc, steering_mppb) = CLOCK.lock(|g| {
-            let g = g.borrow();
-            (
-                g.now_from_capture_ns(predicted as u64),
-                g.steering_freq_mppb(),
-            )
-        });
+        let steering_mppb = CLOCK.lock(|g| g.borrow().steering_freq_mppb());
+        let utc = utc_from_capture_ns(predicted as u64);
         let trusted = SOURCE_TRUSTED.load(Ordering::Relaxed);
 
-        // How late the pulse actually was, if a pin has said so.
-        //
-        // This is the whole difference between placing an edge and controlling one. The computed
-        // figure below is where the schedule *believes* the edge goes, and it drives that to zero
-        // perfectly while the pin sits microseconds away — the constant between belief and pin is
-        // outside the loop, so the loop cannot know it is there. Steering on the measurement puts
-        // it inside.
         let measured = PIN_LATENESS_NS.lock(|p| p.get());
 
         let step = match utc {
@@ -775,12 +796,6 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
             // sit 800 ns off the second, permanently, and the firmware's own `landed_late_ns`
             // reported exactly that. Feeding the rate forward leaves the phase term to correct
             // phase.
-            Some(_) if trusted && measured.is_some() => {
-                schedule.advance(steering_mppb, measured.unwrap())
-            }
-            // Until a pulse has been seen on the pin there is nothing measured to steer by, so
-            // fall back to where the arithmetic says the edge will be. That is enough to get an
-            // output going, which is what the pin watcher needs in order to see anything.
             Some(utc) if trusted => schedule.advance(steering_mppb, pps_lateness_ns(utc)),
             // Nothing to steer by yet: free-run at the nominal second so the FIFO stays fed.
             _ => schedule.step(0, 0),
@@ -794,8 +809,7 @@ async fn pps_out_task(mut out: PpsOutput<'static, PIO0, 1>, mut schedule: PpsSch
         }
         edges = edges.wrapping_add(1);
         if edges <= 8 || edges.is_multiple_of(16) {
-            let landed = CLOCK
-                .lock(|g| g.borrow().now_from_capture_ns(step.edge_ns as u64))
+            let landed = utc_from_capture_ns(step.edge_ns as u64)
                 .map(pps_lateness_ns)
                 .unwrap_or(0);
             info!(
@@ -834,7 +848,10 @@ fn clock_state() -> (Option<i64>, ClockState) {
         let g = g.borrow();
         // Time in the capture timebase, ageing in the software one. The first is what must not
         // carry a scheduling delay; the second only gates service and is a millisecond quantity.
-        let now = c.and_then(|c| g.now_from_capture_ns(c));
+        // The corrected map, like everywhere else: NTP is served from the same seconds PTP is.
+        let now = c
+            .and_then(|c| g.now_from_capture_ns(c))
+            .map(|utc| utc + MAP_CORRECTION_NS.lock(|m| m.get()));
         let holdover_ns = g.holdover_ns(q);
         (
             now,
@@ -914,7 +931,7 @@ async fn send_ptp(
     let raw = egress.try_read()?;
     egress.drain();
     let capture = frame_capture_ns(raw, captures)?;
-    CLOCK.lock(|g| g.borrow().now_from_capture_ns(capture))
+    utc_from_capture_ns(capture)
 }
 
 /// One `Sync`, then the `Follow_Up` that says when it left.
@@ -963,7 +980,7 @@ async fn ptp_answer(
         return None;
     };
     let capture = frame_capture_ns(request.arrived_raw, request.arrived_captures)?;
-    let t4 = CLOCK.lock(|g| g.borrow().now_from_capture_ns(capture))?;
+    let t4 = utc_from_capture_ns(capture)?;
 
     let resp = tiny_ptp::Message {
         domain: ptp::DOMAIN,
