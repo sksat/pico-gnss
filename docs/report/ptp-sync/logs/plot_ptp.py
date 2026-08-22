@@ -170,9 +170,13 @@ def fig_gap(runs):
 
 
 # 波形を連続で取った回。1 コマが 1 取り込みで、GIF はこれを並べる。
+# 出力名はファイル名から推さず、ここで明示する。同じ「PTP 駆動」でも段階が違えば別の図で、
+# 一つの図を上書きしてしまうと、直す前と直したあとが並べられなくなる。
 TRACES = [
-    ("NTP 駆動", "pair-gif2-ntp-trace.csv", "tab:red"),
-    ("PTP 駆動", "pair-gif4-ptp-trace.csv", "tab:green"),
+    ("NTP 駆動", "pair-gif2-ntp-trace.csv", "tab:red", "ntp"),
+    ("PTP 駆動", "pair-gif4-ptp-trace.csv", "tab:green", "ptp"),
+    ("PTP 駆動 (捕捉の toll と時間軸と折り返しを直したあと)",
+     "pair-gif5-ptp-trace.csv", "tab:green", "final"),
 ]
 
 # `measure_pair.py` が固定している垂直の設定。バイト 0-255 が 10 division にあたる。
@@ -484,11 +488,10 @@ def main():
         fig_gap(present)
     print(f"quantisation floor: sigma = {QUANTISATION_FLOOR_NS:.3f} ns (tick {TICK_NS:g} ns)")
 
-    for label, name, colour in TRACES:
+    for label, name, colour, tag in TRACES:
         if os.path.exists(os.path.join(RAW, name)):
-            which = "ntp" if "ntp" in name else "ptp"
-            gif_pair(label, name, colour, f"fig-scope-{which}.gif")
-            gif_two(label, name, colour, f"fig-pair-{which}.gif")
+            gif_pair(label, name, colour, f"fig-scope-{tag}.gif")
+            gif_two(label, name, colour, f"fig-pair-{tag}.gif")
         else:
             print(f"{name} が無いので GIF は飛ばす", file=sys.stderr)
 
