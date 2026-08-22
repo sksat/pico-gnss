@@ -172,7 +172,7 @@ def fig_gap(runs):
 # 波形を連続で取った回。1 コマが 1 取り込みで、GIF はこれを並べる。
 TRACES = [
     ("NTP 駆動", "pair-gif2-ntp-trace.csv", "tab:red"),
-    ("PTP 駆動", "pair-gif2-ptp-trace.csv", "tab:green"),
+    ("PTP 駆動", "pair-gif3-ptp-trace.csv", "tab:green"),
 ]
 
 # `measure_pair.py` が固定している垂直の設定。バイト 0-255 が 10 division にあたる。
